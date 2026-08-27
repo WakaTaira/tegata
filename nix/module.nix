@@ -1,4 +1,4 @@
-{ tegatadPackage, executorEntry, bitwardenCliPackage }:
+{ tegatadPackage, executorEntry, bitwardenCliPackage, playwrightBrowsersPackage }:
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.tegata;
@@ -192,7 +192,9 @@ in
         RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
         ReadWritePaths = [ "/var/lib/tegata" "/run/tegata" ];
         Environment = [
-          "PLAYWRIGHT_BROWSERS_PATH=${pkgs.playwright-driver.browsers}"
+          # executor 同梱の playwright-core と revision を一致させるため、ホスト側 pkgs では
+          # なく flake 注入のブラウザパッケージを用いる（flake.nix の注入コメント参照）。
+          "PLAYWRIGHT_BROWSERS_PATH=${playwrightBrowsersPackage}"
         ] ++ lib.optional (cfg.executorEntry != null) "TEGATA_EXECUTOR_ENTRY=${cfg.executorEntry}";
       };
     };

@@ -41,6 +41,10 @@
         tegatadPackage = tegataPackages.tegatad;
         executorEntry = "${tegataPackages.executor}/lib/tegata-executor/index.js";
         bitwardenCliPackage = pkgsBw.bitwarden-cli;
+        # ブラウザはホスト側 pkgs ではなく本 flake の nixpkgs から渡す。executor に同梱される
+        # playwright-core とブラウザ revision が一致している必要があり、ホスト側の
+        # playwright-driver はバージョンが乖離しうるため（実配備で launch 即失敗を確認済み）。
+        playwrightBrowsersPackage = pkgs.playwright-driver.browsers;
       };
 
       checks.${system} = {

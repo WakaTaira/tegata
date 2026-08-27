@@ -1,0 +1,9 @@
+/docs/secret/
+/CLAUDE.local.md
+/target/
+/node_modules/
+/result
+/result-*
+/.direnv/
+/test-artifacts/
+/packages/*/dist/

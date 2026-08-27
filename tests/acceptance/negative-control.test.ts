@@ -4,8 +4,8 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { expect, test } from "vitest";
 import { createLeakGuard } from "@tegata/leak-guard";
+import { expect, test } from "vitest";
 import { bins } from "./support/harness.js";
 
 test("AC-15: leak_guard fails when a canary is deliberately leaked", async () => {

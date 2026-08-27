@@ -76,7 +76,12 @@ test("AC-13: every encoded variant of a canary is detected (exit 1)", async () =
     // echoes the canary value itself
     expect(res.status).toBe(1);
     const report = JSON.parse(res.stdout) as {
-      hits: Array<{ path: string; canary_index: number; encoding: string; byte_offset: number }>;
+      hits: Array<{
+        path: string;
+        canary_index: number;
+        encoding: string;
+        byte_offset: number;
+      }>;
     };
     const flagged = new Set(report.hits.map((h) => path.basename(h.path)));
     expect([...flagged].sort()).toEqual(

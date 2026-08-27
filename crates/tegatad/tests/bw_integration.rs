@@ -1,7 +1,6 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
@@ -9,6 +8,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use uuid::Uuid;
+
+mod common;
+use common::{rpc, try_rpc};
 
 struct ProcessGuard {
     child: Child,
@@ -167,36 +169,6 @@ fn wait_for_daemon(socket_path: &PathBuf) {
         sleep(Duration::from_millis(20));
     }
     panic!("tegatad did not become ready");
-}
-
-fn rpc(socket_path: &PathBuf, method: &str, params: Value) -> Value {
-    let mut stream = UnixStream::connect(socket_path).expect("connect to daemon");
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params,
-    });
-    writeln!(stream, "{request}").expect("write RPC request");
-    let mut response = String::new();
-    BufReader::new(stream)
-        .read_line(&mut response)
-        .expect("read RPC response");
-    serde_json::from_str(&response).expect("parse RPC response")
-}
-
-fn try_rpc(socket_path: &PathBuf, method: &str, params: Value) -> Option<Value> {
-    let mut stream = UnixStream::connect(socket_path).ok()?;
-    let request = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params,
-    });
-    writeln!(stream, "{request}").ok()?;
-    let mut response = String::new();
-    BufReader::new(stream).read_line(&mut response).ok()?;
-    serde_json::from_str(&response).ok()
 }
 
 #[ignore]

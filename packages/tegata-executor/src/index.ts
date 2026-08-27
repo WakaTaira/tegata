@@ -7,7 +7,7 @@ import { type Browser, chromium, type Page } from "playwright-core";
 type FillStep = {
   action: "fill";
   selector: string;
-  value: string;
+  value: "{{username}}" | "{{password}}" | "{{totp}}";
 };
 
 type ClickStep = {
@@ -32,11 +32,20 @@ type LoginRequest = {
 
 type Request = LoginRequest | { op: "shutdown" };
 
-type ErrorCode = "INTERNAL" | "INVALID_CREDENTIAL" | "SELECTOR_NOT_FOUND";
+type ErrorCode =
+  | "INVALID_CREDENTIAL"
+  | "MFA_REQUIRED"
+  | "SELECTOR_NOT_FOUND"
+  | "VAULT_LOCKED"
+  | "RATE_LIMITED"
+  | "TOTP_NOT_EXPOSABLE"
+  | "INTERNAL";
 
 class SelectorNotFoundError extends Error {}
 
 class InvalidCredentialError extends Error {}
+
+class MfaRequiredError extends Error {}
 
 let activeBrowser: Browser | undefined;
 let shuttingDown = false;
@@ -49,6 +58,12 @@ function isNullableString(value: unknown): value is string | null {
   return value === null || typeof value === "string";
 }
 
+function isSecretPlaceholder(value: unknown): value is FillStep["value"] {
+  return (
+    value === "{{username}}" || value === "{{password}}" || value === "{{totp}}"
+  );
+}
+
 function parseRequest(line: string): Request {
   const value: unknown = JSON.parse(line);
   if (!isRecord(value) || (value.op !== "login" && value.op !== "shutdown")) {
@@ -59,12 +74,14 @@ function parseRequest(line: string): Request {
   const secret = value.secret;
   if (
     typeof value.target_url !== "string" ||
-    !isNullableString(value.success_selector) ||
-    !isNullableString(value.failure_selector) ||
+    (value.success_selector !== undefined &&
+      !isNullableString(value.success_selector)) ||
+    (value.failure_selector !== undefined &&
+      !isNullableString(value.failure_selector)) ||
     !isRecord(secret) ||
     typeof secret.username !== "string" ||
     typeof secret.password !== "string" ||
-    !isNullableString(secret.totp)
+    (secret.totp !== undefined && !isNullableString(secret.totp))
   ) {
     throw new Error("invalid login request");
   }
@@ -79,7 +96,7 @@ function parseRequest(line: string): Request {
       if (step.action === "click") {
         return { action: "click", selector: step.selector };
       }
-      if (step.action === "fill" && typeof step.value === "string") {
+      if (step.action === "fill" && isSecretPlaceholder(step.value)) {
         return {
           action: "fill",
           selector: step.selector,
@@ -94,12 +111,12 @@ function parseRequest(line: string): Request {
     op: "login",
     target_url: value.target_url,
     steps,
-    success_selector: value.success_selector,
-    failure_selector: value.failure_selector,
+    success_selector: value.success_selector ?? null,
+    failure_selector: value.failure_selector ?? null,
     secret: {
       username: secret.username,
       password: secret.password,
-      totp: secret.totp,
+      totp: secret.totp ?? null,
     },
   };
 }
@@ -165,11 +182,15 @@ function substituteSecrets(
   const substitutions = {
     username: secret.username,
     password: secret.password,
-    totp: secret.totp ?? "",
+    totp: secret.totp,
   };
   return value.replace(
     /\{\{(username|password|totp)\}\}/g,
-    (_placeholder, key: keyof typeof substitutions) => substitutions[key],
+    (_placeholder, key: keyof typeof substitutions) => {
+      const substitution = substitutions[key];
+      if (substitution === null) throw new MfaRequiredError();
+      return substitution;
+    },
   );
 }
 
@@ -179,6 +200,12 @@ async function runSteps(
   secret: LoginRequest["secret"],
 ): Promise<void> {
   if (steps !== null) {
+    if (
+      secret.totp === null &&
+      steps.some((step) => step.action === "fill" && step.value === "{{totp}}")
+    ) {
+      throw new MfaRequiredError();
+    }
     for (const step of steps) {
       if (step.action === "fill") {
         await fill(page, step.selector, substituteSecrets(step.value, secret));
@@ -252,6 +279,35 @@ async function waitForLoginResult(
     }
   };
 
+  const waitForDefaultResult = async (): Promise<
+    "success" | "failure" | undefined
+  > => {
+    const networkIdleSettled = await page
+      .waitForLoadState("networkidle", { timeout: 15_000 })
+      .then(() => true)
+      .catch(() => false);
+    const { hasPasswordInput } = await page.evaluate((loadStateSettled) => {
+      const inputs = Array.from(
+        document.querySelectorAll<HTMLInputElement>("input"),
+      );
+      const hasPasswordInput = inputs.some((input) => {
+        const style = getComputedStyle(input);
+        return (
+          input.type === "password" &&
+          !input.hidden &&
+          style.display !== "none" &&
+          style.visibility !== "hidden" &&
+          input.offsetWidth !== 0 &&
+          input.offsetHeight !== 0
+        );
+      });
+      return { hasPasswordInput, loadStateSettled };
+    }, networkIdleSettled);
+    if (!hasPasswordInput && successSelector === null) return "success";
+    if (hasPasswordInput && failureSelector === null) return "failure";
+    return undefined;
+  };
+
   const waits: Array<Promise<"success" | "failure" | undefined>> = [];
   if (successSelector !== null) {
     waits.push(
@@ -266,6 +322,9 @@ async function waitForLoginResult(
         matched ? "failure" : undefined,
       ),
     );
+  }
+  if (successSelector === null || failureSelector === null) {
+    waits.push(waitForDefaultResult());
   }
   const result = await Promise.race([
     ...waits,
@@ -312,7 +371,9 @@ async function handleLogin(request: LoginRequest): Promise<void> {
         ? "SELECTOR_NOT_FOUND"
         : error instanceof InvalidCredentialError
           ? "INVALID_CREDENTIAL"
-          : "INTERNAL";
+          : error instanceof MfaRequiredError
+            ? "MFA_REQUIRED"
+            : "INTERNAL";
     const browser = activeBrowser as Browser | undefined;
     if (browser !== undefined) {
       await browser.close().catch(() => undefined);

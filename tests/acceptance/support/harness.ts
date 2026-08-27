@@ -176,9 +176,7 @@ export async function rawRpc(
 ): Promise<{ result?: unknown; error?: { code: number; message?: string } }> {
   const sock = net.connect(socketPath);
   await once(sock, "connect");
-  sock.write(
-    `${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })}\n`,
-  );
+  sock.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })}\n`);
   const rl = readline.createInterface({ input: sock });
   try {
     for await (const line of rl) {
@@ -374,4 +372,5 @@ export function listFiles(root: string): string[] {
 }
 
 /** Browser artifact patterns that must never exist after a login. */
-export const FORBIDDEN_ARTIFACTS = /(\.har|\.webm)$|trace.*\.zip$|screenshot.*\.png$/i;
+export const FORBIDDEN_ARTIFACTS =
+  /(\.har|\.webm)$|trace.*\.zip$|screenshot.*\.png$/i;

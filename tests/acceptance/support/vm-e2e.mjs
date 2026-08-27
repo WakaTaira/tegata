@@ -33,7 +33,9 @@ function rpc(method, params) {
     let buffer = "";
     sock.on("error", reject);
     sock.on("connect", () =>
-      sock.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })}\n`),
+      sock.write(
+        `${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })}\n`,
+      ),
     );
     sock.on("data", (chunk) => {
       buffer += chunk.toString("utf8");
@@ -42,7 +44,9 @@ function rpc(method, params) {
       sock.destroy();
       const response = JSON.parse(buffer.slice(0, nl));
       if (response.result === undefined)
-        reject(new Error(`rpc ${method} failed: ${JSON.stringify(response.error)}`));
+        reject(
+          new Error(`rpc ${method} failed: ${JSON.stringify(response.error)}`),
+        );
       else resolve(response.result);
     });
   });
@@ -68,7 +72,9 @@ async function inspectSession(endpoint) {
     new Promise((resolve, reject) => {
       const id = nextId++;
       pending.set(id, (msg) =>
-        msg.error ? reject(new Error(`${method}: ${msg.error.message}`)) : resolve(msg.result),
+        msg.error
+          ? reject(new Error(`${method}: ${msg.error.message}`))
+          : resolve(msg.result),
       );
       ws.send(JSON.stringify({ id, method, params, sessionId }));
     });
@@ -84,7 +90,11 @@ async function inspectSession(endpoint) {
   });
   const evaluate = async (expression) =>
     (
-      await send("Runtime.evaluate", { expression, returnByValue: true }, sessionId)
+      await send(
+        "Runtime.evaluate",
+        { expression, returnByValue: true },
+        sessionId,
+      )
     ).result.value;
 
   const hasWelcome = await evaluate(

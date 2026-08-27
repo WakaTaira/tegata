@@ -8,7 +8,7 @@ import {
   pbkdf2Sync,
   randomBytes,
 } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -126,7 +126,6 @@ function childEnvironment(
 ): NodeJS.ProcessEnv {
   return {
     ...process.env,
-    BW_PASSWORD: undefined,
     BW_SESSION: undefined,
     BW_APPDATA_DIR: appDataDir,
     BITWARDENCLI_APPDATA_DIR: appDataDir,
@@ -213,14 +212,17 @@ async function main(): Promise<void> {
   try {
     await registerAccount(server, email, password);
     runBw(["config", "server", server], appDataDir);
-    const session = runBw(
-      ["login", email, "--raw", "--passwordenv", "BW_PASSWORD"],
-      appDataDir,
-      undefined,
-      {
-        BW_PASSWORD: password,
-      },
-    ).split(/\r?\n/, 1)[0];
+    const passwordFile = join(appDataDir, "master-password");
+    writeFileSync(passwordFile, password, { encoding: "utf8", mode: 0o600 });
+    let session: string;
+    try {
+      session = runBw(
+        ["login", email, "--raw", "--passwordfile", passwordFile],
+        appDataDir,
+      ).split(/\r?\n/, 1)[0];
+    } finally {
+      rmSync(passwordFile, { force: true });
+    }
     if (!session) {
       throw new Error("bw login returned no session");
     }

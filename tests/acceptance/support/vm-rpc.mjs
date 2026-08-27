@@ -29,7 +29,9 @@ const bail = (msg) => {
   process.exit(1);
 };
 
-sock.on("error", (err) => bail(`connect/write failed: ${err.code ?? err.message}`));
+sock.on("error", (err) =>
+  bail(`connect/write failed: ${err.code ?? err.message}`),
+);
 sock.on("connect", () => {
   sock.write(`${JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })}\n`);
 });

@@ -9,15 +9,15 @@ import os from "node:os";
 import path from "node:path";
 import { createLeakGuard, type LeakGuard } from "@tegata/leak-guard";
 import {
-  type CanarySet,
-  type Daemon,
-  type McpSession,
-  type TargetFixture,
   bins,
+  type CanarySet,
   connectMcp,
+  type Daemon,
   defaultEntries,
+  type McpSession,
   startDaemon,
   startTargetFixture,
+  type TargetFixture,
 } from "./harness.js";
 
 export interface Stack {
@@ -51,7 +51,11 @@ export async function startStack(opts: StackOptions = {}): Promise<Stack> {
   const daemon = await startDaemon(defaultEntries(canaries));
   const fixture =
     opts.withFixture === false
-      ? ({ port: 0, url: "http://127.0.0.1:0", stop: async () => {} } as TargetFixture)
+      ? ({
+          port: 0,
+          url: "http://127.0.0.1:0",
+          stop: async () => {},
+        } as TargetFixture)
       : await startTargetFixture({
           username: canaries.username,
           password: canaries.password,

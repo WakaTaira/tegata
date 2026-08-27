@@ -1,20 +1,6 @@
-//! Shared secret and executor-sidecar protocol primitives.
-//!
-//! The executor sidecar is started as `node <executor_entry>`, where
-//! `executor_entry` is resolved from the daemon configuration, then
-//! `TEGATA_EXECUTOR_ENTRY`, then the path obtained from
-//! `current_exe()`/`../../../packages/tegata-executor/dist/index.js`.
-//! One sidecar is started for each login. The daemon writes one JSON object
-//! per line to stdin:
-//! `{"op":"login","target_url":<string>,"steps":[{"action":"fill"|"click","selector":<string>,"value":<string|null>}]|null,"success_selector":<string|null>,"failure_selector":<string|null>,"secret":{"username":<string>,"password":<string>,"totp":<string|null>}}`.
-//! The sidecar responds with one JSON line, either
-//! `{"ok":true,"endpoint":"ws://..."}` or
-//! `{"ok":false,"error":"<classification code>"}`, and stays alive after
-//! a successful response while retaining the browser. The daemon shuts it
-//! down by writing `{"op":"shutdown"}` or sending SIGTERM. Stderr is
-//! discarded, and secrets are sent only through the stdin pipe, never in
-//! argv or environment variables. Sessions exceeding `session_ttl_secs`
-//! (default 300 seconds) are stopped automatically.
+//! Shared secret and TOTP primitives.
+
+pub mod wire;
 
 use data_encoding::{BASE32, BASE32_NOPAD};
 use hmac::{Hmac, KeyInit, Mac};

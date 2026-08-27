@@ -1,7 +1,8 @@
 // AC-02, AC-03, AC-04, AC-05 — login handoff and leak-free session delivery.
 // Traceability: docs/secret/briefs/tegata-phase1.md 受け入れ条件 #2-#5.
-import { expect, test } from "vitest";
+
 import { chromium } from "playwright-core";
+import { expect, test } from "vitest";
 import {
   FORBIDDEN_ARTIFACTS,
   fixtureSteps,

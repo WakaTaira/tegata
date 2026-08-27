@@ -53,32 +53,62 @@ interface ScanTarget {
   path: string;
 }
 
-function snapshotFiles(roots: string[]): Map<string, FileSnapshot> {
+function snapshotFiles(
+  roots: string[],
+  observationErrors: string[] = [],
+): Map<string, FileSnapshot> {
   const snapshot = new Map<string, FileSnapshot>();
 
   for (const root of roots) {
-    addFilesToSnapshot(path.resolve(root), snapshot);
+    addFilesToSnapshot(path.resolve(root), snapshot, observationErrors, true);
   }
 
   return snapshot;
 }
 
+function isIgnorableFsError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error.code === "EACCES" || error.code === "ENOENT")
+  );
+}
+
+function isIgnorableEnvironError(error: unknown): boolean {
+  return (
+    isIgnorableFsError(error) ||
+    (typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      error.code === "ESRCH")
+  );
+}
+
 function addFilesToSnapshot(
   directory: string,
   snapshot: Map<string, FileSnapshot>,
+  observationErrors: string[] = [],
+  isWatchedRoot = false,
 ): void {
   try {
     if (!fs.lstatSync(directory).isDirectory()) {
       return;
     }
-  } catch {
+  } catch (error) {
+    if (isWatchedRoot || !isIgnorableFsError(error)) {
+      observationErrors.push(`lstat ${directory}: ${String(error)}`);
+    }
     return;
   }
 
   let entries: fs.Dirent[];
   try {
     entries = fs.readdirSync(directory, { withFileTypes: true });
-  } catch {
+  } catch (error) {
+    if (isWatchedRoot || !isIgnorableFsError(error)) {
+      observationErrors.push(`readdir ${directory}: ${String(error)}`);
+    }
     return;
   }
 
@@ -89,7 +119,7 @@ function addFilesToSnapshot(
     }
 
     if (entry.isDirectory()) {
-      addFilesToSnapshot(entryPath, snapshot);
+      addFilesToSnapshot(entryPath, snapshot, observationErrors);
       continue;
     }
 
@@ -100,8 +130,10 @@ function addFilesToSnapshot(
     try {
       const stats = fs.lstatSync(entryPath);
       snapshot.set(entryPath, { size: stats.size, mtimeMs: stats.mtimeMs });
-    } catch {
-      // Files can disappear while a snapshot is being collected.
+    } catch (error) {
+      if (!isIgnorableFsError(error)) {
+        observationErrors.push(`lstat ${entryPath}: ${String(error)}`);
+      }
     }
   }
 }
@@ -109,8 +141,9 @@ function addFilesToSnapshot(
 function changedFiles(
   roots: string[],
   initialSnapshot: Map<string, FileSnapshot>,
+  observationErrors: string[],
 ): string[] {
-  const currentSnapshot = snapshotFiles(roots);
+  const currentSnapshot = snapshotFiles(roots, observationErrors);
   const changed: string[] = [];
 
   for (const [filePath, current] of currentSnapshot) {
@@ -171,13 +204,22 @@ export async function createLeakGuard(
   const canaries = new Map<string, string>();
   const observed: ObservedValue[] = [];
   const psSamples: string[] = [];
-  const initialSnapshot = snapshotFiles(opts.agentVisibleRoots);
+  const observationErrors: string[] = [];
+  const initialSnapshot = snapshotFiles(
+    opts.agentVisibleRoots,
+    observationErrors,
+  );
   const workDir = await fs.promises.mkdtemp(
     path.join(os.tmpdir(), "tegata-leak-"),
   );
   const observedDir = path.join(workDir, "observed");
   const psDir = path.join(workDir, "ps");
-  await Promise.all([fs.promises.mkdir(observedDir), fs.promises.mkdir(psDir)]);
+  const environDir = path.join(workDir, "environ");
+  await Promise.all([
+    fs.promises.mkdir(observedDir),
+    fs.promises.mkdir(psDir),
+    fs.promises.mkdir(environDir),
+  ]);
 
   const pendingSamples = new Set<Promise<void>>();
   let samplingStopped = false;
@@ -186,6 +228,8 @@ export async function createLeakGuard(
       execFile("ps", ["-eo", "args"], { encoding: "utf8" }, (error, stdout) => {
         if (error === null) {
           psSamples.push(stdout);
+        } else {
+          observationErrors.push(`ps: ${error.message}`);
         }
         resolve();
       });
@@ -251,9 +295,54 @@ export async function createLeakGuard(
     return targets;
   };
 
+  const writeEnvironSamples = async (): Promise<ScanTarget[]> => {
+    const targets: ScanTarget[] = [];
+    let entries: string[];
+    try {
+      entries = await fs.promises.readdir("/proc");
+    } catch (error) {
+      observationErrors.push(`readdir /proc: ${String(error)}`);
+      return targets;
+    }
+
+    for (const entry of entries) {
+      if (!/^\d+$/.test(entry)) {
+        continue;
+      }
+      const environPath = path.join("/proc", entry, "environ");
+      let contents: Buffer;
+      try {
+        contents = await fs.promises.readFile(environPath);
+      } catch (error) {
+        if (!isIgnorableEnvironError(error)) {
+          observationErrors.push(`read ${environPath}: ${String(error)}`);
+        }
+        continue;
+      }
+      const targetPath = path.join(environDir, `${entry}.bin`);
+      await fs.promises.writeFile(targetPath, contents);
+      targets.push({
+        surface: "ps",
+        label: `environ-${entry}`,
+        path: targetPath,
+      });
+    }
+    return targets;
+  };
+
+  const throwObservationErrors = (): void => {
+    if (observationErrors.length > 0) {
+      throw new Error(
+        `Leak observation failed: ${observationErrors.join("; ")}`,
+      );
+    }
+  };
+
   const collectLeaks = async (): Promise<LeakHit[]> => {
     await Promise.all([...pendingSamples]);
     const canaryEntries = [...canaries.entries()];
+    const environTargets = await writeEnvironSamples();
+    throwObservationErrors();
     if (canaryEntries.length === 0) {
       return [];
     }
@@ -263,14 +352,24 @@ export async function createLeakGuard(
       writeObserved(),
       writePsSamples(),
     ]);
-    const fsTargets = changedFiles(opts.agentVisibleRoots, initialSnapshot).map(
+    const fsTargets = changedFiles(
+      opts.agentVisibleRoots,
+      initialSnapshot,
+      observationErrors,
+    ).map(
       (filePath): ScanTarget => ({
         surface: "fs",
         label: filePath,
         path: filePath,
       }),
     );
-    const scanTargets = [...observedTargets, ...fsTargets, ...psTargets];
+    throwObservationErrors();
+    const scanTargets = [
+      ...observedTargets,
+      ...fsTargets,
+      ...psTargets,
+      ...environTargets,
+    ];
     if (scanTargets.length === 0) {
       return [];
     }

@@ -9,11 +9,22 @@ type RpcResponse = {
   error?: { message?: unknown };
 };
 
+const ERROR_CODES = [
+  "INVALID_CREDENTIAL",
+  "MFA_REQUIRED",
+  "SELECTOR_NOT_FOUND",
+  "VAULT_LOCKED",
+  "RATE_LIMITED",
+  "TOTP_NOT_EXPOSABLE",
+  "INTERNAL",
+] as const;
+type ErrorCode = (typeof ERROR_CODES)[number];
+
 const loginStep = z.union([
   z.object({
     action: z.literal("fill"),
     selector: z.string(),
-    value: z.string(),
+    value: z.enum(["{{username}}", "{{password}}", "{{totp}}"]),
   }),
   z.object({
     action: z.literal("click"),
@@ -32,9 +43,12 @@ function internalError(): {
 }
 
 function errorResult(message: string) {
+  const errorCode: ErrorCode = ERROR_CODES.includes(message as ErrorCode)
+    ? (message as ErrorCode)
+    : "INTERNAL";
   return {
     isError: true as const,
-    content: [{ type: "text" as const, text: message }],
+    content: [{ type: "text" as const, text: errorCode }],
   };
 }
 

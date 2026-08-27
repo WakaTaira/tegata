@@ -306,20 +306,39 @@ impl BitwardenCliProvider {
         }
 
         let password = self.run_askpass().await?;
-        self.run_bw(
-            &[
-                "config".to_owned(),
-                "server".to_owned(),
-                self.server_url.clone(),
-            ],
-            None,
-            None,
-        )
-        .await
-        .map_err(|error| {
-            log_bw_error("config server", &error);
-            ErrorCode::Internal
-        })?;
+        // bw CLI はログイン済みの appdata に対して `config server` を拒否する。デーモン
+        // 再起動後は前回のログイン状態が appdata に残っているため、無条件の再設定は
+        // 必ず失敗する。現在の設定値を確認し、一致している場合は再設定しない。
+        let current_server = self
+            .run_bw(&["config".to_owned(), "server".to_owned()], None, None)
+            .await
+            .ok()
+            .and_then(|output| String::from_utf8(output).ok())
+            .map(|value| value.trim().to_owned());
+        if current_server.as_deref() != Some(self.server_url.as_str()) {
+            // サーバーが異なる場合はログイン状態を破棄しなければ設定変更できない。
+            if self
+                .run_bw(&["login".to_owned(), "--check".to_owned()], None, None)
+                .await
+                .is_ok()
+            {
+                let _ = self.run_bw(&["logout".to_owned()], None, None).await;
+            }
+            self.run_bw(
+                &[
+                    "config".to_owned(),
+                    "server".to_owned(),
+                    self.server_url.clone(),
+                ],
+                None,
+                None,
+            )
+            .await
+            .map_err(|error| {
+                log_bw_error("config server", &error);
+                ErrorCode::Internal
+            })?;
+        }
         let logged_in = match self
             .run_bw(&["login".to_owned(), "--check".to_owned()], None, None)
             .await

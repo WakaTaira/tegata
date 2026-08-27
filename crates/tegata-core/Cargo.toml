@@ -6,3 +6,10 @@ license.workspace = true
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+data-encoding = "2.11.1"
+hmac = "0.13.0"
+serde = { version = "1.0.229", features = ["derive"] }
+sha1 = "0.11.0"
+zeroize = "1.9.0"

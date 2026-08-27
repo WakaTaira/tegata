@@ -7,5 +7,9 @@
     "build": "tsc -p tsconfig.json"
   },
   "main": "dist/index.js",
-  "exports": "./dist/index.js"
+  "exports": "./dist/index.js",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "zod": "^4.0.0"
+  }
 }

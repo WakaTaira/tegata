@@ -7,6 +7,7 @@
     "packages/*"
   ],
   "scripts": {
+    "pretest:acceptance": "npm run build --workspaces --if-present && cargo build -p tegatad --features mock-provider",
     "test:acceptance": "vitest run"
   },
   "devDependencies": {

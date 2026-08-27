@@ -7,3 +7,4 @@
 /.direnv/
 /test-artifacts/
 /packages/*/dist/
+/.claude/settings.local.json

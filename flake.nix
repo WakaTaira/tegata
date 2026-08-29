@@ -29,6 +29,7 @@
 
       packages.${system} = {
         bitwarden-cli-compat = pkgsBw.bitwarden-cli;
+        tegata-bridge = tegataPackages.tegata-bridge;
         inherit (tegataPackages)
           leakscan
           tegatad
@@ -45,6 +46,10 @@
         # playwright-core とブラウザ revision が一致している必要があり、ホスト側の
         # playwright-driver はバージョンが乖離しうるため（実配備で launch 即失敗を確認済み）。
         playwrightBrowsersPackage = pkgs.playwright-driver.browsers;
+      };
+
+      nixosModules.tegata-bridge = import ./nix/bridge-module.nix {
+        tegataBridgePackage = tegataPackages.tegata-bridge;
       };
 
       checks.${system} = {
@@ -124,6 +129,31 @@
               provision-test-vault;
           };
         };
+
+        tegata-bridge-eval =
+          let
+            evaluated = nixpkgs.lib.nixosSystem {
+              inherit system;
+              modules = [
+                self.nixosModules.tegata-bridge
+                {
+                  services.tegata-bridge = {
+                    enable = true;
+                    user = "agent";
+                    tokenFile = "/run/tegata-bridge/token";
+                  };
+                  users.users.agent = {
+                    isNormalUser = true;
+                  };
+                }
+              ];
+            };
+          in
+            assert evaluated.config.systemd.services.tegata-bridge.serviceConfig.RuntimeDirectory
+              == "tegata-bridge";
+            assert evaluated.config.systemd.services.tegata-bridge.serviceConfig.ExecStart
+              == "${tegataPackages.tegata-bridge}/bin/tegata-bridge --socket /run/tegata-bridge/bridge.sock --token-file /run/tegata-bridge/token";
+            pkgs.runCommand "tegata-bridge-eval" {} "touch $out";
       };
     };
 }

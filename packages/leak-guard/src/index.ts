@@ -8,6 +8,7 @@ export interface LeakGuardOptions {
   leakscanBin: string;
   agentVisibleRoots: string[];
   psSampleIntervalMs?: number;
+  psSampleCommands?: string[][];
 }
 
 export interface LeakHit {
@@ -51,6 +52,28 @@ interface ScanTarget {
   surface: "observed" | "fs" | "ps";
   label: string;
   path: string;
+}
+
+interface PsSample {
+  command: string;
+  stdout: string;
+}
+
+function formatPsSamplerError(command: string, error: unknown): string {
+  const errorObject =
+    typeof error === "object" && error !== null
+      ? (error as { code?: unknown; signal?: unknown })
+      : undefined;
+  if (typeof errorObject?.signal === "string") {
+    return `${command}: killed by signal ${errorObject.signal}`;
+  }
+  if (typeof errorObject?.code === "number") {
+    return `${command}: exited with code ${errorObject.code}`;
+  }
+  if (typeof errorObject?.code === "string") {
+    return `${command}: failed to start: ${errorObject.code}`;
+  }
+  return `${command}: failed to start`;
 }
 
 function snapshotFiles(
@@ -203,7 +226,7 @@ export async function createLeakGuard(
   const runId = crypto.randomBytes(8).toString("hex");
   const canaries = new Map<string, string>();
   const observed: ObservedValue[] = [];
-  const psSamples: string[] = [];
+  const psSamples: PsSample[] = [];
   const observationErrors: string[] = [];
   const initialSnapshot = snapshotFiles(
     opts.agentVisibleRoots,
@@ -213,10 +236,12 @@ export async function createLeakGuard(
     path.join(os.tmpdir(), "tegata-leak-"),
   );
   const observedDir = path.join(workDir, "observed");
+  const fsDir = path.join(workDir, "fs");
   const psDir = path.join(workDir, "ps");
   const environDir = path.join(workDir, "environ");
   await Promise.all([
     fs.promises.mkdir(observedDir),
+    fs.promises.mkdir(fsDir),
     fs.promises.mkdir(psDir),
     fs.promises.mkdir(environDir),
   ]);
@@ -225,14 +250,41 @@ export async function createLeakGuard(
   let samplingStopped = false;
   let interval: NodeJS.Timeout | undefined = setInterval(() => {
     const sample = new Promise<void>((resolve) => {
-      execFile("ps", ["-eo", "args"], { encoding: "utf8" }, (error, stdout) => {
-        if (error === null) {
-          psSamples.push(stdout);
-        } else {
-          observationErrors.push(`ps: ${error.message}`);
-        }
-        resolve();
-      });
+      const commands = opts.psSampleCommands ?? [["ps", "-eo", "args"]];
+      Promise.all(
+        commands.map(
+          (argv) =>
+            new Promise<void>((resolveCommand) => {
+              const [command, ...args] = argv;
+              if (command === undefined) {
+                observationErrors.push("ps: sampler command is empty");
+                resolveCommand();
+                return;
+              }
+              try {
+                execFile(
+                  command,
+                  args,
+                  { encoding: "utf8" },
+                  (error, stdout) => {
+                    if (stdout !== "") {
+                      psSamples.push({ command, stdout });
+                    }
+                    if (error !== null) {
+                      observationErrors.push(
+                        formatPsSamplerError(command, error),
+                      );
+                    }
+                    resolveCommand();
+                  },
+                );
+              } catch (error) {
+                observationErrors.push(formatPsSamplerError(command, error));
+                resolveCommand();
+              }
+            }),
+        ),
+      ).then(() => resolve());
     });
     pendingSamples.add(sample);
     void sample.then(
@@ -284,10 +336,10 @@ export async function createLeakGuard(
     await Promise.all(
       psSamples.map(async (sample, index) => {
         const targetPath = path.join(psDir, `${index}.txt`);
-        await fs.promises.writeFile(targetPath, sample);
+        await fs.promises.writeFile(targetPath, sample.stdout);
         targets.push({
           surface: "ps",
-          label: `ps-sample-${index}`,
+          label: `ps-sample-${index}-${path.basename(sample.command)}`,
           path: targetPath,
         });
       }),
@@ -352,15 +404,34 @@ export async function createLeakGuard(
       writeObserved(),
       writePsSamples(),
     ]);
-    const fsTargets = changedFiles(
-      opts.agentVisibleRoots,
-      initialSnapshot,
-      observationErrors,
-    ).map(
-      (filePath): ScanTarget => ({
-        surface: "fs",
-        label: filePath,
-        path: filePath,
+    const fsTargets: ScanTarget[] = [];
+    await Promise.all(
+      changedFiles(
+        opts.agentVisibleRoots,
+        initialSnapshot,
+        observationErrors,
+      ).map(async (filePath, index) => {
+        const targetPath = path.join(fsDir, `${index}`);
+        try {
+          await fs.promises.copyFile(filePath, targetPath);
+        } catch (error) {
+          const errorCode =
+            typeof error === "object" && error !== null && "code" in error
+              ? error.code
+              : undefined;
+          if (errorCode === "ENOENT") {
+            return;
+          }
+          observationErrors.push(
+            `copy fs target: ${typeof errorCode === "string" ? errorCode : "unknown error"}`,
+          );
+          return;
+        }
+        fsTargets.push({
+          surface: "fs",
+          label: filePath,
+          path: targetPath,
+        });
       }),
     );
     throwObservationErrors();

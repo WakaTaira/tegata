@@ -8,7 +8,8 @@
   ],
   "scripts": {
     "pretest:acceptance": "npm run build --workspaces --if-present && cargo build -p tegatad -p leakscan --features tegatad/mock-provider",
-    "test:acceptance": "vitest run"
+    "test:acceptance": "vitest run",
+    "test:acceptance:windows": "vitest run --config tests/acceptance/windows/vitest.config.ts"
   },
   "devDependencies": {
     "@modelcontextprotocol/sdk": "^1.17.0",

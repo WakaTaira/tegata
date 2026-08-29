@@ -1,9 +1,15 @@
+#[cfg(windows)]
+mod dpapi;
+mod secure_fs;
+mod transport;
+#[cfg(windows)]
+mod windows_cli;
+#[cfg(windows)]
+mod windows_service;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,27 +23,60 @@ use tegata_core::wire::{
     RpcResponse,
 };
 use tegata_core::{Secret, totp};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, interval, timeout};
 use uuid::Uuid;
 
+#[cfg(windows)]
+use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use tegata_core::wire::{AdminSealParams, AdminTokenIssueResult};
+#[cfg(windows)]
+use zeroize::Zeroize;
+
+#[cfg(windows)]
+use crate::transport::CdpPortResolver;
+use crate::transport::{Accepted, PeerIdentity, PlatformConfig, PlatformTransport, Transport};
+
 const JSON_RPC_VERSION: &str = "2.0";
 const METHOD_NOT_FOUND: i32 = -32601;
 const CLASSIFICATION_ERROR: i32 = -32000;
 const EXECUTOR_TIMEOUT: Duration = Duration::from_secs(90);
+const BW_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+
+type ReadySender = Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<Result<(), String>>>>>;
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    socket_path: String,
     state_dir: String,
     audit_log_path: String,
-    allowed_uids: Vec<u32>,
     executor_entry: Option<String>,
     session_ttl_secs: Option<u64>,
+    #[cfg(windows)]
+    #[serde(default = "default_unlock_mode")]
+    unlock_mode: UnlockMode,
+    #[serde(default)]
     providers: Vec<ProviderConfig>,
+    /// Keys of the platform transport, read from the same top level table.
+    /// Which keys those are depends on the target, so the transport module
+    /// owns them.
+    #[serde(flatten)]
+    transport: PlatformConfig,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum UnlockMode {
+    Sealed,
+    Askpass,
+}
+
+#[cfg(windows)]
+fn default_unlock_mode() -> UnlockMode {
+    UnlockMode::Sealed
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,12 +156,17 @@ struct BitwardenCliProvider {
     askpass_cmd: String,
     appdata_dir: PathBuf,
     password_dir: PathBuf,
+    bw_path: Option<PathBuf>,
     totp_exposable: Vec<String>,
     session_ttl: Duration,
     session: Option<Secret>,
     unlocked_at: Option<Instant>,
     locked: bool,
     catalog: Vec<BitwardenCatalogItem>,
+    #[cfg(windows)]
+    unlock_mode: UnlockMode,
+    #[cfg(windows)]
+    sealed_blob_path: PathBuf,
 }
 
 struct BitwardenCatalogItem {
@@ -157,6 +201,7 @@ enum BwRunError {
     PasswordFile(io::Error),
     Process(io::Error),
     NonZeroExit(std::process::ExitStatus),
+    Timeout,
 }
 
 impl fmt::Display for BwRunError {
@@ -176,6 +221,7 @@ impl fmt::Display for BwRunError {
                     .code()
                     .map_or_else(|| "signal".to_owned(), |code| code.to_string()),
             ),
+            Self::Timeout => write!(formatter, "bw command timed out"),
         }
     }
 }
@@ -199,7 +245,7 @@ impl BitwardenCliProvider {
         tokio::fs::create_dir_all(&self.password_dir)
             .await
             .map_err(BwRunError::CreateDir)?;
-        tokio::fs::set_permissions(&self.password_dir, std::fs::Permissions::from_mode(0o700))
+        secure_fs::restrict_directory(&self.password_dir)
             .await
             .map_err(BwRunError::CreateDir)?;
         let password_file = if let Some(password) = password {
@@ -207,13 +253,7 @@ impl BitwardenCliProvider {
                 .password_dir
                 .join(format!(".bw-password-{}", Uuid::new_v4()));
             let guard = PasswordFileGuard::new(path.clone());
-            let mut file = match tokio::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&path)
-                .await
-            {
+            let mut file = match secure_fs::create_private_file(&path).await {
                 Ok(file) => file,
                 Err(error) => {
                     drop(guard);
@@ -242,21 +282,51 @@ impl BitwardenCliProvider {
             command_args.push("--passwordfile".to_owned());
             command_args.push(path.to_string_lossy().into_owned());
         }
-        let mut command = Command::new("bw");
+        let bw_path = self.bw_path.as_deref().unwrap_or_else(|| Path::new("bw"));
+        let mut command = Command::new(bw_path);
         command
             .args(&command_args)
             .env("BW_APPDATA_DIR", &self.appdata_dir)
             .env("BITWARDENCLI_APPDATA_DIR", &self.appdata_dir)
             .env_remove("BW_PASSWORD")
             .env_remove("BW_SESSION")
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
         if let Some(session) = session {
             command.env("BW_SESSION", session.as_str());
         }
-        let result = match command.output().await {
-            Ok(output) if output.status.success() => Ok(output.stdout),
-            Ok(output) => Err(BwRunError::NonZeroExit(output.status)),
+        let result = match command.spawn() {
+            Ok(mut child) => match child.stdout.take() {
+                Some(mut stdout) => match timeout(BW_COMMAND_TIMEOUT, async {
+                    let mut output = Vec::new();
+                    let (status, read_result) =
+                        tokio::join!(child.wait(), stdout.read_to_end(&mut output));
+                    let status = status.map_err(BwRunError::Process)?;
+                    read_result.map_err(BwRunError::Process)?;
+                    if status.success() {
+                        Ok(output)
+                    } else {
+                        Err(BwRunError::NonZeroExit(status))
+                    }
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        Err(BwRunError::Timeout)
+                    }
+                },
+                None => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    let error =
+                        io::Error::new(io::ErrorKind::BrokenPipe, "bw stdout was not piped");
+                    Err(BwRunError::Process(error))
+                }
+            },
             Err(error) => Err(BwRunError::Process(error)),
         };
         if let Some((path, _)) = password_file {
@@ -269,27 +339,76 @@ impl BitwardenCliProvider {
         tokio::fs::create_dir_all(&self.appdata_dir)
             .await
             .map_err(|_| ErrorCode::Internal)?;
-        let output = Command::new("sh")
+        let mut command = Command::new("sh");
+        command
             .args(["-c", self.askpass_cmd.as_str()])
             .env("BW_APPDATA_DIR", &self.appdata_dir)
             .env("BITWARDENCLI_APPDATA_DIR", &self.appdata_dir)
             .env_remove("BW_PASSWORD")
             .env_remove("BW_SESSION")
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .await
-            .map_err(|_| ErrorCode::Internal)?;
-        if !output.status.success() {
+            .stderr(std::process::Stdio::null());
+        let mut child = command.spawn().map_err(|_| ErrorCode::Internal)?;
+        let Some(mut stdout) = child.stdout.take() else {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(ErrorCode::Internal);
+        };
+        let (status, output) = match timeout(BW_COMMAND_TIMEOUT, async {
+            let mut output = Vec::new();
+            let (status, read_result) = tokio::join!(child.wait(), stdout.read_to_end(&mut output));
+            (status, read_result.map(|_| output))
+        })
+        .await
+        {
+            Ok((status, Ok(output))) => (status.map_err(|_| ErrorCode::Internal)?, output),
+            Ok((_, Err(_))) => return Err(ErrorCode::Internal),
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(ErrorCode::Internal);
+            }
+        };
+        if !status.success() {
             return Err(ErrorCode::Internal);
         }
-        let first_line = String::from_utf8(output.stdout)
+        let first_line = String::from_utf8(output)
             .ok()
             .and_then(|value| value.lines().next().map(ToOwned::to_owned))
             .map(|value| value.trim_end_matches('\r').to_owned())
             .filter(|value| !value.is_empty())
             .ok_or(ErrorCode::Internal)?;
         Ok(Secret::new(first_line))
+    }
+
+    async fn password(&self) -> Result<Secret, ErrorCode> {
+        #[cfg(windows)]
+        if self.unlock_mode == UnlockMode::Sealed {
+            return dpapi::unseal(&self.sealed_blob_path)
+                .map_err(|_| ErrorCode::AdminSealUnavailable);
+        }
+        self.run_askpass().await
+    }
+
+    async fn login_with_password(
+        &self,
+        login_args: &[String],
+        password: &Secret,
+    ) -> Result<String, ErrorCode> {
+        let session = self
+            .run_bw(login_args, None, Some(password))
+            .await
+            .map_err(|error| {
+                log_bw_error("login or unlock", &error);
+                ErrorCode::Internal
+            })?;
+        String::from_utf8(session)
+            .ok()
+            .and_then(|value| value.lines().next().map(ToOwned::to_owned))
+            .map(|value| value.trim_end_matches('\r').to_owned())
+            .filter(|value| !value.is_empty())
+            .ok_or(ErrorCode::Internal)
     }
 
     async fn ensure_session(&mut self) -> Result<(), ErrorCode> {
@@ -305,7 +424,7 @@ impl BitwardenCliProvider {
             return Err(ErrorCode::VaultLocked);
         }
 
-        let password = self.run_askpass().await?;
+        let password = self.password().await?;
         // bw CLI はログイン済みの appdata に対して `config server` を拒否する。デーモン
         // 再起動後は前回のログイン状態が appdata に残っているため、無条件の再設定は
         // 必ず失敗する。現在の設定値を確認し、一致している場合は再設定しない。
@@ -316,7 +435,7 @@ impl BitwardenCliProvider {
             .and_then(|output| String::from_utf8(output).ok())
             .map(|value| value.trim().to_owned());
         if current_server.as_deref() != Some(self.server_url.as_str()) {
-            // サーバーが異なる場合はログイン状態を破棄しなければ設定変更できない。
+            // If the server differs, the login state must be discarded before changing the configuration.
             if self
                 .run_bw(&["login".to_owned(), "--check".to_owned()], None, None)
                 .await
@@ -355,21 +474,32 @@ impl BitwardenCliProvider {
         } else {
             vec!["login".to_owned(), self.email.clone(), "--raw".to_owned()]
         };
-        let session = self
-            .run_bw(&login_args, None, Some(&password))
-            .await
-            .map_err(|error| {
-                log_bw_error("login or unlock", &error);
-                ErrorCode::Internal
-            })?;
+        let session = self.login_with_password(&login_args, &password).await?;
         drop(password);
-        let session = String::from_utf8(session)
-            .ok()
-            .and_then(|value| value.lines().next().map(ToOwned::to_owned))
-            .map(|value| value.trim_end_matches('\r').to_owned())
-            .filter(|value| !value.is_empty())
-            .ok_or(ErrorCode::Internal)?;
         self.session = Some(Secret::new(session));
+        if let Err(_error) = self
+            .run_bw(&["sync".to_owned()], self.session.as_ref(), None)
+            .await
+        {
+            self.session = None;
+            self.unlocked_at = None;
+            let _ = self.run_bw(&["logout".to_owned()], None, None).await;
+
+            let password = self.password().await?;
+            let login_args = vec!["login".to_owned(), self.email.clone(), "--raw".to_owned()];
+            let session = self.login_with_password(&login_args, &password).await?;
+            drop(password);
+            self.session = Some(Secret::new(session));
+            if let Err(error) = self
+                .run_bw(&["sync".to_owned()], self.session.as_ref(), None)
+                .await
+            {
+                log_bw_error("sync", &error);
+                self.session = None;
+                self.unlocked_at = None;
+                return Err(ErrorCode::Internal);
+            }
+        }
         self.unlocked_at = Some(Instant::now());
         Ok(())
     }
@@ -524,7 +654,14 @@ struct DaemonState {
     audit_log_path: PathBuf,
     audit_lock: Arc<Mutex<()>>,
     executor_entry: PathBuf,
+    node_path: PathBuf,
+    browsers_path: Option<PathBuf>,
+    cdp_ports: Arc<std::sync::RwLock<HashMap<String, u16>>>,
     session_ttl: Duration,
+    #[cfg(windows)]
+    token_hash_path: PathBuf,
+    #[cfg(windows)]
+    sealed_blob_path: PathBuf,
 }
 
 type SharedState = Arc<Mutex<DaemonState>>;
@@ -538,6 +675,12 @@ enum ErrorCode {
     RateLimited,
     TotpNotExposable,
     Internal,
+    #[cfg(windows)]
+    Unauthorized,
+    #[cfg(windows)]
+    AdminRequired,
+    #[cfg(windows)]
+    AdminSealUnavailable,
 }
 
 impl ErrorCode {
@@ -550,14 +693,22 @@ impl ErrorCode {
             Self::RateLimited => "RATE_LIMITED",
             Self::TotpNotExposable => "TOTP_NOT_EXPOSABLE",
             Self::Internal => "INTERNAL",
+            #[cfg(windows)]
+            Self::Unauthorized => "UNAUTHORIZED",
+            #[cfg(windows)]
+            Self::AdminRequired => "ADMIN_REQUIRED",
+            #[cfg(windows)]
+            Self::AdminSealUnavailable => "ADMIN_SEAL_UNAVAILABLE",
         }
     }
 }
 
 #[derive(Serialize)]
-struct AuditRecord {
+struct AuditRecord<'a> {
     ts: String,
-    peer_uid: u32,
+    /// One key that names the peer the way its transport identifies it.
+    #[serde(flatten)]
+    peer: &'a PeerIdentity,
     method: String,
     cred_id: Option<String>,
     target_url: Option<String>,
@@ -577,7 +728,13 @@ struct HandledRequest {
 #[derive(Parser)]
 struct Args {
     #[arg(long)]
-    config: PathBuf,
+    config: Option<PathBuf>,
+    #[cfg(windows)]
+    #[arg(long)]
+    foreground: bool,
+    #[cfg(windows)]
+    #[command(subcommand)]
+    command: Option<windows_cli::WindowsCommand>,
 }
 
 const PASSWORD_FILE_DIR: &str = ".bw-passwords";
@@ -585,7 +742,7 @@ const PASSWORD_FILE_DIR: &str = ".bw-passwords";
 async fn prepare_password_dir(state_dir: &Path) -> io::Result<PathBuf> {
     let password_dir = state_dir.join(PASSWORD_FILE_DIR);
     tokio::fs::create_dir_all(&password_dir).await?;
-    tokio::fs::set_permissions(&password_dir, std::fs::Permissions::from_mode(0o700)).await?;
+    secure_fs::restrict_directory(&password_dir).await?;
     let mut entries = tokio::fs::read_dir(&password_dir).await?;
     while let Some(entry) = entries.next_entry().await? {
         if entry
@@ -599,66 +756,162 @@ async fn prepare_password_dir(state_dir: &Path) -> io::Result<PathBuf> {
     Ok(password_dir)
 }
 
-fn socket_activation_enabled() -> bool {
-    std::env::var("LISTEN_FDS").ok().as_deref() == Some("1")
-        && std::env::var("LISTEN_PID").ok().as_deref() == Some(&std::process::id().to_string())
-}
-
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
+fn main() {
+    if let Err(error) = run() {
         eprintln!("tegatad: {error}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let config_text = tokio::fs::read_to_string(&args.config).await?;
-    let config: Config = toml::from_str(&config_text)?;
-    let socket_path = PathBuf::from(&config.socket_path);
-    tokio::fs::create_dir_all(&config.state_dir).await?;
-    let password_dir = prepare_password_dir(Path::new(&config.state_dir)).await?;
-    if let Some(parent) = socket_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+    #[cfg(windows)]
+    {
+        if let Some(command) = args.command {
+            return match command {
+                windows_cli::WindowsCommand::Status { pipe } => {
+                    windows_cli::run_windows_cli(&pipe, "status", json!({}))
+                }
+                windows_cli::WindowsCommand::Token { command } => match command {
+                    windows_cli::TokenCommand::Issue { pipe } => {
+                        windows_cli::run_windows_cli(&pipe, "admin_token_issue", json!({}))
+                    }
+                },
+                windows_cli::WindowsCommand::Seal { pipe } => {
+                    let mut password = windows_cli::read_master_password()?;
+                    let result = windows_cli::run_windows_cli(
+                        &pipe,
+                        "admin_seal",
+                        json!({
+                            "master_password": password.as_str(),
+                        }),
+                    );
+                    password.zeroize();
+                    result
+                }
+                windows_cli::WindowsCommand::Service { command } => match command {
+                    windows_service::ServiceCommand::Install { config } => {
+                        windows_service::install_service(&config)
+                    }
+                    windows_service::ServiceCommand::Uninstall => {
+                        windows_service::uninstall_service()
+                    }
+                },
+            };
+        }
+        let config = args.config.ok_or("--config is required")?;
+        let foreground = args.foreground;
+        if foreground {
+            return run_daemon_runtime(&config, true, None);
+        }
+        windows_service::START().map_err(Into::into)
     }
-    let listener = if socket_activation_enabled() {
-        let listener = unsafe { StdUnixListener::from_raw_fd(3) };
-        listener.set_nonblocking(true)?;
-        UnixListener::from_std(listener)?
-    } else {
-        if socket_path.exists() {
-            tokio::fs::remove_file(&socket_path).await?;
-        }
-        let listener = UnixListener::bind(&socket_path)?;
-        tokio::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666)).await?;
-        listener
-    };
-    let allowed_uids = Arc::new(config.allowed_uids.clone());
-    let state = Arc::new(Mutex::new(build_state(config, password_dir)));
-    spawn_session_reaper(state.clone());
-    spawn_bitwarden_session_reaper(state.clone());
 
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let peer_uid = match peer_uid(&stream) {
-            Ok(uid) => uid,
-            Err(_) => continue,
-        };
-        if !allowed_uids.contains(&peer_uid) {
-            continue;
-        }
-        let state = state.clone();
-        tokio::spawn(async move {
-            serve_connection(stream, peer_uid, state).await;
-        });
+    #[cfg(unix)]
+    {
+        let config = args.config.ok_or("--config is required")?;
+        run_daemon_runtime(&config, false, None)
     }
 }
 
+fn run_daemon_runtime(
+    config_path: &Path,
+    ready: bool,
+    stop: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_daemon(config_path, ready, stop, None))
+}
+
+async fn run_daemon(
+    config_path: &Path,
+    ready: bool,
+    stop: Option<tokio::sync::oneshot::Receiver<()>>,
+    ready_sender: Option<ReadySender>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config_text = tokio::fs::read_to_string(config_path).await?;
+    let config: Config = toml::from_str(&config_text)?;
+    #[cfg(windows)]
+    let (token_hash_path, _sealed_blob_path) = resolve_windows_paths(&config);
+    #[cfg(windows)]
+    let transport_config = config.transport.clone();
+    #[cfg(unix)]
+    let transport = PlatformTransport::bind(&config.transport).await?;
+    tokio::fs::create_dir_all(&config.state_dir).await?;
+    let password_dir = prepare_password_dir(Path::new(&config.state_dir)).await?;
+    let state = Arc::new(Mutex::new(build_state(config, password_dir)));
+    #[cfg(windows)]
+    let transport = {
+        let cdp_ports = state.lock().await.cdp_ports.clone();
+        let resolver: CdpPortResolver = Arc::new(move |session_id| {
+            cdp_ports
+                .read()
+                .ok()
+                .and_then(|ports| ports.get(session_id).copied())
+        });
+        PlatformTransport::bind(&transport_config, &token_hash_path, resolver).await?
+    };
+    if let Some(sender) = ready_sender
+        && let Some(sender) = sender.lock().expect("service ready lock").take()
+    {
+        let _ = sender.send(Ok(()));
+    }
+    spawn_session_reaper(state.clone());
+    spawn_bitwarden_session_reaper(state.clone());
+    if ready {
+        let ready_line = r#"{"ready":true}"#;
+        println!("{}", ready_line);
+        std::io::Write::flush(&mut std::io::stdout())?;
+    }
+    serve_transport(transport, state, stop).await
+}
+
+async fn serve_transport(
+    mut transport: PlatformTransport,
+    state: SharedState,
+    mut stop: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        if let Some(stop) = stop.as_mut() {
+            tokio::select! {
+                result = transport.accept() => process_accepted(result?, state.clone()).await?,
+                _ = &mut *stop => break,
+            }
+        } else {
+            process_accepted(transport.accept().await?, state.clone()).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn process_accepted<S>(
+    accepted: Accepted<S>,
+    state: SharedState,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    if let Accepted::Rpc { peer, stream } = accepted {
+        tokio::spawn(async move {
+            serve_connection(stream, peer, state).await;
+        });
+    }
+    Ok(())
+}
+
 fn build_state(config: Config, password_dir: PathBuf) -> DaemonState {
+    #[cfg(windows)]
+    let (token_hash_path, sealed_blob_path) = resolve_windows_paths(&config);
+    #[cfg(windows)]
+    let unlock_mode = config.unlock_mode;
     let mut registry = Vec::new();
     let audit_log_path = PathBuf::from(&config.audit_log_path);
     let executor_entry = resolve_executor_entry(&config);
+    let node_path = resolve_node_path(&config);
+    let browsers_path = resolve_browsers_path(&config);
+    let bw_path = resolve_bw_path(&config);
     let session_ttl = Duration::from_secs(config.session_ttl_secs.unwrap_or(300));
     let state_dir = PathBuf::from(&config.state_dir);
     let providers = config
@@ -686,6 +939,7 @@ fn build_state(config: Config, password_dir: PathBuf) -> DaemonState {
                         appdata_dir: state_dir
                             .join(format!("bw-{}", safe_path_component(&namespace))),
                         password_dir: password_dir.clone(),
+                        bw_path: bw_path.clone(),
                         server_url,
                         email,
                         askpass_cmd,
@@ -697,6 +951,10 @@ fn build_state(config: Config, password_dir: PathBuf) -> DaemonState {
                         unlocked_at: None,
                         locked: false,
                         catalog: Vec::new(),
+                        #[cfg(windows)]
+                        unlock_mode,
+                        #[cfg(windows)]
+                        sealed_blob_path: sealed_blob_path.clone(),
                     }))),
                 ),
             };
@@ -736,7 +994,14 @@ fn build_state(config: Config, password_dir: PathBuf) -> DaemonState {
         audit_log_path,
         audit_lock: Arc::new(Mutex::new(())),
         executor_entry,
+        node_path,
+        browsers_path,
+        cdp_ports: Arc::new(std::sync::RwLock::new(HashMap::new())),
         session_ttl,
+        #[cfg(windows)]
+        token_hash_path,
+        #[cfg(windows)]
+        sealed_blob_path,
     }
 }
 
@@ -769,6 +1034,65 @@ fn resolve_executor_entry(config: &Config) -> PathBuf {
         .join("../../../packages/tegata-executor/dist/index.js")
 }
 
+fn resolve_node_path(config: &Config) -> PathBuf {
+    #[cfg(windows)]
+    {
+        config
+            .transport
+            .node_path
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("node"))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = config;
+        PathBuf::from("node")
+    }
+}
+
+fn resolve_browsers_path(config: &Config) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        config.transport.browsers_path.as_deref().map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = config;
+        None
+    }
+}
+
+fn resolve_bw_path(config: &Config) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        config.transport.bw_path.as_deref().map(PathBuf::from)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = config;
+        None
+    }
+}
+
+#[cfg(windows)]
+fn resolve_windows_paths(config: &Config) -> (PathBuf, PathBuf) {
+    let state_dir = Path::new(&config.state_dir);
+    let token_hash_path = config
+        .transport
+        .token_hash_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.join("token_hash"));
+    let sealed_blob_path = config
+        .transport
+        .sealed_blob_path
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.join("sealed.blob"));
+    (token_hash_path, sealed_blob_path)
+}
+
 fn spawn_session_reaper(state: SharedState) {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(1));
@@ -783,7 +1107,11 @@ fn spawn_session_reaper(state: SharedState) {
                     .filter_map(|(id, session)| (session.expires_at <= now).then_some(id.clone()))
                     .collect();
                 ids.into_iter()
-                    .filter_map(|id| daemon.sessions.remove(&id))
+                    .filter_map(|id| {
+                        let session = daemon.sessions.remove(&id)?;
+                        let _ = daemon.cdp_ports.write().map(|mut ports| ports.remove(&id));
+                        Some(session)
+                    })
                     .collect::<Vec<_>>()
             };
             for session in expired {
@@ -813,15 +1141,18 @@ fn spawn_bitwarden_session_reaper(state: SharedState) {
     });
 }
 
-async fn serve_connection(stream: UnixStream, peer_uid: u32, state: SharedState) {
-    let (read_half, mut write_half) = stream.into_split();
+async fn serve_connection<S>(stream: S, peer: PeerIdentity, state: SharedState)
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin,
+{
+    let (read_half, mut write_half) = tokio::io::split(stream);
     let mut lines = BufReader::new(read_half).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         let parsed = serde_json::from_str::<RpcRequest>(&line);
         let (request, response, outcome, fields) = match parsed {
             Ok(request) => {
                 let fields = audit_fields(&request.params);
-                let handled = handle_request(&request, state.clone()).await;
+                let handled = handle_request(&request, state.clone(), &peer).await;
                 (Some(request), handled.response, handled.outcome, fields)
             }
             Err(_) => (
@@ -842,7 +1173,7 @@ async fn serve_connection(stream: UnixStream, peer_uid: u32, state: SharedState)
             &mut write_half,
             &response,
             &state,
-            peer_uid,
+            &peer,
             method,
             fields,
             outcome,
@@ -855,11 +1186,11 @@ async fn serve_connection(stream: UnixStream, peer_uid: u32, state: SharedState)
     }
 }
 
-async fn write_response(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
+async fn write_response<W: AsyncWrite + Unpin>(
+    writer: &mut W,
     response: &RpcResponse,
     state: &SharedState,
-    peer_uid: u32,
+    peer: &PeerIdentity,
     method: String,
     fields: AuditFields,
     outcome: String,
@@ -874,7 +1205,7 @@ async fn write_response(
     } else {
         if let Err(error) = append_audit(
             &daemon,
-            peer_uid,
+            peer,
             method.clone(),
             fields.cred_id.clone(),
             fields.target_url.clone(),
@@ -891,7 +1222,7 @@ async fn write_response(
     if leaked.is_empty()
         && let Err(error) = append_audit(
             &daemon,
-            peer_uid,
+            peer,
             method,
             fields.cred_id,
             fields.target_url,
@@ -931,7 +1262,7 @@ impl std::error::Error for AppendAuditError {}
 
 async fn append_audit(
     state: &DaemonState,
-    peer_uid: u32,
+    peer: &PeerIdentity,
     method: String,
     cred_id: Option<String>,
     target_url: Option<String>,
@@ -943,7 +1274,7 @@ async fn append_audit(
             .duration_since(UNIX_EPOCH)
             .map(|duration| format!("unix:{}", duration.as_secs()))
             .unwrap_or_else(|_| "unix:0".to_owned()),
-        peer_uid,
+        peer,
         method,
         cred_id,
         target_url,
@@ -962,10 +1293,31 @@ async fn append_audit(
         .map_err(AppendAuditError::Write)
 }
 
-async fn handle_request(request: &RpcRequest, state: SharedState) -> HandledRequest {
+async fn handle_request(
+    request: &RpcRequest,
+    state: SharedState,
+    peer: &PeerIdentity,
+) -> HandledRequest {
     if request.jsonrpc != JSON_RPC_VERSION {
         return classified(request.id.clone(), ErrorCode::Internal);
     }
+    #[cfg(windows)]
+    if request.method == "admin_seal" || request.method == "admin_token_issue" {
+        if !peer.allows_admin_rpc() {
+            return classified(request.id.clone(), ErrorCode::AdminRequired);
+        }
+        return match request.method.as_str() {
+            "admin_seal" => admin_seal(request, state).await,
+            "admin_token_issue" => admin_token_issue(request, state).await,
+            _ => unreachable!(),
+        };
+    }
+    #[cfg(windows)]
+    if !peer.allows_normal_rpc() {
+        return classified(request.id.clone(), ErrorCode::Unauthorized);
+    }
+    #[cfg(not(windows))]
+    let _ = peer;
     match request.method.as_str() {
         "status" => success(request.id.clone(), json!({ "ok": true })),
         "list_credentials" => list_credentials(request, state).await,
@@ -986,6 +1338,50 @@ async fn handle_request(request: &RpcRequest, state: SharedState) -> HandledRequ
             outcome: "method_not_found".to_owned(),
         },
     }
+}
+
+#[cfg(windows)]
+async fn admin_token_issue(request: &RpcRequest, state: SharedState) -> HandledRequest {
+    let token = Uuid::new_v4().simple().to_string();
+    let digest = Sha256::digest(token.as_bytes());
+    let hash = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let path = state.lock().await.token_hash_path.clone();
+    if tokio::fs::write(path, format!("{hash}\n")).await.is_err() {
+        return classified(request.id.clone(), ErrorCode::Internal);
+    }
+    let result = match serde_json::to_value(AdminTokenIssueResult { token }) {
+        Ok(result) => result,
+        Err(_) => return classified(request.id.clone(), ErrorCode::Internal),
+    };
+    success(request.id.clone(), result)
+}
+
+#[cfg(windows)]
+async fn admin_seal(request: &RpcRequest, state: SharedState) -> HandledRequest {
+    let mut params: AdminSealParams = match parse_params(&request.params) {
+        Ok(params) => params,
+        Err(error) => return classified(request.id.clone(), error),
+    };
+    let path = state.lock().await.sealed_blob_path.clone();
+    // The serde-owned RPC line and Value clones may retain copies of the password beyond this handler.
+    let mut master_password = std::mem::take(&mut params.master_password);
+    let result = seal_master_password(&mut master_password, &path);
+    master_password.zeroize();
+    match result {
+        Ok(()) => success(request.id.clone(), json!({ "ok": true })),
+        Err(error) => classified(request.id.clone(), error),
+    }
+}
+
+#[cfg(windows)]
+fn seal_master_password(
+    master_password: &mut String,
+    sealed_blob_path: &Path,
+) -> Result<(), ErrorCode> {
+    dpapi::seal(master_password, sealed_blob_path).map_err(|_| ErrorCode::AdminSealUnavailable)
 }
 
 async fn list_credentials(request: &RpcRequest, state: SharedState) -> HandledRequest {
@@ -1107,7 +1503,7 @@ async fn login(request: &RpcRequest, state: SharedState) -> HandledRequest {
         Ok(params) => params,
         Err(error) => return classified(request.id.clone(), error),
     };
-    let (credential, executor_entry, ttl) = {
+    let (credential, executor_entry, node_path, browsers_path, ttl) = {
         let credential = match resolve_credential(&state, &params.cred_id).await {
             Ok(Some(credential)) => credential,
             Ok(None) => return classified(request.id.clone(), ErrorCode::InvalidCredential),
@@ -1126,14 +1522,34 @@ async fn login(request: &RpcRequest, state: SharedState) -> HandledRequest {
         (
             credential,
             daemon.executor_entry.clone(),
+            daemon.node_path.clone(),
+            daemon.browsers_path.clone(),
             daemon.session_ttl,
         )
     };
-    let (endpoint, session_id, child) =
-        match start_executor(&executor_entry, &params, &credential).await {
-            Ok(result) => result,
-            Err(error) => return classified(request.id.clone(), error),
-        };
+    let (endpoint, session_id, child) = match start_executor(
+        &executor_entry,
+        &node_path,
+        browsers_path.as_deref(),
+        &params,
+        &credential,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => return classified(request.id.clone(), error),
+    };
+    let Some(cdp_port) = cdp_port_from_endpoint(&endpoint) else {
+        stop_child(child).await;
+        return classified(request.id.clone(), ErrorCode::Internal);
+    };
+    let cdp_ports = state.lock().await.cdp_ports.clone();
+    if let Ok(mut ports) = cdp_ports.write() {
+        ports.insert(session_id.clone(), cdp_port);
+    } else {
+        stop_child(child).await;
+        return classified(request.id.clone(), ErrorCode::Internal);
+    }
     state.lock().await.sessions.insert(
         session_id.clone(),
         Session {
@@ -1155,7 +1571,17 @@ async fn logout(request: &RpcRequest, state: SharedState) -> HandledRequest {
         Ok(session_id) => session_id,
         Err(error) => return classified(request.id.clone(), error),
     };
-    let session = state.lock().await.sessions.remove(&session_id);
+    let session = {
+        let mut daemon = state.lock().await;
+        let session = daemon.sessions.remove(&session_id);
+        if session.is_some() {
+            let _ = daemon
+                .cdp_ports
+                .write()
+                .map(|mut ports| ports.remove(&session_id));
+        }
+        session
+    };
     if let Some(session) = session {
         shutdown_child(session.child).await;
     }
@@ -1310,16 +1736,24 @@ fn register_secret(registry: &mut Vec<String>, secret: &Secret) {
 
 async fn start_executor(
     entry: &Path,
+    node_path: &Path,
+    browsers_path: Option<&Path>,
     params: &LoginParams,
     credential: &ResolvedCredential,
 ) -> Result<(String, String, Child), ErrorCode> {
-    let mut child = Command::new("node")
+    #[cfg(not(windows))]
+    let _ = browsers_path;
+    let mut command = Command::new(node_path);
+    command
         .arg(entry)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|_| ErrorCode::Internal)?;
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    if let Some(browsers_path) = browsers_path {
+        command.env("PLAYWRIGHT_BROWSERS_PATH", browsers_path);
+    }
+    let mut child = command.spawn().map_err(|_| ErrorCode::Internal)?;
     let result = async {
         let stdout = child.stdout.take().ok_or(ErrorCode::Internal)?;
         let totp = credential.totp_seed.as_ref().map(|seed| {
@@ -1379,6 +1813,12 @@ async fn start_executor(
             Err(error)
         }
     }
+}
+
+fn cdp_port_from_endpoint(endpoint: &str) -> Option<u16> {
+    let authority = endpoint.split_once("://")?.1.split('/').next()?;
+    let port = authority.rsplit_once(':')?.1.parse().ok()?;
+    (port != 0).then_some(port)
 }
 
 fn parse_error_code(value: &str) -> ErrorCode {
@@ -1484,25 +1924,71 @@ fn error_response(id: Value, error: ErrorCode) -> RpcResponse {
     }
 }
 
-fn peer_uid(stream: &UnixStream) -> Result<u32, std::io::Error> {
-    let fd = stream.as_raw_fd();
-    let mut credentials = libc::ucred {
-        pid: 0,
-        uid: 0,
-        gid: 0,
-    };
-    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let result = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&mut credentials as *mut libc::ucred).cast(),
-            &mut length,
-        )
-    };
-    if result == -1 {
-        return Err(std::io::Error::last_os_error());
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{AuditRecord, PeerIdentity};
+
+    #[test]
+    fn audit_record_names_the_peer_by_its_transport_identity() {
+        let peer = PeerIdentity::Uid(1000);
+        let record = AuditRecord {
+            ts: "unix:1".to_owned(),
+            peer: &peer,
+            method: "status".to_owned(),
+            cred_id: None,
+            target_url: None,
+            outcome: "ok".to_owned(),
+        };
+        assert_eq!(
+            serde_json::to_string(&record).expect("serialize audit record"),
+            r#"{"ts":"unix:1","peer_uid":1000,"method":"status","cred_id":null,"target_url":null,"outcome":"ok"}"#
+        );
     }
-    Ok(credentials.uid)
+}
+
+#[cfg(all(test, windows))]
+mod windows_config_tests {
+    use super::Config;
+
+    #[test]
+    fn minimal_windows_daemon_config_is_backward_compatible() {
+        let config: Config = toml::from_str(
+            r#"
+pipe_name = "tegatad-test"
+tcp_port = 0
+state_dir = "C:\\Temp\\tegata\\state"
+audit_log_path = "C:\\Temp\\tegata\\state\\audit.log"
+allowed_sids = ["S-1-5-21-1"]
+
+[[providers]]
+namespace = "vault"
+type = "bitwarden-cli"
+server_url = "http://127.0.0.1:8087"
+email = "test@example.com"
+askpass_cmd = "echo password"
+"#,
+        )
+        .expect("parse minimal Windows daemon config");
+
+        assert_eq!(config.providers.len(), 1);
+        assert!(config.transport.operator_sid.is_none());
+        assert!(config.transport.token_hash_path.is_none());
+        assert!(config.transport.sealed_blob_path.is_none());
+        assert_eq!(config.unlock_mode, super::UnlockMode::Sealed);
+        assert!(config.transport.browsers_path.is_none());
+        assert!(config.transport.bw_path.is_none());
+        assert!(config.transport.node_path.is_none());
+
+        let config: Config = toml::from_str(
+            r#"
+pipe_name = "tegatad-test"
+tcp_port = 0
+state_dir = "C:\\Temp\\tegata\\state"
+audit_log_path = "C:\\Temp\\tegata\\state\\audit.log"
+allowed_sids = []
+"#,
+        )
+        .expect("parse renderer config without providers");
+        assert!(config.providers.is_empty());
+    }
 }

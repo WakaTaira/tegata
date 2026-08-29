@@ -23,6 +23,13 @@ declare module "@tegata/leak-guard" {
      * every sample is scanned at assert time. Defaults to 200ms.
      */
     psSampleIntervalMs?: number;
+    /**
+     * Process-listing sampler commands, each an argv array whose stdout is
+     * recorded as a "ps" surface sample at every interval. Defaults to
+     * `[["ps", "-eo", "args"]]`. The Windows rig adds a WMI command-line
+     * sampler (`Get-CimInstance Win32_Process`) run through WSL interop.
+     */
+    psSampleCommands?: string[][];
   }
 
   export interface LeakHit {

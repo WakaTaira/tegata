@@ -312,11 +312,12 @@ export interface McpSession {
 export async function connectMcp(
   socketPath: string,
   observe?: (label: string, value: unknown) => void,
+  extraEnv?: Record<string, string>,
 ): Promise<McpSession> {
   const transport = new StdioClientTransport({
     command: "node",
     args: [bins().mcpEntry],
-    env: { ...process.env, TEGATA_SOCKET: socketPath } as Record<
+    env: { ...process.env, TEGATA_SOCKET: socketPath, ...extraEnv } as Record<
       string,
       string
     >,

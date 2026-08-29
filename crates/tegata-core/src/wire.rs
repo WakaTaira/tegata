@@ -1,5 +1,7 @@
 //! JSON wire types shared by the daemon and its clients.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -75,4 +77,158 @@ pub struct ExecutorResponse {
     pub ok: bool,
     pub endpoint: Option<String>,
     pub error: Option<String>,
+}
+
+/// Preamble version understood by this build.
+pub const PREAMBLE_VERSION: u32 = 1;
+
+/// First line a client writes on a transport that authenticates by token
+/// instead of by operating system peer credentials.
+///
+/// Without `tunnel` the connection continues as JSON-RPC, in the same wire
+/// format as the UNIX domain socket transport, and the daemon stays silent on
+/// success. With `tunnel` the daemon answers `{"ok":true}` and then splices
+/// the connection to the requested loopback port on its own side.
+///
+/// The `auth` token is plain text on the wire. A daemon must compare it
+/// against the stored hash and drop it immediately; it must never be logged,
+/// and any retained copy belongs in a [`crate::Secret`].
+#[derive(Deserialize, Serialize)]
+pub struct Preamble {
+    pub v: u32,
+    pub auth: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<PreambleTunnel>,
+}
+
+impl fmt::Debug for Preamble {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Preamble")
+            .field("v", &self.v)
+            .field("auth", &"<redacted>")
+            .field("tunnel", &self.tunnel)
+            .finish()
+    }
+}
+
+/// Tunnel request carried by a preamble. The port must be the CDP port of the
+/// named active session; any other port is refused.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PreambleTunnel {
+    pub session_id: String,
+    pub port: u16,
+}
+
+/// Preamble reply written as one JSON line. It is emitted only when a tunnel
+/// is accepted (`{"ok":true}`) or when the preamble is refused
+/// (`{"ok":false,"error":"<code>"}`); accepting an RPC connection is silent.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PreambleResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl PreambleResponse {
+    /// Reply that accepts a tunnel request.
+    pub fn accepted() -> Self {
+        Self {
+            ok: true,
+            error: None,
+        }
+    }
+
+    /// Reply that refuses a preamble with a transport-level error code.
+    pub fn refused(error: PreambleError) -> Self {
+        Self {
+            ok: false,
+            error: Some(error.as_str().to_owned()),
+        }
+    }
+}
+
+/// Transport level failures of the preamble exchange. These are distinct from
+/// the JSON-RPC classification codes and never reach the RPC layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreambleError {
+    /// The preamble was malformed, unsupported, or carried a wrong token.
+    Unauthorized,
+    /// The token was accepted but the requested tunnel target is not allowed.
+    Forbidden,
+}
+
+impl PreambleError {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unauthorized => "UNAUTHORIZED",
+            Self::Forbidden => "FORBIDDEN",
+        }
+    }
+}
+
+/// Parameters of the `admin_seal` administrative RPC, which hands a master
+/// password to the daemon so that the daemon itself can seal it.
+#[derive(Deserialize)]
+pub struct AdminSealParams {
+    pub master_password: String,
+}
+
+/// Result of the `admin_token_issue` administrative RPC. The plain token is
+/// returned once and only the hash is retained by the daemon.
+#[derive(Serialize)]
+pub struct AdminTokenIssueResult {
+    pub token: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PREAMBLE_VERSION, Preamble, PreambleError, PreambleResponse, PreambleTunnel};
+
+    #[test]
+    fn rpc_preamble_matches_the_pinned_line() {
+        let preamble = Preamble {
+            v: PREAMBLE_VERSION,
+            auth: "token".to_owned(),
+            tunnel: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&preamble).expect("serialize preamble"),
+            r#"{"v":1,"auth":"token"}"#
+        );
+    }
+
+    #[test]
+    fn tunnel_preamble_matches_the_pinned_line() {
+        let preamble = Preamble {
+            v: PREAMBLE_VERSION,
+            auth: "token".to_owned(),
+            tunnel: Some(PreambleTunnel {
+                session_id: "session".to_owned(),
+                port: 9222,
+            }),
+        };
+        assert_eq!(
+            serde_json::to_string(&preamble).expect("serialize preamble"),
+            r#"{"v":1,"auth":"token","tunnel":{"session_id":"session","port":9222}}"#
+        );
+    }
+
+    #[test]
+    fn preamble_responses_match_the_pinned_lines() {
+        assert_eq!(
+            serde_json::to_string(&PreambleResponse::accepted()).expect("serialize response"),
+            r#"{"ok":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&PreambleResponse::refused(PreambleError::Unauthorized))
+                .expect("serialize response"),
+            r#"{"ok":false,"error":"UNAUTHORIZED"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&PreambleResponse::refused(PreambleError::Forbidden))
+                .expect("serialize response"),
+            r#"{"ok":false,"error":"FORBIDDEN"}"#
+        );
+    }
 }

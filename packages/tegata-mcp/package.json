@@ -4,7 +4,8 @@
   "type": "module",
   "license": "MIT OR Apache-2.0",
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run"
   },
   "main": "dist/index.js",
   "exports": "./dist/index.js",

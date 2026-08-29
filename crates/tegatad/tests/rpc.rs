@@ -1,3 +1,7 @@
+//! These tests drive the daemon over its UNIX domain socket transport, so they
+//! only exist on UNIX targets.
+#![cfg(unix)]
+
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;

@@ -2,6 +2,7 @@
 /CLAUDE.local.md
 /target/
 /node_modules/
+/packages/*/node_modules/
 /result
 /result-*
 /.direnv/

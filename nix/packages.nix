@@ -67,6 +67,11 @@ in
     binary = "tegatad";
   };
 
+  tegata-bridge = rustPackage {
+    pname = "tegata-bridge";
+    binary = "tegata-bridge";
+  };
+
   tegatad-mock = rustPackage {
     pname = "tegatad";
     binary = "tegatad";

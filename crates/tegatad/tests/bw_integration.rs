@@ -1,3 +1,7 @@
+//! These tests drive the daemon over its UNIX domain socket transport, so they
+//! only exist on UNIX targets.
+#![cfg(unix)]
+
 use std::io::Write;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;

@@ -9,6 +9,7 @@ default = []
 mock-provider = []
 
 [dependencies]
+age = "0.12.1"
 clap = { version = "4.6.6", features = ["derive"] }
 leakscan = { version = "0.1.0", path = "../leakscan" }
 serde = { version = "1.0.229", features = ["derive"] }

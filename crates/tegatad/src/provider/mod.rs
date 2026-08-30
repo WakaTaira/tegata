@@ -1,5 +1,7 @@
 mod bitwarden;
-#[cfg(feature = "mock-provider")]
+mod file;
+#[cfg(unix)]
+mod pass;
 mod static_provider;
 
 use std::future::Future;
@@ -11,9 +13,12 @@ use crate::ErrorCode;
 
 pub(crate) use bitwarden::remove_password_file;
 pub(crate) use bitwarden::{BitwardenCliConfig, BitwardenCliProvider};
-#[cfg(feature = "mock-provider")]
+pub(crate) use file::{FileProvider, FileProviderConfig};
+#[cfg(unix)]
+pub(crate) use pass::{PassProvider, PassProviderConfig};
 pub(crate) use static_provider::StaticProvider;
 
+#[derive(Clone)]
 pub(crate) struct CredentialRef {
     pub(crate) id: String,
     pub(crate) name: String,

@@ -38,12 +38,13 @@ use tegata_core::wire::{AdminSealParams, AdminTokenIssueResult};
 #[cfg(windows)]
 use zeroize::Zeroize;
 
-#[cfg(feature = "mock-provider")]
 use crate::provider::StaticProvider;
 use crate::provider::{
-    BitwardenCliConfig, BitwardenCliProvider, CredentialProvider, ResolvedCredential,
-    remove_password_file,
+    BitwardenCliConfig, BitwardenCliProvider, CredentialProvider, FileProvider, FileProviderConfig,
+    ResolvedCredential, remove_password_file,
 };
+#[cfg(unix)]
+use crate::provider::{PassProvider, PassProviderConfig};
 #[cfg(windows)]
 use crate::transport::CdpPortResolver;
 use crate::transport::{Accepted, PeerIdentity, PlatformConfig, PlatformTransport, Transport};
@@ -112,9 +113,22 @@ enum ProviderConfigKind {
         totp_exposable: Vec<String>,
         session_ttl_secs: Option<u64>,
     },
+    AgeFile {
+        entries_path: PathBuf,
+        identity_path: PathBuf,
+        session_ttl_secs: Option<u64>,
+    },
+    Pass {
+        store_dir: PathBuf,
+        gnupghome: Option<PathBuf>,
+        #[serde(default)]
+        pass_bin: Option<PathBuf>,
+        #[serde(default)]
+        totp_exposable: Vec<String>,
+        session_ttl_secs: Option<u64>,
+    },
 }
 
-#[cfg(feature = "mock-provider")]
 #[derive(Debug, Deserialize)]
 struct EntryConfig {
     id: String,
@@ -345,6 +359,30 @@ async fn run_daemon(
         return Err("approve_cmd is only supported on Unix".into());
     }
     #[cfg(windows)]
+    if let Some(message) = config.providers.iter().find_map(|provider| {
+        let ProviderConfigKind::Pass {
+            store_dir,
+            gnupghome,
+            pass_bin,
+            totp_exposable,
+            session_ttl_secs,
+        } = &provider.kind
+        else {
+            return None;
+        };
+        Some(format!(
+            "pass provider is only supported on Unix (namespace={}, store_dir={}, gnupghome={:?}, pass_bin={:?}, totp_exposable={:?}, session_ttl_secs={:?})",
+            provider.namespace,
+            store_dir.display(),
+            gnupghome,
+            pass_bin,
+            totp_exposable,
+            session_ttl_secs,
+        ))
+    }) {
+        return Err(message.into());
+    }
+    #[cfg(windows)]
     let _ = config.approve_timeout_secs;
     #[cfg(windows)]
     let (token_hash_path, _sealed_blob_path) = resolve_windows_paths(&config);
@@ -354,7 +392,7 @@ async fn run_daemon(
     let transport = PlatformTransport::bind(&config.transport).await?;
     tokio::fs::create_dir_all(&config.state_dir).await?;
     let password_dir = prepare_password_dir(Path::new(&config.state_dir)).await?;
-    let state = Arc::new(Mutex::new(build_state(config, password_dir)));
+    let state = Arc::new(Mutex::new(build_state(config, password_dir)?));
     #[cfg(windows)]
     let transport = {
         let cdp_ports = state.lock().await.cdp_ports.clone();
@@ -414,7 +452,7 @@ where
     Ok(())
 }
 
-fn build_state(config: Config, password_dir: PathBuf) -> DaemonState {
+fn build_state(config: Config, password_dir: PathBuf) -> Result<DaemonState, io::Error> {
     #[cfg(windows)]
     let (token_hash_path, sealed_blob_path) = resolve_windows_paths(&config);
     #[cfg(windows)]
@@ -438,7 +476,7 @@ fn build_state(config: Config, password_dir: PathBuf) -> DaemonState {
     let providers = config
         .providers
         .into_iter()
-        .map(|provider| {
+        .map(|provider| -> Result<Provider, io::Error> {
             let namespace = provider.namespace;
             let provider: Arc<Mutex<dyn CredentialProvider + Send>> = match provider.kind {
                 #[cfg(feature = "mock-provider")]
@@ -467,14 +505,43 @@ fn build_state(config: Config, password_dir: PathBuf) -> DaemonState {
                     #[cfg(windows)]
                     sealed_blob_path: sealed_blob_path.clone(),
                 }))),
+                ProviderConfigKind::AgeFile {
+                    entries_path,
+                    identity_path,
+                    session_ttl_secs,
+                } => Arc::new(Mutex::new(FileProvider::new(FileProviderConfig {
+                    entries_path,
+                    identity_path,
+                    session_ttl: Duration::from_secs(
+                        session_ttl_secs.unwrap_or(session_ttl.as_secs()),
+                    ),
+                })?)),
+                #[cfg(unix)]
+                ProviderConfigKind::Pass {
+                    store_dir,
+                    gnupghome,
+                    pass_bin,
+                    totp_exposable,
+                    session_ttl_secs,
+                } => Arc::new(Mutex::new(PassProvider::new(PassProviderConfig {
+                    store_dir,
+                    gnupghome,
+                    pass_bin,
+                    totp_exposable,
+                    session_ttl: Duration::from_secs(
+                        session_ttl_secs.unwrap_or(session_ttl.as_secs()),
+                    ),
+                }))),
+                #[cfg(windows)]
+                ProviderConfigKind::Pass { .. } => unreachable!("pass provider was rejected above"),
             };
-            Provider {
+            Ok(Provider {
                 namespace,
                 provider,
-            }
+            })
         })
-        .collect();
-    DaemonState {
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(DaemonState {
         providers,
         sessions: HashMap::new(),
         last_totp: HashMap::new(),
@@ -496,7 +563,7 @@ fn build_state(config: Config, password_dir: PathBuf) -> DaemonState {
         token_hash_path,
         #[cfg(windows)]
         sealed_blob_path,
-    }
+    })
 }
 
 fn safe_path_component(value: &str) -> String {

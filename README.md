@@ -1,125 +1,234 @@
 # tegata
 
-tegata is a credential isolation sandbox for AI agents. The agent does not receive actual authentication credentials, such as a Bitwarden vault password. It receives only the raw CDP (Chrome DevTools Protocol) endpoint of an authenticated browser.
-For credentials explicitly opted in to `totp_exposable`, it can expose TOTP codes with a 30-second rate limit.
+**A credential isolation sandbox for AI agents.**
 
-## Architecture
+You want an AI agent to operate a site that requires a login. You do not want the
+agent to ever hold the password.
 
-The Rust side contains the isolation daemon `tegatad` (`crates/tegatad`), the leak detection tool `leakscan` (`crates/leakscan`), and shared logic in `tegata-core` (`crates/tegata-core`).
+tegata resolves credentials on the far side of an operating system boundary that
+the agent cannot cross, performs the login there, and hands the agent back only a
+connection to the resulting authenticated browser session. The agent drives a
+browser that is already logged in, and never learns how it got that way.
 
-The TypeScript side contains the MCP broker (`packages/tegata-mcp`) and the Playwright executor sidecar (`packages/tegata-executor`). Supporting packages include `packages/leak-guard`, `packages/target-fixture`, and `packages/provision-test-vault`.
+The name comes from *tegata* (手形), the travel pass a traveller presented at an
+Edo-period checkpoint: proof enough to pass through, without surrendering their
+identity.
 
-The daemon authorizes processes across a Unix Domain Socket (UDS) boundary using `SO_PEERCRED`. Before a response leaves the boundary, it is scanned against the set of secret values resolved at that point. The test suite verifies this path with canary values. `leak-guard` and `leakscan` provide the leakage detection path.
+## What the agent never sees
 
-## Development
+Everything below stays on the isolated side of the boundary, by construction:
 
-Enter the development shell with:
+| Never crosses the boundary | Why it cannot |
+| --- | --- |
+| The vault master password | Entered into, or unsealed by, the isolated daemon only |
+| Usernames and passwords | Resolved in the daemon, written to the executor over a pipe |
+| TOTP seeds | Codes are computed on the isolated side; the seed is never serialized outward |
+| Cookies, `storageState`, session tokens | The session is shared as a live browser, never as a file |
+| Traces, videos, HAR files, screenshots | The executor never enables them |
+
+What the agent *does* receive is a credential catalog with names but no values, a
+CDP (Chrome DevTools Protocol) endpoint for an authenticated browser, and — for
+entries explicitly marked `totp_exposable` — the current six-digit TOTP code,
+rate-limited to one per 30 seconds and written to the audit log.
+
+## How it works
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Agent (Claude Code, or any MCP client)                          │
+│                                                                 │
+│ sees: credential names · tool calls · a CDP endpoint            │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │ MCP over stdio
+┌───────────────────────────▼─────────────────────────────────────┐
+│ Broker — packages/tegata-mcp                                    │
+│ Runs as the agent's own user. Holds no secrets. Forwards        │
+│ five tools to the daemon and returns classified errors.         │
+└───────────────────────────┬─────────────────────────────────────┘
+                            │
+════════════════════════════╪═════════════════════════════════════
+      the boundary          │  UNIX socket + SO_PEERCRED  (Linux)
+      enforced by the OS    │  named pipe + SID           (Windows)
+                            │  loopback TCP + token       (WSL client)
+════════════════════════════╪═════════════════════════════════════
+                            │
+┌───────────────────────────▼─────────────────────────────────────┐
+│ tegatad — crates/tegatad                                        │
+│ Separate user account. Files it owns are unreadable to          │
+│ the agent's user. Every response is scanned for known           │
+│ secret values before it is written back.                        │
+│                                                                 │
+│  ┌───────────────────────────┐  ┌───────────────────────────┐   │
+│  │ ProviderRegistry          │  │ Executor                  │   │
+│  │ namespaced providers:     │─▶ packages/tegata-executor   │   │
+│  │ bitwarden · age · pass    │  │ Playwright form login     │   │
+│  └───────────────────────────┘  └─────────────┬─────────────┘   │
+└────────────────────────────────────────────────┼────────────────┘
+                                                 │ launches
+                                    ┌────────────▼────────────┐
+                                    │ Chromium, logged in     │
+                                    │ CDP endpoint ───────────┼──▶ back to the agent
+                                    └─────────────────────────┘
+```
+
+The agent asks for `login`. The daemon resolves the credential, spawns the
+executor, and passes the secret to it on stdin — never through `argv`, never
+through the environment. The executor fills the form in a browser it launched
+itself, verifies that the login took, and returns the browser's CDP endpoint.
+That endpoint is all that travels back out.
+
+See [docs/architecture.md](docs/architecture.md) for the layer-by-layer detail.
+
+## Threat model in brief
+
+tegata assumes the agent is fully capable and possibly compromised:
+
+- it can run arbitrary shell commands — `env`, `ps`, `cat`, walking the filesystem
+- it can write and execute its own code
+- it may follow instructions injected through a web page it is reading
+
+Under those assumptions, "the agent has been told not to look" is not a boundary.
+Only a boundary the agent's own privileges cannot cross counts: a separate user
+account, a service account, a separate host. tegata puts every secret behind one
+of those and exposes a small allowlisted RPC surface across it.
+
+What tegata does *not* protect against: an agent with an authenticated session can
+do anything that session can do. Constrain that with dedicated accounts,
+read-only roles, and site allowlists — not with tegata.
+
+An injected instruction can also make the agent request a login it is entitled to
+make, which no boundary can tell apart from a legitimate one. For credentials whose
+misuse you could not undo, configure an approval hook so a human has to say yes
+before the login happens.
+
+Full threat model, invariants, and the operator hardening checklist:
+[docs/security.md](docs/security.md).
+
+## Platform support
+
+| Boundary | Platform | Mechanism | Peer authentication | Sealed storage | Status |
+| --- | --- | --- | --- | --- | --- |
+| systemd | Linux, WSL | Dedicated user + hardened systemd unit | UNIX socket, `SO_PEERCRED` | askpass at unlock | Implemented |
+| Windows service | Windows | Virtual service account `NT SERVICE\tegatad` | Named pipe + SID; loopback TCP + token for the WSL client | DPAPI | Implemented |
+| Container | Containerized agents | Separate container, no shared volume | Socket + token | Secret mount | Not implemented |
+| Remote host | Any | Separate host or VM | mTLS / Tailscale identity | Server-side | Not implemented |
+
+The Windows service boundary is the recommended configuration for a WSL agent:
+the daemon runs as a Windows service account, and a WSL process — which reaches
+Windows with the privileges of the user who started WSL — cannot read files owned
+by that service account. The trust direction points away from the agent.
+
+## Quick start
+
+Everything runs through the development shell:
 
 ```sh
 nix develop
 ```
 
-The shell provides Rust tooling (`rustc`, `cargo`, `clippy`, and `rustfmt`), `nodejs_24`, `biome`, `bitwarden-cli`, `vaultwarden`, and `playwright-driver`.
+Then follow the setup guide for your platform:
 
-On NixOS, the `nixosModules.tegata` module deploys tegata for production use through `services.tegata`.
+- **Linux / NixOS** — [docs/setup-linux.md](docs/setup-linux.md)
+- **Windows service + WSL client** — [docs/setup-windows-wsl.md](docs/setup-windows-wsl.md)
 
-## Tests
+On NixOS the `nixosModules.tegata` module deploys the daemon through
+`services.tegata`, and `nixosModules.tegata-bridge` provides the WSL-side bridge
+as `services.tegata-bridge`.
 
-Run the Nix checks with:
+## MCP tools
+
+The agent-facing surface is five tools. Nothing else crosses the boundary.
+
+| Tool | Input | Output |
+| --- | --- | --- |
+| `list_credentials` | `{namespace?}` | Catalog entries: `id`, `name`, `uri`, `kind`, `source`, `status`. No values. |
+| `login` | `{cred_id, target_url, steps?, success_selector?, failure_selector?}` | `{session_id, channel: {kind: "cdp", endpoint}}` |
+| `logout` | `{session_id}` | `{ok}` — destroys the session and its browser |
+| `get_totp` | `{cred_id}` | `{code, expires_in}` — opt-in entries only, rate-limited |
+| `lock_vault` | `{namespace?}` | `{ok}` — locks one provider, or all of them |
+
+Login steps are written with placeholders — `{{username}}`, `{{password}}`,
+`{{totp}}` — and are the only values a `fill` step will accept. Substitution
+happens on the isolated side, so a step can never carry a literal secret in
+either direction.
+
+Full request and response shapes, and the error classification codes:
+[docs/mcp-tools.md](docs/mcp-tools.md).
+
+## How the isolation is verified
+
+The boundary is tested, not asserted. Development and test runs never use a real
+credential; a throwaway vault is provisioned with high-entropy canary values, and
+the suite then hunts for those canaries across every surface the agent can observe.
 
 ```sh
-nix flake check
-```
-
-This runs the `clippy`, `fmt`, `biome`, `cargo-test`, and `boundary` checks, including the `boundary` NixOS test.
-
-Run the acceptance suite with:
-
-```sh
+nix flake check                       # clippy, fmt, biome, cargo-test, boundary VM test
 nix develop -c npm run test:acceptance
 ```
 
-The `pretest:acceptance` hook first runs `cargo build -p tegatad --features mock-provider`; the command then runs the acceptance tests with Vitest.
+- **`leakscan`** (`crates/leakscan`) scans files, directories, and streams for
+  canaries in raw, base64, percent-encoded, hex, and JSON-escaped form, because
+  leaks tend to arrive transformed.
+- **`leak-guard`** (`packages/leak-guard`) wraps an acceptance test: it registers
+  the canaries at setup and, at teardown, checks RPC responses, agent-readable
+  files, process arguments, and environments for any of them.
+- **A negative control** deliberately leaks a canary and asserts the checker
+  catches it, so a broken detector cannot show up as a green suite.
+- **The NixOS `boundary` check** builds a two-user VM and verifies the real
+  thing: the agent's user cannot read the daemon's state, the socket refuses a
+  peer whose uid is not on the allowlist, and a full login driven as the agent's
+  uid — with `ps -eo args` sampled throughout — leaves no canary in anything that
+  user could observe or read.
+- **The Windows suite** (`tests/acceptance/windows`) exercises a real service over
+  a real WSL boundary, including a WMI sampler that would catch a canary appearing
+  in a Windows command line.
 
-## Windows setup
+The acceptance tests under `tests/acceptance/` are the contract for the system;
+they are meant to be read as the specification of what the boundary guarantees.
 
-The Windows service requires Node LTS, Bitwarden CLI `2025.9.0`, and the Playwright browsers installed under the path configured by `browsers_path`. Grant the service account read access to that path with an ACL. The service runs in session 0, so a headed browser does not appear on the desktop.
+## Repository layout
 
-Run the following commands from an elevated PowerShell or command prompt:
-
-```sh
-tegatad.exe service install --config C:\ProgramData\tegata\config.toml
-```
-
-This registers the service, adds a firewall rule for the daemon TCP port limited to the WSL interface, creates `C:\ProgramData\tegata`, configures its ACL, and grants the configured operator SID permission to start and stop the service. The command requires elevation.
-
-Issue a bootstrap token from an elevated shell. The plaintext token is printed to standard output once; copy it to the WSL client and store it with mode `0600`.
-
-```sh
-tegatad.exe token issue
-```
-
-Seal the master password from an elevated shell. The command prompts for the password and seals it with user-scope DPAPI. The daemon automatically unseals it after subsequent service restarts.
-
-```sh
-tegatad.exe seal
-```
-
-The main Windows transport settings are:
-
-| Key | Description |
+| Path | Contents |
 | --- | --- |
-| `tcp_port` | Daemon TCP port; defaults to `21575`. |
-| `tcp_bind` | IPv4 bind address or `auto`; defaults to `auto`. |
-| `pipe_name` | Named pipe name; defaults to `tegatad`. |
-| `allowed_sids` | SIDs allowed to connect to the named pipe. |
-| `operator_sid` | Optional SID allowed to start and stop the service. |
-| `browsers_path` | Playwright browser path passed to child processes as `PLAYWRIGHT_BROWSERS_PATH`. |
-| `bw_path` | Bitwarden CLI path; defaults to `bw`. |
-| `node_path` | Optional Node.js executable path. |
+| `crates/tegatad` | The isolation daemon: providers, RPC, transports, audit log |
+| `crates/tegata-core` | Shared secret type, TOTP, JSON wire types |
+| `crates/tegata-bridge` | WSL-side bridge from a UNIX socket to the Windows daemon |
+| `crates/leakscan` | Canary scanner, as a library and a CLI |
+| `packages/tegata-mcp` | The MCP broker the agent connects to |
+| `packages/tegata-executor` | Playwright login executor sidecar |
+| `packages/leak-guard` | Leak detection fixture for the acceptance suite |
+| `packages/target-fixture` | Local login target used by the tests |
+| `packages/provision-test-vault` | Throwaway vault provisioning for the tests |
+| `nix/` | NixOS modules, packages, and the boundary VM test |
+| `tests/acceptance/` | End-to-end acceptance contract |
 
-To inspect a headed browser running in session 0, expose or obtain its CDP endpoint from the service-side executor, open `chrome://inspect` in a browser in an interactive session, choose `Configure...`, add the endpoint host and port, and select `Inspect` for the discovered target. The DevTools window is the viewing window; the service session itself remains invisible.
+## Documentation
 
-Do not use a real vault password in tests or acceptance environments.
+- [Architecture](docs/architecture.md) — layers, abstractions, sequence, audit log
+- [Security](docs/security.md) — threat model, invariants, unlock and TOTP design
+- [MCP tools](docs/mcp-tools.md) — the full agent-facing contract
+- [Linux setup](docs/setup-linux.md) — NixOS module and `config.toml` reference
+- [Windows / WSL setup](docs/setup-windows-wsl.md) — service, token, seal, bridge
+- [Security policy](SECURITY.md) — how to report a vulnerability privately
 
-The daemon listens on the Windows side of the WSL NAT and is firewalled to the WSL interface. The WSL client connects through this Windows-side endpoint.
+## Roadmap
 
-## WSL client setup
+Implemented today: the systemd and Windows service boundaries; three credential
+backends behind the provider trait — Bitwarden CLI, age-encrypted file, and GNU
+pass — usable together; the Playwright form executor; the five MCP tools;
+human-in-the-loop login approval; and an audit log covering both agent calls and
+the daemon's own session and vault events.
 
-Build `tegata-bridge` from the repository or install its GitHub Release binary:
+Planned:
 
-```sh
-cargo build --release -p tegata-bridge
-```
+- Container and remote-host boundaries; an OAuth device-flow executor
 
-Copy the token issued by `tegatad.exe token issue` into WSL and restrict the file to its owner:
+## Contributing
 
-```sh
-install -m 600 /path/to/issued-token ~/.config/tegata/bridge.token
-```
-
-Create a user systemd unit. The `--daemon-addr` option is optional; when omitted, `tegata-bridge` resolves the default gateway automatically.
-
-```ini
-[Unit]
-Description=tegata WSL bridge
-
-[Service]
-ExecStart=/path/to/tegata-bridge --socket %h/.local/state/tegata/bridge.sock --token-file %h/.config/tegata/bridge.token
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
-
-Enable the unit with `systemctl --user enable --now tegata-bridge`. Start the MCP server with both `TEGATA_BRIDGE=1` and `TEGATA_SOCKET` set to the bridge socket path from the unit, for example:
-
-```sh
-TEGATA_BRIDGE=1 TEGATA_SOCKET=~/.local/state/tegata/bridge.sock node packages/tegata-mcp/dist/index.js
-```
-
-On NixOS, `services.tegata-bridge` provides an alternative systemd module with configurable package, user, and socket path.
+Build and test commands, workspace layout, and the constraints on the acceptance
+suite are documented in [CLAUDE.md](CLAUDE.md).
 
 ## License
 
-tegata is dual-licensed under either the MIT license or Apache License 2.0. See `LICENSE-MIT` and `LICENSE-APACHE`.
+tegata is dual-licensed under either the MIT license or the Apache License 2.0,
+at your option. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).

@@ -60,6 +60,8 @@ struct Config {
     state_dir: String,
     audit_log_path: String,
     audit_log_max_bytes: Option<u64>,
+    approve_cmd: Option<String>,
+    approve_timeout_secs: Option<u64>,
     executor_entry: Option<String>,
     session_ttl_secs: Option<u64>,
     #[cfg(windows)]
@@ -150,6 +152,10 @@ struct DaemonState {
     browsers_path: Option<PathBuf>,
     cdp_ports: Arc<std::sync::RwLock<HashMap<String, u16>>>,
     session_ttl: Duration,
+    #[cfg(unix)]
+    approve_cmd: Option<String>,
+    #[cfg(unix)]
+    approve_timeout: Duration,
     #[cfg(windows)]
     token_hash_path: PathBuf,
     #[cfg(windows)]
@@ -166,6 +172,8 @@ enum ErrorCode {
     VaultLocked,
     RateLimited,
     TotpNotExposable,
+    ApprovalDenied,
+    ApprovalTimeout,
     Internal,
     #[cfg(windows)]
     Unauthorized,
@@ -184,6 +192,8 @@ impl ErrorCode {
             Self::VaultLocked => "VAULT_LOCKED",
             Self::RateLimited => "RATE_LIMITED",
             Self::TotpNotExposable => "TOTP_NOT_EXPOSABLE",
+            Self::ApprovalDenied => "APPROVAL_DENIED",
+            Self::ApprovalTimeout => "APPROVAL_TIMEOUT",
             Self::Internal => "INTERNAL",
             #[cfg(windows)]
             Self::Unauthorized => "UNAUTHORIZED",
@@ -331,6 +341,12 @@ async fn run_daemon(
     let config_text = tokio::fs::read_to_string(config_path).await?;
     let config: Config = toml::from_str(&config_text)?;
     #[cfg(windows)]
+    if config.approve_cmd.is_some() {
+        return Err("approve_cmd is only supported on Unix".into());
+    }
+    #[cfg(windows)]
+    let _ = config.approve_timeout_secs;
+    #[cfg(windows)]
     let (token_hash_path, _sealed_blob_path) = resolve_windows_paths(&config);
     #[cfg(windows)]
     let transport_config = config.transport.clone();
@@ -409,6 +425,10 @@ fn build_state(config: Config, password_dir: PathBuf) -> DaemonState {
     let registry = Vec::new();
     let audit_log_path = PathBuf::from(&config.audit_log_path);
     let audit_log_max_bytes = config.audit_log_max_bytes;
+    #[cfg(unix)]
+    let approve_cmd = config.approve_cmd.clone();
+    #[cfg(unix)]
+    let approve_timeout = Duration::from_secs(config.approve_timeout_secs.unwrap_or(60));
     let executor_entry = resolve_executor_entry(&config);
     let node_path = resolve_node_path(&config);
     let browsers_path = resolve_browsers_path(&config);
@@ -468,6 +488,10 @@ fn build_state(config: Config, password_dir: PathBuf) -> DaemonState {
         browsers_path,
         cdp_ports: Arc::new(std::sync::RwLock::new(HashMap::new())),
         session_ttl,
+        #[cfg(unix)]
+        approve_cmd,
+        #[cfg(unix)]
+        approve_timeout,
         #[cfg(windows)]
         token_hash_path,
         #[cfg(windows)]
@@ -855,7 +879,7 @@ async fn handle_request(
     match request.method.as_str() {
         "status" => success(request.id.clone(), json!({ "ok": true })),
         "list_credentials" => list_credentials(request, state).await,
-        "login" => login(request, state).await,
+        "login" => login(request, state, peer).await,
         "logout" => logout(request, state).await,
         "get_totp" => get_totp(request, state).await,
         "lock_vault" => lock_vault(request, state).await,
@@ -970,7 +994,9 @@ async fn list_credentials(request: &RpcRequest, state: SharedState) -> HandledRe
     success(request.id.clone(), Value::Array(result))
 }
 
-async fn login(request: &RpcRequest, state: SharedState) -> HandledRequest {
+async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) -> HandledRequest {
+    #[cfg(windows)]
+    let _ = peer;
     let params = match parse_params::<LoginParams>(&request.params) {
         Ok(params) => params,
         Err(error) => return classified(request.id.clone(), error),
@@ -979,6 +1005,20 @@ async fn login(request: &RpcRequest, state: SharedState) -> HandledRequest {
         return classified(request.id.clone(), ErrorCode::InvalidCredential);
     };
     let namespace = namespace.to_owned();
+    #[cfg(unix)]
+    if state.lock().await.approve_cmd.is_some() {
+        let credential_state = match credential_state(&state, &params.cred_id).await {
+            Ok(Some(locked)) => locked,
+            Ok(None) => return classified(request.id.clone(), ErrorCode::InvalidCredential),
+            Err(error) => return classified(request.id.clone(), error),
+        };
+        if credential_state {
+            return classified(request.id.clone(), ErrorCode::VaultLocked);
+        }
+        if let Err(error) = approve_login(&state, &params, peer).await {
+            return classified(request.id.clone(), error);
+        }
+    }
     let (credential, executor_entry, node_path, browsers_path, ttl) = {
         let credential = match resolve_credential(&state, &params.cred_id).await {
             Ok(Some(credential)) => credential,
@@ -1035,6 +1075,71 @@ async fn login(request: &RpcRequest, state: SharedState) -> HandledRequest {
             "channel": { "kind": "cdp", "endpoint": endpoint },
         }),
     )
+}
+
+#[cfg(unix)]
+async fn credential_state(state: &SharedState, cred_id: &str) -> Result<Option<bool>, ErrorCode> {
+    let Some((namespace, entry_id)) = cred_id.split_once(':') else {
+        return Ok(None);
+    };
+    let provider = {
+        let daemon = state.lock().await;
+        let Some(provider) = daemon
+            .providers
+            .iter()
+            .find(|provider| provider.namespace == namespace)
+        else {
+            return Ok(None);
+        };
+        provider.provider.clone()
+    };
+    let mut provider = provider.lock().await;
+    let refs = provider.list_refs().await?;
+    Ok(refs
+        .iter()
+        .any(|credential| credential.id == entry_id)
+        .then_some(provider.locked()))
+}
+
+#[cfg(unix)]
+async fn approve_login(
+    state: &SharedState,
+    params: &LoginParams,
+    peer: &PeerIdentity,
+) -> Result<(), ErrorCode> {
+    let (approve_cmd, approve_timeout) = {
+        let daemon = state.lock().await;
+        (daemon.approve_cmd.clone(), daemon.approve_timeout)
+    };
+    let Some(approve_cmd) = approve_cmd else {
+        return Ok(());
+    };
+    let peer_uid = match peer {
+        PeerIdentity::Uid(uid) => uid.to_string(),
+        PeerIdentity::System => "0".to_owned(),
+    };
+    let mut command = Command::new("sh");
+    command
+        .args(["-c", approve_cmd.as_str()])
+        .env("TEGATA_CRED_ID", &params.cred_id)
+        .env("TEGATA_TARGET_URL", &params.target_url)
+        .env("TEGATA_PEER", peer_uid)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    use std::os::unix::process::CommandExt;
+    command.as_std_mut().process_group(0);
+    let mut child = command.spawn().map_err(|_| ErrorCode::Internal)?;
+    match timeout(approve_timeout, child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(_)) => Err(ErrorCode::ApprovalDenied),
+        Ok(Err(_)) => Err(ErrorCode::Internal),
+        Err(_) => {
+            kill_process_group(&child);
+            let _ = child.wait().await;
+            Err(ErrorCode::ApprovalTimeout)
+        }
+    }
 }
 
 async fn logout(request: &RpcRequest, state: SharedState) -> HandledRequest {
@@ -1312,6 +1417,8 @@ fn parse_error_code(value: &str) -> ErrorCode {
         "VAULT_LOCKED" => ErrorCode::VaultLocked,
         "RATE_LIMITED" => ErrorCode::RateLimited,
         "TOTP_NOT_EXPOSABLE" => ErrorCode::TotpNotExposable,
+        "APPROVAL_DENIED" => ErrorCode::ApprovalDenied,
+        "APPROVAL_TIMEOUT" => ErrorCode::ApprovalTimeout,
         "INTERNAL" => ErrorCode::Internal,
         _ => ErrorCode::Internal,
     }
@@ -1333,6 +1440,15 @@ async fn shutdown_child(mut child: Child) {
 async fn stop_child(mut child: Child) {
     let _ = child.start_kill();
     let _ = child.wait().await;
+}
+
+#[cfg(unix)]
+fn kill_process_group(child: &Child) {
+    if let Some(pid) = child.id() {
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
+    }
 }
 
 fn parse_params<T: for<'de> Deserialize<'de>>(params: &Value) -> Result<T, ErrorCode> {

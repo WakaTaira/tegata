@@ -17,6 +17,8 @@ const ERROR_CODES = [
   "VAULT_LOCKED",
   "RATE_LIMITED",
   "TOTP_NOT_EXPOSABLE",
+  "APPROVAL_DENIED",
+  "APPROVAL_TIMEOUT",
   "INTERNAL",
 ] as const;
 type ErrorCode = (typeof ERROR_CODES)[number];

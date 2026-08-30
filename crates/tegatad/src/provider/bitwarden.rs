@@ -251,6 +251,11 @@ impl BitwardenCliProvider {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.as_std_mut().process_group(0);
+        }
         let mut child = command.spawn().map_err(|_| ErrorCode::Internal)?;
         let Some(mut stdout) = child.stdout.take() else {
             let _ = child.start_kill();
@@ -267,6 +272,9 @@ impl BitwardenCliProvider {
             Ok((status, Ok(output))) => (status.map_err(|_| ErrorCode::Internal)?, output),
             Ok((_, Err(_))) => return Err(ErrorCode::Internal),
             Err(_) => {
+                #[cfg(unix)]
+                crate::kill_process_group(&child);
+                #[cfg(windows)]
                 let _ = child.start_kill();
                 let _ = child.wait().await;
                 return Err(ErrorCode::Internal);

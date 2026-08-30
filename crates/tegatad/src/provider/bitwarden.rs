@@ -314,9 +314,6 @@ impl BitwardenCliProvider {
     }
 
     async fn ensure_session(&mut self) -> Result<(), ErrorCode> {
-        if self.locked {
-            return Err(ErrorCode::VaultLocked);
-        }
         if let (Some(_session), Some(unlocked_at)) = (&self.session, self.unlocked_at) {
             if unlocked_at.elapsed() < self.session_ttl {
                 return Ok(());
@@ -403,6 +400,7 @@ impl BitwardenCliProvider {
             }
         }
         self.unlocked_at = Some(Instant::now());
+        self.locked = false;
         Ok(())
     }
 
@@ -424,9 +422,6 @@ impl BitwardenCliProvider {
     }
 
     async fn expire_session(&mut self) {
-        if self.locked {
-            return;
-        }
         if self
             .unlocked_at
             .is_some_and(|unlocked_at| unlocked_at.elapsed() >= self.session_ttl)

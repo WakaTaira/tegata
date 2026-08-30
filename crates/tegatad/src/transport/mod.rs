@@ -59,6 +59,8 @@ pub(crate) enum Accepted<S> {
 pub(crate) enum PeerIdentity {
     /// Peer credentials of a UNIX domain socket client.
     Uid(u32),
+    /// An audit event emitted by the daemon itself.
+    System,
 }
 
 /// Identity of an authenticated peer, as established by the transport.
@@ -78,6 +80,8 @@ pub(crate) enum PeerIdentity {
     /// Loopback TCP client that presented a valid preamble token. Such a peer
     /// carries no operating system identity.
     Token,
+    /// An audit event emitted by the daemon itself.
+    System,
 }
 
 #[cfg(windows)]
@@ -86,6 +90,7 @@ impl PeerIdentity {
         match self {
             Self::Sid { normal_allowed, .. } => *normal_allowed,
             Self::Token => true,
+            Self::System => false,
         }
     }
 
@@ -97,23 +102,36 @@ impl PeerIdentity {
                 ..
             } => *elevated && *administrator,
             Self::Token => false,
+            Self::System => false,
         }
     }
 }
 
 /// Writes the peer as the audit log field of its platform. The map is
-/// flattened into the audit record, so each variant contributes exactly one
-/// key to it.
+/// flattened into the audit record.
 impl serde::Serialize for PeerIdentity {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(1))?;
+        let mut map = serializer.serialize_map(Some(3))?;
         match self {
             #[cfg(unix)]
             Self::Uid(uid) => map.serialize_entry("peer_uid", uid)?,
+            #[cfg(unix)]
+            Self::System => map.serialize_entry("peer_system", &true)?,
             #[cfg(windows)]
-            Self::Sid { sid, .. } => map.serialize_entry("peer_sid", sid)?,
+            Self::Sid {
+                sid,
+                elevated,
+                administrator,
+                ..
+            } => {
+                map.serialize_entry("peer_sid", sid)?;
+                map.serialize_entry("elevated", elevated)?;
+                map.serialize_entry("administrator", administrator)?;
+            }
             #[cfg(windows)]
             Self::Token => map.serialize_entry("peer_token", &true)?,
+            #[cfg(windows)]
+            Self::System => map.serialize_entry("peer_system", &true)?,
         }
         map.end()
     }

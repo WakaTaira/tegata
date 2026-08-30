@@ -12,7 +12,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
@@ -58,6 +59,7 @@ type ReadySender = Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<Resul
 struct Config {
     state_dir: String,
     audit_log_path: String,
+    audit_log_max_bytes: Option<u64>,
     executor_entry: Option<String>,
     session_ttl_secs: Option<u64>,
     #[cfg(windows)]
@@ -131,6 +133,7 @@ struct Provider {
 struct Session {
     child: Child,
     expires_at: Instant,
+    namespace: String,
 }
 
 struct DaemonState {
@@ -139,6 +142,8 @@ struct DaemonState {
     last_totp: HashMap<String, Instant>,
     registry: Arc<Mutex<Vec<String>>>,
     audit_log_path: PathBuf,
+    audit_log_max_bytes: Option<u64>,
+    audit_rotated: AtomicBool,
     audit_lock: Arc<Mutex<()>>,
     executor_entry: PathBuf,
     node_path: PathBuf,
@@ -199,12 +204,17 @@ struct AuditRecord<'a> {
     method: String,
     cred_id: Option<String>,
     target_url: Option<String>,
+    session_id: Option<String>,
+    namespace: Option<String>,
     outcome: String,
 }
 
+#[derive(Clone)]
 struct AuditFields {
     cred_id: Option<String>,
     target_url: Option<String>,
+    session_id: Option<String>,
+    namespace: Option<String>,
 }
 
 struct HandledRequest {
@@ -398,6 +408,7 @@ fn build_state(config: Config, password_dir: PathBuf) -> DaemonState {
     #[cfg(not(feature = "mock-provider"))]
     let registry = Vec::new();
     let audit_log_path = PathBuf::from(&config.audit_log_path);
+    let audit_log_max_bytes = config.audit_log_max_bytes;
     let executor_entry = resolve_executor_entry(&config);
     let node_path = resolve_node_path(&config);
     let browsers_path = resolve_browsers_path(&config);
@@ -449,6 +460,8 @@ fn build_state(config: Config, password_dir: PathBuf) -> DaemonState {
         last_totp: HashMap::new(),
         registry: Arc::new(Mutex::new(registry)),
         audit_log_path,
+        audit_log_max_bytes,
+        audit_rotated: AtomicBool::new(false),
         audit_lock: Arc::new(Mutex::new(())),
         executor_entry,
         node_path,
@@ -567,12 +580,29 @@ fn spawn_session_reaper(state: SharedState) {
                     .filter_map(|id| {
                         let session = daemon.sessions.remove(&id)?;
                         let _ = daemon.cdp_ports.write().map(|mut ports| ports.remove(&id));
-                        Some(session)
+                        Some((id, session))
                     })
                     .collect::<Vec<_>>()
             };
-            for session in expired {
-                stop_child(session.child).await;
+            for (session_id, session) in expired {
+                shutdown_child(session.child).await;
+                let daemon = state.lock().await;
+                if let Err(error) = append_audit(
+                    &daemon,
+                    &PeerIdentity::System,
+                    "session_expired".to_owned(),
+                    AuditFields {
+                        cred_id: None,
+                        target_url: None,
+                        session_id: Some(session_id),
+                        namespace: None,
+                    },
+                    "ok".to_owned(),
+                )
+                .await
+                {
+                    eprintln!("tegatad: audit append failed: {error}");
+                }
             }
         }
     });
@@ -588,12 +618,32 @@ fn spawn_bitwarden_session_reaper(state: SharedState) {
                 daemon
                     .providers
                     .iter()
-                    .map(|provider| provider.provider.clone())
+                    .map(|provider| (provider.namespace.clone(), provider.provider.clone()))
                     .collect::<Vec<_>>()
             };
-            for provider in providers {
+            for (namespace, provider) in providers {
                 let mut provider = provider.lock().await;
+                let was_locked = provider.locked();
                 let _ = provider.expire().await;
+                if !was_locked && provider.locked() {
+                    let daemon = state.lock().await;
+                    if let Err(error) = append_audit(
+                        &daemon,
+                        &PeerIdentity::System,
+                        "vault_autolocked".to_owned(),
+                        AuditFields {
+                            cred_id: None,
+                            target_url: None,
+                            session_id: None,
+                            namespace: Some(namespace),
+                        },
+                        "ok".to_owned(),
+                    )
+                    .await
+                    {
+                        eprintln!("tegatad: audit append failed: {error}");
+                    }
+                }
             }
         }
     });
@@ -620,6 +670,8 @@ where
                 AuditFields {
                     cred_id: None,
                     target_url: None,
+                    session_id: None,
+                    namespace: None,
                 },
             ),
         };
@@ -665,8 +717,7 @@ async fn write_response<W: AsyncWrite + Unpin>(
             &daemon,
             peer,
             method.clone(),
-            fields.cred_id.clone(),
-            fields.target_url.clone(),
+            fields.clone(),
             ErrorCode::Internal.as_str().to_owned(),
         )
         .await
@@ -678,15 +729,7 @@ async fn write_response<W: AsyncWrite + Unpin>(
         ErrorCode::Internal.as_str().to_owned()
     };
     if leaked.is_empty()
-        && let Err(error) = append_audit(
-            &daemon,
-            peer,
-            method,
-            fields.cred_id,
-            fields.target_url,
-            final_outcome,
-        )
-        .await
+        && let Err(error) = append_audit(&daemon, peer, method, fields, final_outcome).await
     {
         eprintln!("tegatad: audit append failed: {error}");
     }
@@ -722,8 +765,7 @@ async fn append_audit(
     state: &DaemonState,
     peer: &PeerIdentity,
     method: String,
-    cred_id: Option<String>,
-    target_url: Option<String>,
+    fields: AuditFields,
     outcome: String,
 ) -> Result<(), AppendAuditError> {
     let _guard = state.audit_lock.lock().await;
@@ -734,18 +776,52 @@ async fn append_audit(
             .unwrap_or_else(|_| "unix:0".to_owned()),
         peer,
         method,
-        cred_id,
-        target_url,
+        cred_id: fields.cred_id,
+        target_url: fields.target_url,
+        session_id: fields.session_id,
+        namespace: fields.namespace,
         outcome,
     };
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&state.audit_log_path)
-        .await
-        .map_err(AppendAuditError::Open)?;
     let mut bytes = serde_json::to_vec(&record).map_err(AppendAuditError::Serialize)?;
     bytes.push(b'\n');
+    let current_size = match tokio::fs::metadata(&state.audit_log_path).await {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(AppendAuditError::Open(error)),
+    };
+    if let Some(max_bytes) = state.audit_log_max_bytes
+        && !state.audit_rotated.load(Ordering::Relaxed)
+        && (current_size > max_bytes || current_size.saturating_add(bytes.len() as u64) > max_bytes)
+        && current_size > 0
+    {
+        let rotated_path = PathBuf::from(format!("{}.1", state.audit_log_path.display()));
+        match tokio::fs::remove_file(&rotated_path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(AppendAuditError::Open(error)),
+        }
+        tokio::fs::rename(&state.audit_log_path, rotated_path)
+            .await
+            .map_err(AppendAuditError::Open)?;
+        state.audit_rotated.store(true, Ordering::Relaxed);
+    }
+    let mut file = match secure_fs::create_private_file(&state.audit_log_path).await {
+        Ok(file) => {
+            drop(file);
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&state.audit_log_path)
+                .await
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&state.audit_log_path)
+                .await
+        }
+        Err(error) => Err(error),
+    }
+    .map_err(AppendAuditError::Open)?;
     file.write_all(&bytes)
         .await
         .map_err(AppendAuditError::Write)
@@ -899,6 +975,10 @@ async fn login(request: &RpcRequest, state: SharedState) -> HandledRequest {
         Ok(params) => params,
         Err(error) => return classified(request.id.clone(), error),
     };
+    let Some((namespace, _)) = params.cred_id.split_once(':') else {
+        return classified(request.id.clone(), ErrorCode::InvalidCredential);
+    };
+    let namespace = namespace.to_owned();
     let (credential, executor_entry, node_path, browsers_path, ttl) = {
         let credential = match resolve_credential(&state, &params.cred_id).await {
             Ok(Some(credential)) => credential,
@@ -945,6 +1025,7 @@ async fn login(request: &RpcRequest, state: SharedState) -> HandledRequest {
         Session {
             child,
             expires_at: Instant::now() + ttl,
+            namespace,
         },
     );
     success(
@@ -1039,6 +1120,51 @@ async fn lock_vault(request: &RpcRequest, state: SharedState) -> HandledRequest 
         let mut provider = provider.lock().await;
         if let Err(error) = provider.lock().await {
             return classified(request.id.clone(), error);
+        }
+    }
+    let sessions = {
+        let mut daemon = state.lock().await;
+        let session_ids = daemon
+            .sessions
+            .iter()
+            .filter_map(|(session_id, session)| {
+                namespace
+                    .as_deref()
+                    .is_none_or(|requested| requested == session.namespace)
+                    .then_some(session_id.clone())
+            })
+            .collect::<Vec<_>>();
+        session_ids
+            .into_iter()
+            .filter_map(|session_id| {
+                let session = daemon.sessions.remove(&session_id)?;
+                let _ = daemon
+                    .cdp_ports
+                    .write()
+                    .map(|mut ports| ports.remove(&session_id));
+                Some((session_id, session))
+            })
+            .collect::<Vec<_>>()
+    };
+    for (session_id, session) in sessions {
+        let session_namespace = session.namespace.clone();
+        shutdown_child(session.child).await;
+        let daemon = state.lock().await;
+        if let Err(error) = append_audit(
+            &daemon,
+            &PeerIdentity::System,
+            "session_terminated".to_owned(),
+            AuditFields {
+                cred_id: None,
+                target_url: None,
+                session_id: Some(session_id),
+                namespace: Some(session_namespace),
+            },
+            "ok".to_owned(),
+        )
+        .await
+        {
+            eprintln!("tegatad: audit append failed: {error}");
         }
     }
     success(request.id.clone(), json!({ "ok": true }))
@@ -1247,6 +1373,14 @@ fn audit_fields(params: &Value) -> AuditFields {
             .get("target_url")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        session_id: params
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        namespace: params
+            .get("namespace")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
     }
 }
 
@@ -1294,11 +1428,13 @@ mod tests {
             method: "status".to_owned(),
             cred_id: None,
             target_url: None,
+            session_id: None,
+            namespace: None,
             outcome: "ok".to_owned(),
         };
         assert_eq!(
             serde_json::to_string(&record).expect("serialize audit record"),
-            r#"{"ts":"unix:1","peer_uid":1000,"method":"status","cred_id":null,"target_url":null,"outcome":"ok"}"#
+            r#"{"ts":"unix:1","peer_uid":1000,"method":"status","cred_id":null,"target_url":null,"session_id":null,"namespace":null,"outcome":"ok"}"#
         );
     }
 }

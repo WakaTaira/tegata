@@ -28,7 +28,9 @@ export const REPO_ROOT = path.resolve(
 
 /** Error classification codes. The full closed set; nothing else may appear.
  * APPROVAL_DENIED / APPROVAL_TIMEOUT were added by the Phase 3 contract
- * (docs/secret/briefs/tegata-phase3.md, 変更内容 4). */
+ * (docs/secret/briefs/tegata-phase3.md, 変更内容 4).
+ * Keep in sync with ErrorCode in crates/tegatad/src/main.rs and
+ * ERROR_CODES in packages/tegata-mcp/src/index.ts. */
 export const ERROR_CODES = [
   "INVALID_CREDENTIAL",
   "MFA_REQUIRED",

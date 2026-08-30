@@ -28,6 +28,7 @@ pub(crate) struct BitwardenCliProvider {
     session: Option<Secret>,
     unlocked_at: Option<Instant>,
     locked: bool,
+    autolock_event_pending: bool,
     catalog: Vec<BitwardenCatalogItem>,
     #[cfg(windows)]
     unlock_mode: UnlockMode,
@@ -127,6 +128,7 @@ impl BitwardenCliProvider {
             session: None,
             unlocked_at: None,
             locked: false,
+            autolock_event_pending: false,
             catalog: Vec::new(),
             #[cfg(windows)]
             unlock_mode: config.unlock_mode,
@@ -326,9 +328,7 @@ impl BitwardenCliProvider {
             if unlocked_at.elapsed() < self.session_ttl {
                 return Ok(());
             }
-            let _ = self.lock_session().await;
-            self.locked = true;
-            return Err(ErrorCode::VaultLocked);
+            self.expire_session().await;
         }
 
         let password = self.password().await?;
@@ -436,6 +436,7 @@ impl BitwardenCliProvider {
         {
             let _ = self.lock_session().await;
             self.locked = true;
+            self.autolock_event_pending = true;
         }
     }
 
@@ -529,7 +530,7 @@ impl BitwardenCliProvider {
         let expose_totp = self.totp_exposable.iter().any(|name| name == &item.name);
         Ok(Some(ResolvedCredential {
             locked: self.locked,
-            register_secrets: false,
+            secrets_preregistered: false,
             username: Secret::new(login.username.unwrap_or_default()),
             password: Secret::new(login.password.unwrap_or_default()),
             totp_seed: login.totp.map(Secret::new),
@@ -565,6 +566,10 @@ impl CredentialProvider for BitwardenCliProvider {
 
     fn locked(&self) -> bool {
         self.locked
+    }
+
+    fn take_autolock_event(&mut self) -> bool {
+        std::mem::take(&mut self.autolock_event_pending)
     }
 }
 

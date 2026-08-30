@@ -2,7 +2,7 @@
 //!
 //! Everything that depends on how a client reaches the daemon lives behind
 //! [`Transport`]: the listener, the authentication of the peer, and the
-//! identity that the audit log records. The RPC layer above sees only an
+//! authenticated peer identity. The RPC layer above sees only an
 //! authenticated peer and a byte stream, so it is identical on every platform.
 //!
 //! Exactly one implementation is compiled per target. The UNIX build listens
@@ -59,8 +59,6 @@ pub(crate) enum Accepted<S> {
 pub(crate) enum PeerIdentity {
     /// Peer credentials of a UNIX domain socket client.
     Uid(u32),
-    /// An audit event emitted by the daemon itself.
-    System,
 }
 
 /// Identity of an authenticated peer, as established by the transport.
@@ -80,8 +78,6 @@ pub(crate) enum PeerIdentity {
     /// Loopback TCP client that presented a valid preamble token. Such a peer
     /// carries no operating system identity.
     Token,
-    /// An audit event emitted by the daemon itself.
-    System,
 }
 
 #[cfg(windows)]
@@ -90,7 +86,6 @@ impl PeerIdentity {
         match self {
             Self::Sid { normal_allowed, .. } => *normal_allowed,
             Self::Token => true,
-            Self::System => false,
         }
     }
 
@@ -102,7 +97,6 @@ impl PeerIdentity {
                 ..
             } => *elevated && *administrator,
             Self::Token => false,
-            Self::System => false,
         }
     }
 }
@@ -115,8 +109,6 @@ impl serde::Serialize for PeerIdentity {
         match self {
             #[cfg(unix)]
             Self::Uid(uid) => map.serialize_entry("peer_uid", uid)?,
-            #[cfg(unix)]
-            Self::System => map.serialize_entry("peer_system", &true)?,
             #[cfg(windows)]
             Self::Sid {
                 sid,
@@ -130,8 +122,6 @@ impl serde::Serialize for PeerIdentity {
             }
             #[cfg(windows)]
             Self::Token => map.serialize_entry("peer_token", &true)?,
-            #[cfg(windows)]
-            Self::System => map.serialize_entry("peer_system", &true)?,
         }
         map.end()
     }

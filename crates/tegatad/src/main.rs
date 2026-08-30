@@ -18,6 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use leakscan::scan_bytes;
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tegata_core::wire::{
@@ -178,6 +179,7 @@ struct DaemonState {
 
 type SharedState = Arc<Mutex<DaemonState>>;
 
+// Keep in sync with packages/tegata-mcp/src/index.ts and tests/acceptance/support/harness.ts.
 #[derive(Clone, Copy)]
 enum ErrorCode {
     InvalidCredential,
@@ -219,12 +221,29 @@ impl ErrorCode {
     }
 }
 
+enum AuditPeer<'a> {
+    Peer(&'a PeerIdentity),
+    System,
+}
+
+impl Serialize for AuditPeer<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Peer(peer) => peer.serialize(serializer),
+            Self::System => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("peer_system", &true)?;
+                map.end()
+            }
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct AuditRecord<'a> {
     ts: String,
-    /// One key that names the peer the way its transport identifies it.
     #[serde(flatten)]
-    peer: &'a PeerIdentity,
+    peer: AuditPeer<'a>,
     method: String,
     cred_id: Option<String>,
     target_url: Option<String>,
@@ -410,7 +429,7 @@ async fn run_daemon(
         let _ = sender.send(Ok(()));
     }
     spawn_session_reaper(state.clone());
-    spawn_bitwarden_session_reaper(state.clone());
+    spawn_provider_expiry_reaper(state.clone());
     if ready {
         let ready_line = r#"{"ready":true}"#;
         println!("{}", ready_line);
@@ -680,7 +699,7 @@ fn spawn_session_reaper(state: SharedState) {
                 let daemon = state.lock().await;
                 if let Err(error) = append_audit(
                     &daemon,
-                    &PeerIdentity::System,
+                    AuditPeer::System,
                     "session_expired".to_owned(),
                     AuditFields {
                         cred_id: None,
@@ -699,7 +718,7 @@ fn spawn_session_reaper(state: SharedState) {
     });
 }
 
-fn spawn_bitwarden_session_reaper(state: SharedState) {
+fn spawn_provider_expiry_reaper(state: SharedState) {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(1));
         loop {
@@ -714,30 +733,35 @@ fn spawn_bitwarden_session_reaper(state: SharedState) {
             };
             for (namespace, provider) in providers {
                 let mut provider = provider.lock().await;
-                let was_locked = provider.locked();
                 let _ = provider.expire().await;
-                if !was_locked && provider.locked() {
-                    let daemon = state.lock().await;
-                    if let Err(error) = append_audit(
-                        &daemon,
-                        &PeerIdentity::System,
-                        "vault_autolocked".to_owned(),
-                        AuditFields {
-                            cred_id: None,
-                            target_url: None,
-                            session_id: None,
-                            namespace: Some(namespace),
-                        },
-                        "ok".to_owned(),
-                    )
-                    .await
-                    {
-                        eprintln!("tegatad: audit append failed: {error}");
-                    }
+                let autolocked = provider.take_autolock_event();
+                drop(provider);
+                if autolocked {
+                    audit_provider_autolock(&state, namespace).await;
                 }
             }
         }
     });
+}
+
+async fn audit_provider_autolock(state: &SharedState, namespace: String) {
+    let daemon = state.lock().await;
+    if let Err(error) = append_audit(
+        &daemon,
+        AuditPeer::System,
+        "vault_autolocked".to_owned(),
+        AuditFields {
+            cred_id: None,
+            target_url: None,
+            session_id: None,
+            namespace: Some(namespace),
+        },
+        "ok".to_owned(),
+    )
+    .await
+    {
+        eprintln!("tegatad: audit append failed: {error}");
+    }
 }
 
 async fn serve_connection<S>(stream: S, peer: PeerIdentity, state: SharedState)
@@ -806,7 +830,7 @@ async fn write_response<W: AsyncWrite + Unpin>(
     } else {
         if let Err(error) = append_audit(
             &daemon,
-            peer,
+            AuditPeer::Peer(peer),
             method.clone(),
             fields.clone(),
             ErrorCode::Internal.as_str().to_owned(),
@@ -820,7 +844,14 @@ async fn write_response<W: AsyncWrite + Unpin>(
         ErrorCode::Internal.as_str().to_owned()
     };
     if leaked.is_empty()
-        && let Err(error) = append_audit(&daemon, peer, method, fields, final_outcome).await
+        && let Err(error) = append_audit(
+            &daemon,
+            AuditPeer::Peer(peer),
+            method,
+            fields,
+            final_outcome,
+        )
+        .await
     {
         eprintln!("tegatad: audit append failed: {error}");
     }
@@ -854,7 +885,7 @@ impl std::error::Error for AppendAuditError {}
 
 async fn append_audit(
     state: &DaemonState,
-    peer: &PeerIdentity,
+    peer: AuditPeer<'_>,
     method: String,
     fields: AuditFields,
     outcome: String,
@@ -1029,13 +1060,18 @@ async fn list_credentials(request: &RpcRequest, state: SharedState) -> HandledRe
     };
     let mut result = Vec::new();
     for (provider_namespace, provider) in providers {
-        let (refs, locked) = {
+        let (refs_result, locked, autolocked) = {
             let mut provider = provider.lock().await;
-            let refs = match provider.list_refs().await {
-                Ok(refs) => refs,
-                Err(error) => return classified(request.id.clone(), error),
-            };
-            (refs, provider.locked())
+            let refs_result = provider.list_refs().await;
+            let autolocked = provider.take_autolock_event();
+            (refs_result, provider.locked(), autolocked)
+        };
+        if autolocked {
+            audit_provider_autolock(&state, provider_namespace.clone()).await;
+        }
+        let refs = match refs_result {
+            Ok(refs) => refs,
+            Err(error) => return classified(request.id.clone(), error),
         };
         for credential in refs {
             let id = format!("{provider_namespace}:{}", credential.id);
@@ -1161,11 +1197,21 @@ async fn credential_state(state: &SharedState, cred_id: &str) -> Result<Option<b
         provider.provider.clone()
     };
     let mut provider = provider.lock().await;
-    let refs = provider.list_refs().await?;
-    Ok(refs
-        .iter()
-        .any(|credential| credential.id == entry_id)
-        .then_some(provider.locked()))
+    let refs_result = provider.list_refs().await;
+    let autolocked = provider.take_autolock_event();
+    let locked = provider.locked();
+    drop(provider);
+    if autolocked {
+        audit_provider_autolock(state, namespace.to_owned()).await;
+    }
+    let refs = refs_result?;
+    if refs.iter().any(|credential| credential.id == entry_id) {
+        return Ok(Some(false));
+    }
+    if locked && refs.is_empty() {
+        return Ok(Some(false));
+    }
+    Ok(None)
 }
 
 #[cfg(unix)]
@@ -1183,7 +1229,6 @@ async fn approve_login(
     };
     let peer_uid = match peer {
         PeerIdentity::Uid(uid) => uid.to_string(),
-        PeerIdentity::System => "0".to_owned(),
     };
     let mut command = Command::new("sh");
     command
@@ -1324,7 +1369,7 @@ async fn lock_vault(request: &RpcRequest, state: SharedState) -> HandledRequest 
         let daemon = state.lock().await;
         if let Err(error) = append_audit(
             &daemon,
-            &PeerIdentity::System,
+            AuditPeer::System,
             "session_terminated".to_owned(),
             AuditFields {
                 cred_id: None,
@@ -1361,12 +1406,17 @@ async fn resolve_credential(
         provider.provider.clone()
     };
     let mut provider = provider.lock().await;
-    let credential = provider.resolve(entry_id).await?;
+    let credential_result = provider.resolve(entry_id).await;
+    let autolocked = provider.take_autolock_event();
     drop(provider);
+    if autolocked {
+        audit_provider_autolock(state, namespace.to_owned()).await;
+    }
+    let credential = credential_result?;
     let Some(credential) = credential else {
         return Ok(None);
     };
-    if !credential.register_secrets {
+    if !credential.secrets_preregistered {
         let daemon = state.lock().await;
         let mut registry = daemon.registry.lock().await;
         register_secret(&mut registry, &credential.username);
@@ -1600,14 +1650,14 @@ fn error_response(id: Value, error: ErrorCode) -> RpcResponse {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{AuditRecord, PeerIdentity};
+    use super::{AuditPeer, AuditRecord, PeerIdentity};
 
     #[test]
     fn audit_record_names_the_peer_by_its_transport_identity() {
         let peer = PeerIdentity::Uid(1000);
         let record = AuditRecord {
             ts: "unix:1".to_owned(),
-            peer: &peer,
+            peer: AuditPeer::Peer(&peer),
             method: "status".to_owned(),
             cred_id: None,
             target_url: None,

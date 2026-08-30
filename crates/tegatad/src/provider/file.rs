@@ -33,6 +33,7 @@ pub(crate) struct FileProvider {
     catalog: Vec<CredentialRef>,
     unlocked_at: Option<Instant>,
     locked: bool,
+    autolock_event_pending: bool,
 }
 
 impl FileProvider {
@@ -60,18 +61,20 @@ impl FileProvider {
             catalog: Vec::new(),
             unlocked_at: None,
             locked: true,
+            autolock_event_pending: false,
         })
     }
 
     async fn unlock(&mut self) -> Result<(), ErrorCode> {
-        if self
-            .unlocked_at
-            .is_some_and(|unlocked_at| unlocked_at.elapsed() < self.session_ttl)
-        {
-            return Ok(());
+        if let Some(unlocked_at) = self.unlocked_at {
+            if unlocked_at.elapsed() < self.session_ttl {
+                return Ok(());
+            }
+            self.session = None;
+            self.unlocked_at = None;
+            self.locked = true;
+            self.autolock_event_pending = true;
         }
-        self.session = None;
-        self.unlocked_at = None;
         let encrypted = tokio::fs::read(&self.entries_path)
             .await
             .map_err(|error| self.log_decryption_error(error))?;
@@ -94,9 +97,10 @@ impl FileProvider {
             .map_err(|error| self.log_decryption_error(error))?;
         let entries = match toml::from_slice::<EntriesFile>(&plaintext) {
             Ok(entries) => entries.entries,
-            Err(error) => {
+            Err(_error) => {
                 plaintext.zeroize();
-                return Err(self.log_decryption_error(error));
+                eprintln!("tegatad: age entries file is not valid TOML");
+                return Err(ErrorCode::Internal);
             }
         };
         plaintext.zeroize();
@@ -155,7 +159,7 @@ impl FileProvider {
         let Some(mut credential) = credential else {
             return Ok(None);
         };
-        credential.register_secrets = false;
+        credential.secrets_preregistered = false;
         Ok(Some(credential))
     }
 }
@@ -188,6 +192,7 @@ impl CredentialProvider for FileProvider {
                 self.session = None;
                 self.unlocked_at = None;
                 self.locked = true;
+                self.autolock_event_pending = true;
             }
             Ok(())
         })
@@ -195,5 +200,9 @@ impl CredentialProvider for FileProvider {
 
     fn locked(&self) -> bool {
         self.locked
+    }
+
+    fn take_autolock_event(&mut self) -> bool {
+        std::mem::take(&mut self.autolock_event_pending)
     }
 }

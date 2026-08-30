@@ -10,6 +10,7 @@ type RpcResponse = {
   error?: { message?: unknown };
 };
 
+// Keep in sync with crates/tegatad/src/main.rs and tests/acceptance/support/harness.ts.
 const ERROR_CODES = [
   "INVALID_CREDENTIAL",
   "MFA_REQUIRED",

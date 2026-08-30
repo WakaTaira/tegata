@@ -65,6 +65,7 @@ pub(crate) struct PassProvider {
     entries: HashMap<String, PassEntry>,
     unlocked_at: Option<Instant>,
     locked: bool,
+    autolock_event_pending: bool,
 }
 
 impl PassProvider {
@@ -79,7 +80,14 @@ impl PassProvider {
             entries: HashMap::new(),
             unlocked_at: None,
             locked: true,
+            autolock_event_pending: false,
         }
+    }
+
+    fn clear_session(&mut self) {
+        self.entries.clear();
+        self.unlocked_at = None;
+        self.locked = true;
     }
 
     fn scan_store(&mut self) -> Result<(), ErrorCode> {
@@ -154,9 +162,8 @@ impl PassProvider {
             .unlocked_at
             .is_some_and(|unlocked_at| unlocked_at.elapsed() >= self.session_ttl)
         {
-            self.entries.clear();
-            self.unlocked_at = None;
-            self.locked = true;
+            self.clear_session();
+            self.autolock_event_pending = true;
         }
         if let Some(entry) = self.entries.get(&entry_name) {
             return Ok(Some(to_resolved(entry)));
@@ -234,7 +241,7 @@ fn extract_totp_seed(line: &str) -> Option<String> {
 fn to_resolved(entry: &PassEntry) -> ResolvedCredential {
     ResolvedCredential {
         locked: false,
-        register_secrets: false,
+        secrets_preregistered: false,
         username: Secret::new(entry.username.as_str()),
         password: Secret::new(entry.password.as_str()),
         totp_seed: entry
@@ -269,9 +276,7 @@ impl CredentialProvider for PassProvider {
 
     fn lock(&mut self) -> ProviderFuture<'_, ()> {
         Box::pin(async move {
-            self.entries.clear();
-            self.unlocked_at = None;
-            self.locked = true;
+            self.clear_session();
             // Locking only drops retrieved values; it deliberately does not touch the gpg-agent cache.
             Ok(())
         })
@@ -283,9 +288,8 @@ impl CredentialProvider for PassProvider {
                 .unlocked_at
                 .is_some_and(|unlocked_at| unlocked_at.elapsed() >= self.session_ttl)
             {
-                self.entries.clear();
-                self.unlocked_at = None;
-                self.locked = true;
+                self.clear_session();
+                self.autolock_event_pending = true;
             }
             Ok(())
         })
@@ -293,5 +297,9 @@ impl CredentialProvider for PassProvider {
 
     fn locked(&self) -> bool {
         self.locked
+    }
+
+    fn take_autolock_event(&mut self) -> bool {
+        std::mem::take(&mut self.autolock_event_pending)
     }
 }

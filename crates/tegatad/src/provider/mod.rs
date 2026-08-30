@@ -28,7 +28,7 @@ pub(crate) struct CredentialRef {
 
 pub(crate) struct ResolvedCredential {
     pub(crate) locked: bool,
-    pub(crate) register_secrets: bool,
+    pub(crate) secrets_preregistered: bool,
     pub(crate) username: Secret,
     pub(crate) password: Secret,
     pub(crate) totp_seed: Option<Secret>,
@@ -46,6 +46,10 @@ pub(crate) trait CredentialProvider: Send {
     fn lock(&mut self) -> ProviderFuture<'_, ()>;
 
     fn expire(&mut self) -> ProviderFuture<'_, ()>;
+
+    fn take_autolock_event(&mut self) -> bool {
+        false
+    }
 
     fn locked(&self) -> bool;
 }

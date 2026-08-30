@@ -25,6 +25,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use tokio::sync::mpsc;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GAA_FLAG_INCLUDE_PREFIX, GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
@@ -113,14 +114,11 @@ pub(crate) struct PlatformTransport {
 }
 
 struct PipeTransport {
-    server: NamedPipeServer,
-    name: OsString,
-    allowed_sids: Vec<String>,
-    /// SID of the account the daemon runs under. The pipe security descriptor
-    /// must name it, because every additional pipe instance is created against
-    /// the security descriptor of the existing one.
-    daemon_sid: String,
+    receiver: mpsc::Receiver<io::Result<(super::PeerIdentity, PrefixedStream<NamedPipeServer>)>>,
+    accept_task: tokio::task::JoinHandle<()>,
 }
+
+const PIPE_ACCEPT_QUEUE_CAPACITY: usize = 16;
 
 /// Time a connected client is given to send its first byte.
 ///
@@ -217,47 +215,94 @@ impl PipeTransport {
         let name = pipe_path(pipe_name)?;
         let daemon_sid = crate::secure_fs::current_user_sid()?;
         let server = create_pipe_server(&name, allowed_sids, &daemon_sid, true)?;
-        Ok(Self {
+        let (sender, receiver) = mpsc::channel(PIPE_ACCEPT_QUEUE_CAPACITY);
+        let accept_task = tokio::spawn(accept_loop(
             server,
             name,
-            allowed_sids: allowed_sids.to_owned(),
+            allowed_sids.to_owned(),
             daemon_sid,
+            sender,
+        ));
+        Ok(Self {
+            receiver,
+            accept_task,
         })
     }
 
     async fn accept(
         &mut self,
     ) -> io::Result<Option<(super::PeerIdentity, PrefixedStream<NamedPipeServer>)>> {
-        self.server.connect().await?;
-        let name = self.name.clone();
-        let allowed_sids = self.allowed_sids.clone();
-        let replacement = create_pipe_server(&name, &allowed_sids, &self.daemon_sid, false)?;
-        let mut connected = std::mem::replace(&mut self.server, replacement);
-        // The client becomes impersonable only once it has sent data, so the
-        // first byte of its request is read here and replayed to the RPC layer.
-        let mut prefix = [0_u8; 1];
-        let read = tokio::time::timeout(IDENTITY_READ_TIMEOUT, connected.read(&mut prefix)).await;
-        if !matches!(read, Ok(Ok(1))) {
-            return Ok(None);
+        match self.receiver.recv().await {
+            Some(result) => result.map(Some),
+            None => Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "named pipe accept loop stopped",
+            )),
         }
-        let identity = match client_identity(&connected) {
-            Ok(identity) => identity,
-            Err(_) => return Ok(None),
-        };
-        let normal_allowed = self.allowed_sids.iter().any(|sid| sid == &identity.sid);
-        if !normal_allowed && !(identity.administrator && identity.elevated) {
-            return Ok(None);
-        }
-        Ok(Some((
-            super::PeerIdentity::Sid {
-                sid: identity.sid,
-                elevated: identity.elevated,
-                administrator: identity.administrator,
-                normal_allowed,
-            },
-            PrefixedStream::new(prefix[0], connected),
-        )))
     }
+}
+
+impl Drop for PipeTransport {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+    }
+}
+
+async fn accept_loop(
+    mut server: NamedPipeServer,
+    name: OsString,
+    allowed_sids: Vec<String>,
+    daemon_sid: String,
+    sender: mpsc::Sender<io::Result<(super::PeerIdentity, PrefixedStream<NamedPipeServer>)>>,
+) {
+    loop {
+        if let Err(error) = server.connect().await {
+            let _ = sender.send(Err(error)).await;
+            return;
+        }
+        let replacement = match create_pipe_server(&name, &allowed_sids, &daemon_sid, false) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
+        };
+        let connected = std::mem::replace(&mut server, replacement);
+        let sender = sender.clone();
+        let allowed_sids = allowed_sids.clone();
+        tokio::spawn(async move {
+            if let Some(accepted) = validate_client(connected, &allowed_sids).await {
+                let _ = sender.send(Ok(accepted)).await;
+            }
+        });
+    }
+}
+
+async fn validate_client(
+    mut connected: NamedPipeServer,
+    allowed_sids: &[String],
+) -> Option<(super::PeerIdentity, PrefixedStream<NamedPipeServer>)> {
+    // The client becomes impersonable only once it has sent data, so the first
+    // byte of its request is read here and replayed to the RPC layer.
+    let mut prefix = [0_u8; 1];
+    let read = tokio::time::timeout(IDENTITY_READ_TIMEOUT, connected.read(&mut prefix)).await;
+    if !matches!(read, Ok(Ok(1))) {
+        return None;
+    }
+    let identity = client_identity(&connected).ok()?;
+    let normal_allowed = allowed_sids.iter().any(|sid| sid == &identity.sid);
+    if !normal_allowed && !(identity.administrator && identity.elevated) {
+        return None;
+    }
+    Some((
+        super::PeerIdentity::Sid {
+            sid: identity.sid,
+            elevated: identity.elevated,
+            administrator: identity.administrator,
+            normal_allowed,
+        },
+        PrefixedStream::new(prefix[0], connected),
+    ))
 }
 
 pub(crate) fn pipe_path(pipe_name: &str) -> io::Result<OsString> {

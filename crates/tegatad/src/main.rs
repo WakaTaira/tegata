@@ -1,5 +1,6 @@
 #[cfg(windows)]
 mod dpapi;
+mod provider;
 mod secure_fs;
 mod transport;
 #[cfg(windows)]
@@ -23,7 +24,7 @@ use tegata_core::wire::{
     RpcResponse,
 };
 use tegata_core::{Secret, totp};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, interval, timeout};
@@ -36,6 +37,12 @@ use tegata_core::wire::{AdminSealParams, AdminTokenIssueResult};
 #[cfg(windows)]
 use zeroize::Zeroize;
 
+#[cfg(feature = "mock-provider")]
+use crate::provider::StaticProvider;
+use crate::provider::{
+    BitwardenCliConfig, BitwardenCliProvider, CredentialProvider, ResolvedCredential,
+    remove_password_file,
+};
 #[cfg(windows)]
 use crate::transport::CdpPortResolver;
 use crate::transport::{Accepted, PeerIdentity, PlatformConfig, PlatformTransport, Transport};
@@ -44,7 +51,6 @@ const JSON_RPC_VERSION: &str = "2.0";
 const METHOD_NOT_FOUND: i32 = -32601;
 const CLASSIFICATION_ERROR: i32 = -32000;
 const EXECUTOR_TIMEOUT: Duration = Duration::from_secs(90);
-const BW_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
 type ReadySender = Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<Result<(), String>>>>>;
 
@@ -104,12 +110,7 @@ enum ProviderConfigKind {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProviderKind {
-    Mock,
-    BitwardenCli,
-}
-
+#[cfg(feature = "mock-provider")]
 #[derive(Debug, Deserialize)]
 struct EntryConfig {
     id: String,
@@ -124,521 +125,7 @@ struct EntryConfig {
 
 struct Provider {
     namespace: String,
-    kind: ProviderKind,
-    entries: Vec<Entry>,
-    locked: bool,
-    bitwarden: Option<Arc<Mutex<BitwardenCliProvider>>>,
-}
-
-struct Entry {
-    id: String,
-    name: String,
-    uri: String,
-    kind: String,
-    username: Secret,
-    password: Secret,
-    totp_seed: Option<Secret>,
-    totp_exposable: bool,
-}
-
-struct ResolvedCredential {
-    kind: ProviderKind,
-    locked: bool,
-    username: Secret,
-    password: Secret,
-    totp_seed: Option<Secret>,
-    totp_exposable: bool,
-}
-
-struct BitwardenCliProvider {
-    server_url: String,
-    email: String,
-    askpass_cmd: String,
-    appdata_dir: PathBuf,
-    password_dir: PathBuf,
-    bw_path: Option<PathBuf>,
-    totp_exposable: Vec<String>,
-    session_ttl: Duration,
-    session: Option<Secret>,
-    unlocked_at: Option<Instant>,
-    locked: bool,
-    catalog: Vec<BitwardenCatalogItem>,
-    #[cfg(windows)]
-    unlock_mode: UnlockMode,
-    #[cfg(windows)]
-    sealed_blob_path: PathBuf,
-}
-
-struct BitwardenCatalogItem {
-    id: String,
-    name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct BitwardenItem {
-    id: String,
-    name: String,
-    login: Option<BitwardenLogin>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BitwardenLogin {
-    #[serde(default)]
-    uris: Vec<BitwardenUri>,
-    username: Option<String>,
-    password: Option<String>,
-    totp: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct BitwardenUri {
-    uri: Option<String>,
-}
-
-#[derive(Debug)]
-enum BwRunError {
-    CreateDir(io::Error),
-    PasswordFile(io::Error),
-    Process(io::Error),
-    NonZeroExit(std::process::ExitStatus),
-    Timeout,
-}
-
-impl fmt::Display for BwRunError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CreateDir(error) => {
-                write!(formatter, "could not create appdata directory: {error}")
-            }
-            Self::PasswordFile(error) => {
-                write!(formatter, "could not prepare password file: {error}")
-            }
-            Self::Process(error) => write!(formatter, "could not run bw: {error}"),
-            Self::NonZeroExit(status) => write!(
-                formatter,
-                "bw exited unsuccessfully with status {}",
-                status
-                    .code()
-                    .map_or_else(|| "signal".to_owned(), |code| code.to_string()),
-            ),
-            Self::Timeout => write!(formatter, "bw command timed out"),
-        }
-    }
-}
-
-impl std::error::Error for BwRunError {}
-
-fn log_bw_error(operation: &str, error: &BwRunError) {
-    eprintln!("tegatad: bw {operation} failed: {error}");
-}
-
-impl BitwardenCliProvider {
-    async fn run_bw(
-        &self,
-        args: &[String],
-        session: Option<&Secret>,
-        password: Option<&Secret>,
-    ) -> Result<Vec<u8>, BwRunError> {
-        tokio::fs::create_dir_all(&self.appdata_dir)
-            .await
-            .map_err(BwRunError::CreateDir)?;
-        tokio::fs::create_dir_all(&self.password_dir)
-            .await
-            .map_err(BwRunError::CreateDir)?;
-        secure_fs::restrict_directory(&self.password_dir)
-            .await
-            .map_err(BwRunError::CreateDir)?;
-        let password_file = if let Some(password) = password {
-            let path = self
-                .password_dir
-                .join(format!(".bw-password-{}", Uuid::new_v4()));
-            let guard = PasswordFileGuard::new(path.clone());
-            let mut file = match secure_fs::create_private_file(&path).await {
-                Ok(file) => file,
-                Err(error) => {
-                    drop(guard);
-                    return Err(BwRunError::PasswordFile(error));
-                }
-            };
-            let mut bytes = password.as_str().as_bytes().to_vec();
-            let write_result = file.write_all(&bytes).await;
-            let write_result = match write_result {
-                Ok(()) => file.flush().await,
-                Err(error) => Err(error),
-            };
-            bytes.fill(0);
-            if let Err(error) = write_result {
-                drop(file);
-                remove_password_file(&path).await;
-                return Err(BwRunError::PasswordFile(error));
-            }
-            drop(file);
-            Some((path, guard))
-        } else {
-            None
-        };
-        let mut command_args = args.to_vec();
-        if let Some((path, _)) = &password_file {
-            command_args.push("--passwordfile".to_owned());
-            command_args.push(path.to_string_lossy().into_owned());
-        }
-        let bw_path = self.bw_path.as_deref().unwrap_or_else(|| Path::new("bw"));
-        let mut command = Command::new(bw_path);
-        command
-            .args(&command_args)
-            .env("BW_APPDATA_DIR", &self.appdata_dir)
-            .env("BITWARDENCLI_APPDATA_DIR", &self.appdata_dir)
-            .env_remove("BW_PASSWORD")
-            .env_remove("BW_SESSION")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
-        if let Some(session) = session {
-            command.env("BW_SESSION", session.as_str());
-        }
-        let result = match command.spawn() {
-            Ok(mut child) => match child.stdout.take() {
-                Some(mut stdout) => match timeout(BW_COMMAND_TIMEOUT, async {
-                    let mut output = Vec::new();
-                    let (status, read_result) =
-                        tokio::join!(child.wait(), stdout.read_to_end(&mut output));
-                    let status = status.map_err(BwRunError::Process)?;
-                    read_result.map_err(BwRunError::Process)?;
-                    if status.success() {
-                        Ok(output)
-                    } else {
-                        Err(BwRunError::NonZeroExit(status))
-                    }
-                })
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => {
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                        Err(BwRunError::Timeout)
-                    }
-                },
-                None => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    let error =
-                        io::Error::new(io::ErrorKind::BrokenPipe, "bw stdout was not piped");
-                    Err(BwRunError::Process(error))
-                }
-            },
-            Err(error) => Err(BwRunError::Process(error)),
-        };
-        if let Some((path, _)) = password_file {
-            remove_password_file(&path).await;
-        }
-        result
-    }
-
-    async fn run_askpass(&self) -> Result<Secret, ErrorCode> {
-        tokio::fs::create_dir_all(&self.appdata_dir)
-            .await
-            .map_err(|_| ErrorCode::Internal)?;
-        let mut command = Command::new("sh");
-        command
-            .args(["-c", self.askpass_cmd.as_str()])
-            .env("BW_APPDATA_DIR", &self.appdata_dir)
-            .env("BITWARDENCLI_APPDATA_DIR", &self.appdata_dir)
-            .env_remove("BW_PASSWORD")
-            .env_remove("BW_SESSION")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
-        let mut child = command.spawn().map_err(|_| ErrorCode::Internal)?;
-        let Some(mut stdout) = child.stdout.take() else {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            return Err(ErrorCode::Internal);
-        };
-        let (status, output) = match timeout(BW_COMMAND_TIMEOUT, async {
-            let mut output = Vec::new();
-            let (status, read_result) = tokio::join!(child.wait(), stdout.read_to_end(&mut output));
-            (status, read_result.map(|_| output))
-        })
-        .await
-        {
-            Ok((status, Ok(output))) => (status.map_err(|_| ErrorCode::Internal)?, output),
-            Ok((_, Err(_))) => return Err(ErrorCode::Internal),
-            Err(_) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                return Err(ErrorCode::Internal);
-            }
-        };
-        if !status.success() {
-            return Err(ErrorCode::Internal);
-        }
-        let first_line = String::from_utf8(output)
-            .ok()
-            .and_then(|value| value.lines().next().map(ToOwned::to_owned))
-            .map(|value| value.trim_end_matches('\r').to_owned())
-            .filter(|value| !value.is_empty())
-            .ok_or(ErrorCode::Internal)?;
-        Ok(Secret::new(first_line))
-    }
-
-    async fn password(&self) -> Result<Secret, ErrorCode> {
-        #[cfg(windows)]
-        if self.unlock_mode == UnlockMode::Sealed {
-            return dpapi::unseal(&self.sealed_blob_path)
-                .map_err(|_| ErrorCode::AdminSealUnavailable);
-        }
-        self.run_askpass().await
-    }
-
-    async fn login_with_password(
-        &self,
-        login_args: &[String],
-        password: &Secret,
-    ) -> Result<String, ErrorCode> {
-        let session = self
-            .run_bw(login_args, None, Some(password))
-            .await
-            .map_err(|error| {
-                log_bw_error("login or unlock", &error);
-                ErrorCode::Internal
-            })?;
-        String::from_utf8(session)
-            .ok()
-            .and_then(|value| value.lines().next().map(ToOwned::to_owned))
-            .map(|value| value.trim_end_matches('\r').to_owned())
-            .filter(|value| !value.is_empty())
-            .ok_or(ErrorCode::Internal)
-    }
-
-    async fn ensure_session(&mut self) -> Result<(), ErrorCode> {
-        if self.locked {
-            return Err(ErrorCode::VaultLocked);
-        }
-        if let (Some(_session), Some(unlocked_at)) = (&self.session, self.unlocked_at) {
-            if unlocked_at.elapsed() < self.session_ttl {
-                return Ok(());
-            }
-            let _ = self.lock_session().await;
-            self.locked = true;
-            return Err(ErrorCode::VaultLocked);
-        }
-
-        let password = self.password().await?;
-        // bw CLI はログイン済みの appdata に対して `config server` を拒否する。デーモン
-        // 再起動後は前回のログイン状態が appdata に残っているため、無条件の再設定は
-        // 必ず失敗する。現在の設定値を確認し、一致している場合は再設定しない。
-        let current_server = self
-            .run_bw(&["config".to_owned(), "server".to_owned()], None, None)
-            .await
-            .ok()
-            .and_then(|output| String::from_utf8(output).ok())
-            .map(|value| value.trim().to_owned());
-        if current_server.as_deref() != Some(self.server_url.as_str()) {
-            // If the server differs, the login state must be discarded before changing the configuration.
-            if self
-                .run_bw(&["login".to_owned(), "--check".to_owned()], None, None)
-                .await
-                .is_ok()
-            {
-                let _ = self.run_bw(&["logout".to_owned()], None, None).await;
-            }
-            self.run_bw(
-                &[
-                    "config".to_owned(),
-                    "server".to_owned(),
-                    self.server_url.clone(),
-                ],
-                None,
-                None,
-            )
-            .await
-            .map_err(|error| {
-                log_bw_error("config server", &error);
-                ErrorCode::Internal
-            })?;
-        }
-        let logged_in = match self
-            .run_bw(&["login".to_owned(), "--check".to_owned()], None, None)
-            .await
-        {
-            Ok(_) => true,
-            Err(BwRunError::NonZeroExit(_)) => false,
-            Err(error) => {
-                log_bw_error("login check", &error);
-                false
-            }
-        };
-        let login_args = if logged_in {
-            vec!["unlock".to_owned(), "--raw".to_owned()]
-        } else {
-            vec!["login".to_owned(), self.email.clone(), "--raw".to_owned()]
-        };
-        let session = self.login_with_password(&login_args, &password).await?;
-        drop(password);
-        self.session = Some(Secret::new(session));
-        if let Err(_error) = self
-            .run_bw(&["sync".to_owned()], self.session.as_ref(), None)
-            .await
-        {
-            self.session = None;
-            self.unlocked_at = None;
-            let _ = self.run_bw(&["logout".to_owned()], None, None).await;
-
-            let password = self.password().await?;
-            let login_args = vec!["login".to_owned(), self.email.clone(), "--raw".to_owned()];
-            let session = self.login_with_password(&login_args, &password).await?;
-            drop(password);
-            self.session = Some(Secret::new(session));
-            if let Err(error) = self
-                .run_bw(&["sync".to_owned()], self.session.as_ref(), None)
-                .await
-            {
-                log_bw_error("sync", &error);
-                self.session = None;
-                self.unlocked_at = None;
-                return Err(ErrorCode::Internal);
-            }
-        }
-        self.unlocked_at = Some(Instant::now());
-        Ok(())
-    }
-
-    async fn lock_session(&mut self) -> Result<(), ErrorCode> {
-        let result = if let Some(session) = self.session.as_ref() {
-            self.run_bw(&["lock".to_owned()], Some(session), None)
-                .await
-                .map(|_| ())
-                .map_err(|error| {
-                    log_bw_error("lock", &error);
-                    ErrorCode::Internal
-                })
-        } else {
-            Ok(())
-        };
-        self.session = None;
-        self.unlocked_at = None;
-        result
-    }
-
-    async fn expire_session(&mut self) {
-        if self.locked {
-            return;
-        }
-        if self
-            .unlocked_at
-            .is_some_and(|unlocked_at| unlocked_at.elapsed() >= self.session_ttl)
-        {
-            let _ = self.lock_session().await;
-            self.locked = true;
-        }
-    }
-
-    async fn list_items(&mut self) -> Result<Vec<BitwardenItem>, ErrorCode> {
-        self.ensure_session().await?;
-        let output = self
-            .run_bw(
-                &["list".to_owned(), "items".to_owned()],
-                self.session.as_ref(),
-                None,
-            )
-            .await
-            .map_err(|error| {
-                log_bw_error("list items", &error);
-                ErrorCode::Internal
-            })?;
-        serde_json::from_slice(&output).map_err(|_| ErrorCode::Internal)
-    }
-
-    async fn get_item(&mut self, item_id: &str) -> Result<BitwardenItem, ErrorCode> {
-        self.ensure_session().await?;
-        let output = self
-            .run_bw(
-                &["get".to_owned(), "item".to_owned(), item_id.to_owned()],
-                self.session.as_ref(),
-                None,
-            )
-            .await
-            .map_err(|error| {
-                log_bw_error("get item", &error);
-                ErrorCode::InvalidCredential
-            })?;
-        serde_json::from_slice(&output).map_err(|_| ErrorCode::InvalidCredential)
-    }
-
-    async fn resolve(&mut self, item_id: &str) -> Result<ResolvedCredential, ErrorCode> {
-        let item = self.get_item(item_id).await?;
-        let login = item.login.ok_or(ErrorCode::InvalidCredential)?;
-        if !self.catalog.iter().any(|cached| cached.id == item.id) {
-            self.catalog.push(BitwardenCatalogItem {
-                id: item.id.clone(),
-                name: item.name.clone(),
-            });
-        }
-        let expose_totp = self.totp_exposable.iter().any(|name| name == &item.name);
-        Ok(ResolvedCredential {
-            kind: ProviderKind::BitwardenCli,
-            locked: self.locked,
-            username: Secret::new(login.username.unwrap_or_default()),
-            password: Secret::new(login.password.unwrap_or_default()),
-            totp_seed: login.totp.map(Secret::new),
-            totp_exposable: expose_totp,
-        })
-    }
-}
-
-struct PasswordFileGuard {
-    path: Option<PathBuf>,
-}
-
-impl PasswordFileGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
-    }
-}
-
-impl Drop for PasswordFileGuard {
-    fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            remove_password_file_sync(&path);
-        }
-    }
-}
-
-fn remove_password_file_sync(path: &Path) {
-    if let Ok(metadata) = std::fs::metadata(path)
-        && let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(path)
-    {
-        let mut remaining = metadata.len();
-        let zeros = [0_u8; 8192];
-        while remaining > 0 {
-            let count = remaining.min(zeros.len() as u64) as usize;
-            if std::io::Write::write_all(&mut file, &zeros[..count]).is_err() {
-                break;
-            }
-            remaining -= count as u64;
-        }
-        let _ = std::io::Write::flush(&mut file);
-    }
-    let _ = std::fs::remove_file(path);
-}
-
-async fn remove_password_file(path: &Path) {
-    if let Ok(metadata) = tokio::fs::metadata(path).await
-        && let Ok(mut file) = tokio::fs::OpenOptions::new().write(true).open(path).await
-    {
-        let mut remaining = metadata.len();
-        let zeros = [0_u8; 8192];
-        while remaining > 0 {
-            let count = remaining.min(zeros.len() as u64) as usize;
-            if file.write_all(&zeros[..count]).await.is_err() {
-                break;
-            }
-            remaining -= count as u64;
-        }
-        let _ = file.flush().await;
-    }
-    let _ = tokio::fs::remove_file(path).await;
+    provider: Arc<Mutex<dyn CredentialProvider + Send>>,
 }
 
 struct Session {
@@ -906,7 +393,10 @@ fn build_state(config: Config, password_dir: PathBuf) -> DaemonState {
     let (token_hash_path, sealed_blob_path) = resolve_windows_paths(&config);
     #[cfg(windows)]
     let unlock_mode = config.unlock_mode;
+    #[cfg(feature = "mock-provider")]
     let mut registry = Vec::new();
+    #[cfg(not(feature = "mock-provider"))]
+    let registry = Vec::new();
     let audit_log_path = PathBuf::from(&config.audit_log_path);
     let executor_entry = resolve_executor_entry(&config);
     let node_path = resolve_node_path(&config);
@@ -919,70 +409,37 @@ fn build_state(config: Config, password_dir: PathBuf) -> DaemonState {
         .into_iter()
         .map(|provider| {
             let namespace = provider.namespace;
-            let (kind, entries, bitwarden): (
-                ProviderKind,
-                Vec<EntryConfig>,
-                Option<Arc<Mutex<BitwardenCliProvider>>>,
-            ) = match provider.kind {
+            let provider: Arc<Mutex<dyn CredentialProvider + Send>> = match provider.kind {
                 #[cfg(feature = "mock-provider")]
-                ProviderConfigKind::Mock { entries } => (ProviderKind::Mock, entries, None),
+                ProviderConfigKind::Mock { entries } => Arc::new(Mutex::new(
+                    StaticProvider::from_config(entries, &mut registry),
+                )),
                 ProviderConfigKind::BitwardenCli {
                     server_url,
                     email,
                     askpass_cmd,
                     totp_exposable,
                     session_ttl_secs,
-                } => (
-                    ProviderKind::BitwardenCli,
-                    Vec::new(),
-                    Some(Arc::new(Mutex::new(BitwardenCliProvider {
-                        appdata_dir: state_dir
-                            .join(format!("bw-{}", safe_path_component(&namespace))),
-                        password_dir: password_dir.clone(),
-                        bw_path: bw_path.clone(),
-                        server_url,
-                        email,
-                        askpass_cmd,
-                        totp_exposable,
-                        session_ttl: Duration::from_secs(
-                            session_ttl_secs.unwrap_or(session_ttl.as_secs()),
-                        ),
-                        session: None,
-                        unlocked_at: None,
-                        locked: false,
-                        catalog: Vec::new(),
-                        #[cfg(windows)]
-                        unlock_mode,
-                        #[cfg(windows)]
-                        sealed_blob_path: sealed_blob_path.clone(),
-                    }))),
-                ),
+                } => Arc::new(Mutex::new(BitwardenCliProvider::new(BitwardenCliConfig {
+                    server_url,
+                    email,
+                    askpass_cmd,
+                    appdata_dir: state_dir.join(format!("bw-{}", safe_path_component(&namespace))),
+                    password_dir: password_dir.clone(),
+                    bw_path: bw_path.clone(),
+                    totp_exposable,
+                    session_ttl: Duration::from_secs(
+                        session_ttl_secs.unwrap_or(session_ttl.as_secs()),
+                    ),
+                    #[cfg(windows)]
+                    unlock_mode,
+                    #[cfg(windows)]
+                    sealed_blob_path: sealed_blob_path.clone(),
+                }))),
             };
             Provider {
                 namespace,
-                kind,
-                entries: entries
-                    .into_iter()
-                    .map(|entry| {
-                        registry.push(entry.username.clone());
-                        registry.push(entry.password.clone());
-                        if let Some(seed) = &entry.totp_seed {
-                            registry.push(seed.clone());
-                        }
-                        Entry {
-                            id: entry.id,
-                            name: entry.name,
-                            uri: entry.uri,
-                            kind: entry.kind,
-                            username: Secret::new(entry.username),
-                            password: Secret::new(entry.password),
-                            totp_seed: entry.totp_seed.map(Secret::new),
-                            totp_exposable: entry.totp_exposable.unwrap_or(false),
-                        }
-                    })
-                    .collect(),
-                locked: false,
-                bitwarden,
+                provider,
             }
         })
         .collect();
@@ -1131,11 +588,12 @@ fn spawn_bitwarden_session_reaper(state: SharedState) {
                 daemon
                     .providers
                     .iter()
-                    .filter_map(|provider| provider.bitwarden.clone())
+                    .map(|provider| provider.provider.clone())
                     .collect::<Vec<_>>()
             };
             for provider in providers {
-                provider.lock().await.expire_session().await;
+                let mut provider = provider.lock().await;
+                let _ = provider.expire().await;
             }
         }
     });
@@ -1399,96 +857,34 @@ async fn list_credentials(request: &RpcRequest, state: SharedState) -> HandledRe
                     .as_deref()
                     .is_none_or(|requested| requested == provider.namespace)
             })
-            .map(|provider| {
-                let entries = provider
-                    .entries
-                    .iter()
-                    .map(|entry| {
-                        (
-                            entry.id.clone(),
-                            entry.name.clone(),
-                            entry.uri.clone(),
-                            entry.kind.clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                (
-                    provider.namespace.clone(),
-                    provider.kind,
-                    provider.locked,
-                    entries,
-                    provider.bitwarden.clone(),
-                )
-            })
+            .map(|provider| (provider.namespace.clone(), provider.provider.clone()))
             .collect::<Vec<_>>()
     };
     let mut result = Vec::new();
-    for (provider_namespace, provider_kind, locked, entries, bitwarden) in providers {
-        if provider_kind == ProviderKind::Mock {
-            for (entry_id, entry_name, entry_uri, entry_kind) in entries {
-                let id = format!("{provider_namespace}:{entry_id}");
-                if locked {
-                    result.push(json!({
-                        "id": id,
-                        "name": entry_name,
-                        "source": provider_namespace,
-                        "status": "locked",
-                    }));
-                } else {
-                    result.push(json!({
-                        "id": id,
-                        "name": entry_name,
-                        "uri": entry_uri,
-                        "kind": entry_kind,
-                        "source": provider_namespace,
-                        "status": "unlocked",
-                    }));
-                }
-            }
-        } else if provider_kind == ProviderKind::BitwardenCli {
-            let Some(bitwarden) = bitwarden else {
-                return classified(request.id.clone(), ErrorCode::Internal);
-            };
-            let mut client = bitwarden.lock().await;
-            if client.locked {
-                for item in &client.catalog {
-                    result.push(json!({
-                        "id": format!("{provider_namespace}:{}", item.id),
-                        "name": item.name,
-                        "source": provider_namespace,
-                        "status": "locked",
-                    }));
-                }
-                continue;
-            }
-            let items = match client.list_items().await {
-                Ok(items) => items,
+    for (provider_namespace, provider) in providers {
+        let (refs, locked) = {
+            let mut provider = provider.lock().await;
+            let refs = match provider.list_refs().await {
+                Ok(refs) => refs,
                 Err(error) => return classified(request.id.clone(), error),
             };
-            client.catalog = items
-                .iter()
-                .filter_map(|item| {
-                    item.login.as_ref()?;
-                    Some(BitwardenCatalogItem {
-                        id: item.id.clone(),
-                        name: item.name.clone(),
-                    })
-                })
-                .collect();
-            for item in items {
-                let Some(login) = item.login else {
-                    continue;
-                };
-                let uri = login
-                    .uris
-                    .first()
-                    .and_then(|uri| uri.uri.clone())
-                    .unwrap_or_default();
+            (refs, provider.locked())
+        };
+        for credential in refs {
+            let id = format!("{provider_namespace}:{}", credential.id);
+            if locked {
                 result.push(json!({
-                    "id": format!("{provider_namespace}:{}", item.id),
-                    "name": item.name,
-                    "uri": uri,
-                    "kind": "login",
+                    "id": id,
+                    "name": credential.name,
+                    "source": provider_namespace,
+                    "status": "locked",
+                }));
+            } else {
+                result.push(json!({
+                    "id": id,
+                    "name": credential.name,
+                    "uri": credential.uri.unwrap_or_default(),
+                    "kind": credential.kind.unwrap_or_default(),
                     "source": provider_namespace,
                     "status": "unlocked",
                 }));
@@ -1511,12 +907,6 @@ async fn login(request: &RpcRequest, state: SharedState) -> HandledRequest {
         };
         if credential.locked {
             return classified(request.id.clone(), ErrorCode::VaultLocked);
-        }
-        if !matches!(
-            credential.kind,
-            ProviderKind::Mock | ProviderKind::BitwardenCli
-        ) {
-            return classified(request.id.clone(), ErrorCode::Internal);
         }
         let daemon = state.lock().await;
         (
@@ -1601,12 +991,6 @@ async fn get_totp(request: &RpcRequest, state: SharedState) -> HandledRequest {
     if credential.locked {
         return classified(request.id.clone(), ErrorCode::VaultLocked);
     }
-    if !matches!(
-        credential.kind,
-        ProviderKind::Mock | ProviderKind::BitwardenCli
-    ) {
-        return classified(request.id.clone(), ErrorCode::Internal);
-    }
     let Some(seed) = credential.totp_seed else {
         return classified(request.id.clone(), ErrorCode::TotpNotExposable);
     };
@@ -1638,33 +1022,24 @@ async fn lock_vault(request: &RpcRequest, state: SharedState) -> HandledRequest 
         Ok(namespace) => namespace,
         Err(error) => return classified(request.id.clone(), error),
     };
-    let bitwarden = {
-        let mut daemon = state.lock().await;
-        let mut bitwarden = Vec::new();
-        for provider in &mut daemon.providers {
-            if namespace
-                .as_deref()
-                .is_none_or(|requested| requested == provider.namespace)
-            {
-                if provider.kind == ProviderKind::Mock {
-                    provider.locked = true;
-                } else if provider.kind == ProviderKind::BitwardenCli {
-                    if let Some(client) = &provider.bitwarden {
-                        bitwarden.push(client.clone());
-                    } else {
-                        return classified(request.id.clone(), ErrorCode::Internal);
-                    }
-                }
-            }
-        }
-        bitwarden
+    let providers = {
+        let daemon = state.lock().await;
+        daemon
+            .providers
+            .iter()
+            .filter(|provider| {
+                namespace
+                    .as_deref()
+                    .is_none_or(|requested| requested == provider.namespace)
+            })
+            .map(|provider| provider.provider.clone())
+            .collect::<Vec<_>>()
     };
-    for provider in bitwarden {
+    for provider in providers {
         let mut provider = provider.lock().await;
-        if let Err(error) = provider.lock_session().await {
+        if let Err(error) = provider.lock().await {
             return classified(request.id.clone(), error);
         }
-        provider.locked = true;
     }
     success(request.id.clone(), json!({ "ok": true }))
 }
@@ -1685,43 +1060,25 @@ async fn resolve_credential(
         else {
             return Ok(None);
         };
-        if provider.kind == ProviderKind::BitwardenCli {
-            (provider.kind, provider.bitwarden.clone())
-        } else {
-            let Some(entry) = provider.entries.iter().find(|entry| entry.id == entry_id) else {
-                return Ok(None);
-            };
-            return Ok(Some(ResolvedCredential {
-                kind: provider.kind,
-                locked: provider.locked,
-                username: Secret::new(entry.username.as_str()),
-                password: Secret::new(entry.password.as_str()),
-                totp_seed: entry
-                    .totp_seed
-                    .as_ref()
-                    .map(|seed| Secret::new(seed.as_str())),
-                totp_exposable: entry.totp_exposable,
-            }));
-        }
+        provider.provider.clone()
     };
-    let (provider_kind, Some(bitwarden)) = provider else {
-        return Err(ErrorCode::Internal);
-    };
-    if provider_kind != ProviderKind::BitwardenCli {
+    let mut provider = provider.lock().await;
+    let credential = provider.resolve(entry_id).await?;
+    drop(provider);
+    let Some(credential) = credential else {
         return Ok(None);
+    };
+    if !credential.register_secrets {
+        let daemon = state.lock().await;
+        let mut registry = daemon.registry.lock().await;
+        register_secret(&mut registry, &credential.username);
+        register_secret(&mut registry, &credential.password);
+        if let Some(seed) = &credential.totp_seed {
+            register_secret(&mut registry, seed);
+        }
+        drop(registry);
+        drop(daemon);
     }
-    let mut bitwarden = bitwarden.lock().await;
-    let credential = bitwarden.resolve(entry_id).await?;
-    drop(bitwarden);
-    let daemon = state.lock().await;
-    let mut registry = daemon.registry.lock().await;
-    register_secret(&mut registry, &credential.username);
-    register_secret(&mut registry, &credential.password);
-    if let Some(seed) = &credential.totp_seed {
-        register_secret(&mut registry, seed);
-    }
-    drop(registry);
-    drop(daemon);
     Ok(Some(credential))
 }
 

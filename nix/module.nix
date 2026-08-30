@@ -37,6 +37,12 @@ let
     executor_entry = cfg.executorEntry;
   } // lib.optionalAttrs (cfg.sessionTtlSecs != null) {
     session_ttl_secs = cfg.sessionTtlSecs;
+  } // lib.optionalAttrs (cfg.approveCmd != null) {
+    approve_cmd = cfg.approveCmd;
+  } // lib.optionalAttrs (cfg.approveTimeoutSecs != null) {
+    approve_timeout_secs = cfg.approveTimeoutSecs;
+  } // lib.optionalAttrs (cfg.auditLogMaxBytes != null) {
+    audit_log_max_bytes = cfg.auditLogMaxBytes;
   };
 
   configTemplate = ''
@@ -93,6 +99,26 @@ in
             type = lib.types.nullOr lib.types.ints.unsigned;
             default = null;
           };
+          entries_path = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+          };
+          identity_path = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+          };
+          store_dir = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+          };
+          gnupghome = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+          };
+          pass_bin = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = null;
+          };
         };
       });
       default = [];
@@ -109,6 +135,24 @@ in
       type = lib.types.nullOr lib.types.ints.unsigned;
       default = null;
       description = "Default daemon session lifetime in seconds.";
+    };
+
+    approveCmd = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      description = "Command used to approve sensitive operations.";
+    };
+
+    approveTimeoutSecs = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.unsigned;
+      default = null;
+      description = "Approval command timeout in seconds.";
+    };
+
+    auditLogMaxBytes = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.unsigned;
+      default = null;
+      description = "Maximum audit log size in bytes.";
     };
   };
 

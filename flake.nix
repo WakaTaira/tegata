@@ -18,6 +18,9 @@
           rustfmt
           nodejs_24
           biome
+          pass
+          gnupg
+          age
           pkgsBw.bitwarden-cli
           vaultwarden
           playwright-driver

@@ -26,7 +26,9 @@ export const REPO_ROOT = path.resolve(
   "../../..",
 );
 
-/** Error classification codes. The full closed set; nothing else may appear. */
+/** Error classification codes. The full closed set; nothing else may appear.
+ * APPROVAL_DENIED / APPROVAL_TIMEOUT were added by the Phase 3 contract
+ * (docs/secret/briefs/tegata-phase3.md, 変更内容 4). */
 export const ERROR_CODES = [
   "INVALID_CREDENTIAL",
   "MFA_REQUIRED",
@@ -34,6 +36,8 @@ export const ERROR_CODES = [
   "VAULT_LOCKED",
   "RATE_LIMITED",
   "TOTP_NOT_EXPOSABLE",
+  "APPROVAL_DENIED",
+  "APPROVAL_TIMEOUT",
   "INTERNAL",
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -199,10 +203,15 @@ export interface TargetFixture {
  * Start the dummy login site. Credentials go in via stdin as one JSON line
  * (never argv/env, to keep ps/environ scan surfaces clean); the fixture
  * prints `{"port": N}` on stdout once listening.
+ *
+ * `totp_seed` (optional, Phase 3) switches the fixture into TOTP mode: the
+ * login form gains an `input#totp` field and the server validates the posted
+ * code against the seed (±1 time step). Without it, behaviour is unchanged.
  */
 export async function startTargetFixture(creds: {
   username: string;
   password: string;
+  totp_seed?: string;
 }): Promise<TargetFixture> {
   const child = spawn("node", [bins().fixtureEntry, "--port", "0"], {
     stdio: ["pipe", "pipe", "inherit"],

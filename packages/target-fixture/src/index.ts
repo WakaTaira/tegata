@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
   createServer,
@@ -11,6 +11,7 @@ import {
 interface Credentials {
   username: string;
   password: string;
+  totp_seed?: string;
 }
 
 const sessions = new Map<string, true>();
@@ -49,15 +50,94 @@ function parseArguments(): { port: number; credsFile?: string } {
 
 function parseCredentials(input: string): Credentials {
   const value: unknown = JSON.parse(input);
+  const record = value as Record<string, unknown>;
   if (
     typeof value !== "object" ||
     value === null ||
-    typeof (value as Record<string, unknown>).username !== "string" ||
-    typeof (value as Record<string, unknown>).password !== "string"
+    typeof record.username !== "string" ||
+    typeof record.password !== "string" ||
+    ("totp_seed" in record && typeof record.totp_seed !== "string")
   ) {
     throw new Error("credentials must contain username and password strings");
   }
   return value as Credentials;
+}
+
+function decodeBase32(input: string, padded: boolean): Buffer | undefined {
+  if (padded && input.length % 8 !== 0) return undefined;
+  if (!padded && input.includes("=")) return undefined;
+
+  const paddingIndex = input.indexOf("=");
+  const content = paddingIndex === -1 ? input : input.slice(0, paddingIndex);
+  const padding = paddingIndex === -1 ? "" : input.slice(paddingIndex);
+  if (padding.length > 6 || (padding.length > 0 && !/^=+$/.test(padding))) {
+    return undefined;
+  }
+  if (paddingIndex !== -1 && !padded) return undefined;
+  if (
+    content.length % 8 === 1 ||
+    content.length % 8 === 3 ||
+    content.length % 8 === 6
+  ) {
+    return undefined;
+  }
+  if (padded && padding.length !== (8 - (content.length % 8)) % 8) {
+    return undefined;
+  }
+
+  let buffer = 0;
+  let bits = 0;
+  const output: number[] = [];
+  for (const character of content) {
+    const code = character.charCodeAt(0);
+    const value =
+      code >= 65 && code <= 90
+        ? code - 65
+        : code >= 50 && code <= 55
+          ? code - 24
+          : -1;
+    if (value < 0) return undefined;
+    buffer = (buffer << 5) | value;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      output.push((buffer >> bits) & 0xff);
+    }
+  }
+  if (bits > 0 && (buffer & ((1 << bits) - 1)) !== 0) return undefined;
+  return Buffer.from(output);
+}
+
+function totpKey(seed: string): Buffer {
+  return (
+    decodeBase32(seed, true) ??
+    decodeBase32(seed, false) ??
+    decodeBase32(seed.toUpperCase(), true) ??
+    decodeBase32(seed.toUpperCase(), false) ??
+    Buffer.from(seed, "utf8")
+  );
+}
+
+function totpCode(seed: string, unixTimeSecs: number): string {
+  const counter = Math.floor(unixTimeSecs / 30);
+  const message = Buffer.alloc(8);
+  message.writeBigUInt64BE(BigInt(counter));
+  const digest = createHmac("sha1", totpKey(seed)).update(message).digest();
+  const offset = digest[19] & 0x0f;
+  const binary =
+    ((digest[offset] & 0x7f) << 24) |
+    (digest[offset + 1] << 16) |
+    (digest[offset + 2] << 8) |
+    digest[offset + 3];
+  return String(binary % 1_000_000).padStart(6, "0");
+}
+
+function validTotp(seed: string, submitted: string | null): boolean {
+  if (submitted === null) return false;
+  const now = Math.floor(Date.now() / 1000);
+  return [now - 30, now, now + 30].some(
+    (time) => time >= 0 && totpCode(seed, time) === submitted,
+  );
 }
 
 async function readCredentials(
@@ -89,10 +169,11 @@ function writePage(
   response.end(body);
 }
 
-function loginForm(error = false): string {
+function loginForm(error = false, totpEnabled = false): string {
   const errorMessage = error
     ? '<div id="login-error">invalid credentials</div>'
     : "";
+  const totpInput = totpEnabled ? '<input id="totp" name="totp">' : "";
   return `<!doctype html>
 <html lang="en">
 <body>
@@ -100,6 +181,7 @@ ${errorMessage}
 <form method="POST" action="/login">
 <input id="username" name="username">
 <input id="password" name="password" type="password">
+${totpInput}
 <button id="submit" type="submit">Log in</button>
 </form>
 </body>
@@ -131,7 +213,7 @@ function handleRequest(
       response,
       session !== undefined && sessions.has(session)
         ? loggedInPage()
-        : loginForm(),
+        : loginForm(false, credentials.totp_seed !== undefined),
     );
     return;
   }
@@ -146,7 +228,9 @@ function handleRequest(
       const form = new URLSearchParams(body);
       if (
         form.get("username") === credentials.username &&
-        form.get("password") === credentials.password
+        form.get("password") === credentials.password &&
+        (credentials.totp_seed === undefined ||
+          validTotp(credentials.totp_seed, form.get("totp")))
       ) {
         const session = randomBytes(32).toString("hex");
         sessions.set(session, true);
@@ -154,7 +238,10 @@ function handleRequest(
           "Set-Cookie": `session=${session}; HttpOnly; Path=/; SameSite=Lax`,
         });
       } else {
-        writePage(response, loginForm(true));
+        writePage(
+          response,
+          loginForm(true, credentials.totp_seed !== undefined),
+        );
       }
     });
     return;

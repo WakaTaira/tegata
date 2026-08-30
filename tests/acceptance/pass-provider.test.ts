@@ -1,7 +1,7 @@
 // AC-43, AC-44 — the pass provider: list/login/get_totp end to end against a
 // throwaway GNU pass store (passphrase-less GPG key), leak-guarded, and the
 // totp_exposable opt-in enforced by entry name.
-// Traceability: docs/secret/briefs/tegata-phase3.md 受け入れ条件 #12, #13.
+// Traceability: docs/secret/briefs/tegata-phase3.md acceptance condition #12, #13.
 
 import { chromium } from "playwright-core";
 import { expect, test } from "vitest";

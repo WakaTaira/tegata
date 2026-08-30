@@ -1,5 +1,5 @@
 // AC-06, AC-07 — failure classification without information leakage.
-// Traceability: docs/secret/briefs/tegata-phase1.md 受け入れ条件 #6-#7.
+// Traceability: docs/secret/briefs/tegata-phase1.md acceptance condition #6-#7.
 import { expect, test } from "vitest";
 import { fixtureSteps } from "./support/harness.js";
 import { startStack, stopStack } from "./support/stack.js";

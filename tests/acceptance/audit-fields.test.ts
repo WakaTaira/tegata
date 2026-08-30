@@ -1,6 +1,6 @@
 // AC-45, AC-46 — audit log maturation: size-based single-generation rotation,
 // and session_id / namespace recorded for logout and lock_vault.
-// Traceability: docs/secret/briefs/tegata-phase3.md 受け入れ条件 #14, #15.
+// Traceability: docs/secret/briefs/tegata-phase3.md acceptance condition #14, #15.
 
 import { expect, test } from "vitest";
 import { defaultEntries, fixtureSteps, rawRpc } from "./support/harness.js";

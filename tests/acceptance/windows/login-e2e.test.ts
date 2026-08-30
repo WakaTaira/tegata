@@ -1,7 +1,7 @@
 // AC-23, AC-25, AC-26, AC-27 — end-to-end login across the WSL->Windows
 // boundary: sealed auto-unseal, the tunneled CDP handoff, leak-freedom, and
 // the tunnel target restriction.
-// Traceability: docs/secret/briefs/tegata-phase2.md 受け入れ条件 #5, #7, #8, #9.
+// Traceability: docs/secret/briefs/tegata-phase2.md acceptance condition #5, #7, #8, #9.
 
 import { chromium } from "playwright-core";
 import { expect, test } from "vitest";

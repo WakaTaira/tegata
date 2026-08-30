@@ -1,5 +1,5 @@
 // AC-36 — browser-session TTL expiry terminates the executor and is audited.
-// Traceability: docs/secret/briefs/tegata-phase3.md 受け入れ条件 #5.
+// Traceability: docs/secret/briefs/tegata-phase3.md acceptance condition #5.
 
 import { chromium } from "playwright-core";
 import { expect, test } from "vitest";

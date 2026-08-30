@@ -1,5 +1,5 @@
 // AC-08, AC-09, AC-10 — TOTP code exposure: opt-in, short-lived, rate-limited.
-// Traceability: docs/secret/briefs/tegata-phase1.md 受け入れ条件 #8-#10.
+// Traceability: docs/secret/briefs/tegata-phase1.md acceptance condition #8-#10.
 import { expect, test } from "vitest";
 import { startStack, stopStack } from "./support/stack.js";
 

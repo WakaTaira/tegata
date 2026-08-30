@@ -1,6 +1,6 @@
 // AC-28, AC-29 — the named pipe gates normal RPC on the caller's SID, not on
 // the pipe DACL alone.
-// Traceability: docs/secret/briefs/tegata-phase2.md 受け入れ条件 #10, #11.
+// Traceability: docs/secret/briefs/tegata-phase2.md acceptance condition #10, #11.
 //
 // Each test starts a throwaway foreground tegatad.exe (no service context)
 // with a specific allowed_sids set, then calls it back over the named pipe

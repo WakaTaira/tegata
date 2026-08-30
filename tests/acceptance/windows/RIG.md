@@ -8,19 +8,19 @@ skips) when the rig is not configured — see `requireRig()` in
 
 ## Topology
 
-- **`the Windows host`** — the Windows host. Runs the `tegatad` service (virtual account
+- **The Windows host** — runs the `tegatad` service (virtual account
   `NT SERVICE\tegatad`), the loopback TCP listener, and the named pipe. The
   TCP listener binds the host side of the WSL NAT (the vEthernet (WSL)
   gateway address) and is firewalled to the WSL subnet; vsock was ruled out
   on 2026-08-28 because Windows editions without the Hyper-V VMMS never
   consult `GuestCommunicationServices`, leaving a guest->host AF_HYPERV
   listener unreachable from WSL.
-- **`the WSL distro`** — a WSL2 distro on `the Windows host`, **NAT networking, interop and
+- **The WSL distro** — a WSL2 distro on the Windows host, **NAT networking, interop and
   automount enabled** (the weakest configuration, on purpose: the point is
   that isolation holds even when interop is available). The vitest harness
   runs here.
 
-## One-time Windows setup (`the Windows host`, elevated)
+## One-time Windows setup (the Windows host, elevated)
 
 1. Install Node LTS, `bw` CLI **2025.9.0**, and the Playwright browsers into
    the daemon's `browsers_path`, then grant that path's ACL to the service
@@ -36,7 +36,7 @@ skips) when the rig is not configured — see `requireRig()` in
    `TEGATA_TEST_MASTER_PASSWORD_FILE` on WSL so `provision-test-vault` can
    create a throwaway vault that matches.
 
-## Rig environment (WSL, `the WSL distro`)
+## Rig environment (the WSL distro)
 
 Defaults live in `support/winrig.ts`; override via env when the rig differs.
 

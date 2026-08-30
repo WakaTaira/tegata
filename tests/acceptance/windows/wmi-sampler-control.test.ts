@@ -6,7 +6,7 @@
 // WMI sampler can. This guards against a leak-guard implementation that
 // accepts `psSampleCommands` but never samples it, which would let AC-26 pass
 // with the WMI surface unmonitored.
-// Traceability: docs/secret/briefs/tegata-phase2.md 受け入れ条件 #13.
+// Traceability: docs/secret/briefs/tegata-phase2.md acceptance condition #13.
 
 import fs from "node:fs";
 import os from "node:os";

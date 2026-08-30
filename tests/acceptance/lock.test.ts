@@ -1,5 +1,5 @@
 // AC-11 — vault locking semantics.
-// Traceability: docs/secret/briefs/tegata-phase1.md 受け入れ条件 #11.
+// Traceability: docs/secret/briefs/tegata-phase1.md acceptance condition #11.
 import { expect, test } from "vitest";
 import { fixtureSteps } from "./support/harness.js";
 import { startStack, stopStack } from "./support/stack.js";

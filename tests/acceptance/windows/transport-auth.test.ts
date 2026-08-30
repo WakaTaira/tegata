@@ -1,6 +1,6 @@
 // AC-19, AC-20, AC-21, AC-30 — TCP transport authentication and the
 // classification-only error surface across the bridge.
-// Traceability: docs/secret/briefs/tegata-phase2.md 受け入れ条件 #1, #2, #3, #12.
+// Traceability: docs/secret/briefs/tegata-phase2.md acceptance condition #1, #2, #3, #12.
 
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { ERROR_CODES } from "../support/harness.js";

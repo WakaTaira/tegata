@@ -1,6 +1,6 @@
 // AC-22 — the daemon's ProgramData directory is unreadable from the agent
 // side even with WSL interop and automount enabled.
-// Traceability: docs/secret/briefs/tegata-phase2.md 受け入れ条件 #4.
+// Traceability: docs/secret/briefs/tegata-phase2.md acceptance condition #4.
 
 import fs from "node:fs";
 import path from "node:path";

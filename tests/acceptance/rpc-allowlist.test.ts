@@ -1,5 +1,5 @@
 // AC-12 — the boundary RPC accepts only allowlisted methods.
-// Traceability: docs/secret/briefs/tegata-phase1.md 受け入れ条件 #12.
+// Traceability: docs/secret/briefs/tegata-phase1.md acceptance condition #12.
 import { expect, test } from "vitest";
 import { rawRpc } from "./support/harness.js";
 import { startStack, stopStack } from "./support/stack.js";

@@ -332,9 +332,9 @@ impl BitwardenCliProvider {
         }
 
         let password = self.password().await?;
-        // bw CLI はログイン済みの appdata に対して `config server` を拒否する。デーモン
-        // 再起動後は前回のログイン状態が appdata に残っているため、無条件の再設定は
-        // 必ず失敗する。現在の設定値を確認し、一致している場合は再設定しない。
+        // The bw CLI rejects `config server` for appdata with an active login. After a daemon
+        // restart, the previous login state remains in appdata, so unconditional reconfiguration
+        // always fails. Check the current configuration and do not reconfigure when it matches.
         let current_server = self
             .run_bw(&["config".to_owned(), "server".to_owned()], None, None)
             .await

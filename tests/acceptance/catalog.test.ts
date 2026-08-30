@@ -1,5 +1,5 @@
 // AC-01 — credential catalog projection.
-// Traceability: docs/secret/briefs/tegata-phase1.md 受け入れ条件 #1.
+// Traceability: docs/secret/briefs/tegata-phase1.md acceptance condition #1.
 import { expect, test } from "vitest";
 import { startStack, stopStack } from "./support/stack.js";
 

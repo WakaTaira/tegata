@@ -1,7 +1,7 @@
 // AC-37, AC-38, AC-39, AC-40 — the human-in-the-loop approval hook: a
 // configured approve_cmd gates login on exit status, times out into a
 // denial that reaps its whole process group, and receives only references.
-// Traceability: docs/secret/briefs/tegata-phase3.md 受け入れ条件 #6, #7, #8, #9.
+// Traceability: docs/secret/briefs/tegata-phase3.md acceptance condition #6, #7, #8, #9.
 
 import fs from "node:fs";
 import os from "node:os";

@@ -2,7 +2,7 @@
 // the next operation: TTL expiry is not sticky, and an explicit lock of a
 // provider with a ceremony (age re-decryption) reopens on demand. AC-11
 // (a ceremony-less static provider stays VAULT_LOCKED) pins the other half.
-// Traceability: docs/secret/briefs/tegata-phase3.md 受け入れ条件 #3, #4.
+// Traceability: docs/secret/briefs/tegata-phase3.md acceptance condition #3, #4.
 
 import path from "node:path";
 import { expect, test } from "vitest";

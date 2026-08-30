@@ -1,5 +1,5 @@
 // AC-24 — administrative RPCs require elevation.
-// Traceability: docs/secret/briefs/tegata-phase2.md 受け入れ条件 #6.
+// Traceability: docs/secret/briefs/tegata-phase2.md acceptance condition #6.
 //
 // The acceptance suite runs from a non-elevated WSL shell, so the interop
 // pipe client here is inherently non-elevated. Both admin CLIs must refuse.

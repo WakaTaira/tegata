@@ -1,7 +1,7 @@
 // AC-41, AC-42 — the age-file provider: an end-to-end leak-guarded login
 // from an age-encrypted entries file, and a classified-only failure when the
 // identity cannot decrypt it.
-// Traceability: docs/secret/briefs/tegata-phase3.md 受け入れ条件 #10, #11.
+// Traceability: docs/secret/briefs/tegata-phase3.md acceptance condition #10, #11.
 
 import fs from "node:fs";
 import path from "node:path";

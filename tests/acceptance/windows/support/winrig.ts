@@ -2,8 +2,8 @@
  * Windows/WSL rig harness for the Phase 2 acceptance suite. Owned by the
  * acceptance suite (gauntlet); do not modify during implementation.
  *
- * These tests run INSIDE WSL on the test rig (`the WSL distro`), against a tegatad
- * Windows service installed on the Windows host (`the Windows host`). The rig is set up
+ * These tests run INSIDE WSL on the test rig, against a tegatad Windows service
+ * installed on the Windows host. The rig is set up
  * once by hand; see RIG.md next to this suite for prerequisites.
  *
  * Everything in this file is a pinned implementation contract:

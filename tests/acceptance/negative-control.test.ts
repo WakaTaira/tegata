@@ -1,6 +1,6 @@
 // AC-15 — negative control: a deliberate leak MUST be caught. This guards
 // against a broken detector turning the whole suite green.
-// Traceability: docs/secret/briefs/tegata-phase1.md 受け入れ条件 #15.
+// Traceability: docs/secret/briefs/tegata-phase1.md acceptance condition #15.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";

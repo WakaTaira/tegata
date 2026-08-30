@@ -1,5 +1,5 @@
 # Boundary acceptance tests AC-16..AC-18 (NixOS VM, two-user setup).
-# Traceability: docs/secret/briefs/tegata-phase1.md 受け入れ条件 #16-#18.
+# Traceability: docs/secret/briefs/tegata-phase1.md acceptance criteria #16-#18.
 #
 # Owned by the acceptance suite (gauntlet); do not modify during
 # implementation. The flake wires it in as:

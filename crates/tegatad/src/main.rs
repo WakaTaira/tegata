@@ -39,6 +39,7 @@ use tegata_core::wire::{AdminSealParams, AdminTokenIssueResult};
 #[cfg(windows)]
 use zeroize::Zeroize;
 
+#[cfg(feature = "mock-provider")]
 use crate::provider::StaticProvider;
 use crate::provider::{
     BitwardenCliConfig, BitwardenCliProvider, CredentialProvider, FileProvider, FileProviderConfig,

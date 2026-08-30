@@ -1,6 +1,6 @@
 // AC-13, AC-14 — the leakscan CLI detects encoded canaries and stays quiet
 // on clean input.
-// Traceability: docs/secret/briefs/tegata-phase1.md 受け入れ条件 #13-#14.
+// Traceability: docs/secret/briefs/tegata-phase1.md acceptance condition #13-#14.
 //
 // Pinned CLI contract:
 //   leakscan --canaries <canaries.json> --json <target>...

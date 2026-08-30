@@ -3,7 +3,7 @@
 // lockedness to the resolve path, where the unlock ceremony reopens the
 // provider. AC-50 covers an explicitly relocked age provider; AC-51 covers
 // a cold-started pass provider whose catalog scan never runs the ceremony.
-// Traceability: docs/secret/briefs/tegata-phase3.md 受け入れ条件 #19.
+// Traceability: docs/secret/briefs/tegata-phase3.md acceptance condition #19.
 
 import path from "node:path";
 import { expect, test } from "vitest";

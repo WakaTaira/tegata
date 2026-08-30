@@ -1,7 +1,7 @@
 // AC-47 — the named pipe accepts connections concurrently: a silent client
 // that never sends its first byte must not stall other clients for the
 // duration of the identity-read timeout (5 seconds).
-// Traceability: docs/secret/briefs/tegata-phase3.md 受け入れ条件 #16.
+// Traceability: docs/secret/briefs/tegata-phase3.md acceptance condition #16.
 
 import { beforeAll, expect, test } from "vitest";
 import {

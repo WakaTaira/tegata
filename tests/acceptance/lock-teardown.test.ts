@@ -1,6 +1,6 @@
 // AC-32, AC-33 — lock_vault tears down the live browser sessions of the
 // locked namespace, gracefully, and audits each termination.
-// Traceability: docs/secret/briefs/tegata-phase3.md 受け入れ条件 #1, #2.
+// Traceability: docs/secret/briefs/tegata-phase3.md acceptance condition #1, #2.
 
 import { chromium } from "playwright-core";
 import { expect, test } from "vitest";

@@ -1,7 +1,7 @@
 // AC-48, AC-49 — login-time TOTP: the daemon computes the current code from
 // the seed on the isolated side and the executor fills {{totp}}; a step
 // referencing {{totp}} without a seed fails with MFA_REQUIRED.
-// Traceability: docs/secret/briefs/tegata-phase3.md 受け入れ条件 #17, #18.
+// Traceability: docs/secret/briefs/tegata-phase3.md acceptance condition #17, #18.
 
 import fs from "node:fs";
 import os from "node:os";

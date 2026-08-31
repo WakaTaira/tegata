@@ -245,9 +245,21 @@ pass — usable together; the Playwright form executor; the five MCP tools;
 human-in-the-loop login approval; and an audit log covering both agent calls and
 the daemon's own session and vault events.
 
-Planned:
+Planned, tracked in the
+[issue tracker](https://github.com/WakaTaira/tegata/issues):
 
-- Container and remote-host boundaries; an OAuth device-flow executor
+- **Container boundary** ([#6](https://github.com/WakaTaira/tegata/issues/6)) —
+  the daemon in its own container, no shared volume, for containerized agents
+- **Remote-host boundary** ([#7](https://github.com/WakaTaira/tegata/issues/7)) —
+  the daemon on a separate host or VM, authenticated by mTLS or tailnet identity
+- **OAuth device-flow executor**
+  ([#8](https://github.com/WakaTaira/tegata/issues/8)) — device-code grants
+  completed on the isolated side, alongside the form executor
+- **Release binaries** ([#1](https://github.com/WakaTaira/tegata/issues/1)) —
+  prebuilt artifacts for non-Nix deployments
+
+Each feature is designed in a private brief before implementation; what lands
+publicly is the design's contract, as acceptance tests under `tests/acceptance/`.
 
 ## Contributing
 

@@ -186,7 +186,8 @@ is `ok` or the classification code. Only references are recorded; no value is.
 Daemon-initiated events use `"peer_system": true` in place of a caller:
 `session_expired` when a session reaches its TTL, `vault_autolocked` when a
 provider's unlock TTL lapses, and `session_terminated` when `lock_vault` takes a
-live session down with the vault. The file is created mode 0600, and
+live session down with the vault or the exiting daemon reaps one on shutdown.
+The file is created mode 0600, and
 `audit_log_max_bytes` enables a single rotation to `<path>.1` per daemon process.
 
 ## The transport layer
@@ -225,7 +226,10 @@ namespace it came from. The daemon holds the child handle and an expiry, and a
 sweeper stops any session past its TTL — 300 seconds by default — auditing a
 `session_expired` event as it goes. `logout` does the same on demand and is
 idempotent, and `lock_vault` takes down every session belonging to the namespaces
-it locks.
+it locks. A daemon asked to stop — a service stop request, `SIGTERM`, or
+`SIGINT` — reaps every live executor on its way out, and the executor treats its
+stdin closing as that same order, so even a daemon that dies without cleaning up
+does not leave browsers running.
 
 Vault sessions are reaped on the same principle by a separate task: an unlocked
 provider past its TTL locks itself, per namespace, and the reaper audits

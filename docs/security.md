@@ -287,7 +287,7 @@ of a caller:
 | --- | --- |
 | `session_expired` | A browser session passed its TTL and was reaped |
 | `vault_autolocked` | A provider's unlock TTL lapsed and it locked itself |
-| `session_terminated` | `lock_vault` tore down a live session in that namespace |
+| `session_terminated` | `lock_vault` tore down a live session in that namespace, or the daemon reaped one while shutting down |
 
 Without these, the log would show a session being created and never show it
 ending, which is exactly the gap an investigation needs closed.

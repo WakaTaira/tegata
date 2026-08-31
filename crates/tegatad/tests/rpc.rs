@@ -17,6 +17,44 @@ const USERNAME: &str = "integration-user-secret";
 const PASSWORD: &str = "integration-password-secret";
 const TOTP_SEED: &str = "invalid-base32-canary-$";
 
+/// A fake executor that completes a login and then idles even after stdin
+/// closes, imitating an executor whose browser keeps the event loop alive.
+/// Only an explicit shutdown request or a signal can end it.
+const IDLING_EXECUTOR: &str = r#"
+const fs = require("node:fs");
+const readline = require("node:readline");
+fs.writeFileSync(__filename + ".pid", String(process.pid));
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.op === "login") {
+    process.stdout.write(
+      JSON.stringify({ ok: true, endpoint: "ws://127.0.0.1:38999/devtools/browser/test" }) + "\n",
+    );
+  } else if (request.op === "shutdown") {
+    process.exit(0);
+  }
+});
+rl.on("close", () => { setInterval(() => {}, 1000); });
+"#;
+
+/// A fake executor that fails the login and then idles the same way.
+const FAILING_EXECUTOR: &str = r#"
+const fs = require("node:fs");
+const readline = require("node:readline");
+fs.writeFileSync(__filename + ".pid", String(process.pid));
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.op === "login") {
+    process.stdout.write(JSON.stringify({ ok: false, error: "INVALID_CREDENTIAL" }) + "\n");
+  } else if (request.op === "shutdown") {
+    process.exit(0);
+  }
+});
+rl.on("close", () => { setInterval(() => {}, 1000); });
+"#;
+
 struct Daemon {
     child: Child,
     directory: PathBuf,
@@ -24,8 +62,18 @@ struct Daemon {
 }
 
 impl Daemon {
-    #[allow(clippy::zombie_processes)]
     fn start() -> Self {
+        Self::start_inner(None)
+    }
+
+    /// Starts the daemon with a fake node executor written into the test
+    /// directory; the executor records its PID in `executor.js.pid`.
+    fn start_with_executor(script: &str) -> Self {
+        Self::start_inner(Some(script))
+    }
+
+    #[allow(clippy::zombie_processes)]
+    fn start_inner(executor_script: Option<&str>) -> Self {
         let directory = std::env::temp_dir().join(format!("tegatad-test-{}", Uuid::new_v4()));
         std::fs::create_dir(&directory).expect("create test directory");
         let state_dir = directory.join("state");
@@ -33,12 +81,20 @@ impl Daemon {
         let socket_path = directory.join("tegatad.sock");
         let config_path = directory.join("config.toml");
         let uid = unsafe { libc::geteuid() };
+        let executor_line = executor_script
+            .map(|script| {
+                let script_path = directory.join("executor.js");
+                std::fs::write(&script_path, script).expect("write executor script");
+                format!("executor_entry = {script_path:?}\n")
+            })
+            .unwrap_or_default();
         let config = format!(
-            "socket_path = {:?}\nstate_dir = {:?}\naudit_log_path = {:?}\nallowed_uids = [{}]\n\n[[providers]]\nnamespace = \"mock\"\ntype = \"mock\"\n\n[[providers.entries]]\nid = \"site\"\nname = \"Integration Site\"\nuri = \"http://127.0.0.1\"\nkind = \"login\"\nusername = {:?}\npassword = {:?}\ntotp_seed = {:?}\ntotp_exposable = true\n\n[[providers.entries]]\nid = \"site-no-totp\"\nname = \"Integration Site Without TOTP\"\nuri = \"http://127.0.0.1\"\nkind = \"login\"\nusername = {:?}\npassword = {:?}\n",
+            "socket_path = {:?}\nstate_dir = {:?}\naudit_log_path = {:?}\nallowed_uids = [{}]\n{}\n[[providers]]\nnamespace = \"mock\"\ntype = \"mock\"\n\n[[providers.entries]]\nid = \"site\"\nname = \"Integration Site\"\nuri = \"http://127.0.0.1\"\nkind = \"login\"\nusername = {:?}\npassword = {:?}\ntotp_seed = {:?}\ntotp_exposable = true\n\n[[providers.entries]]\nid = \"site-no-totp\"\nname = \"Integration Site Without TOTP\"\nuri = \"http://127.0.0.1\"\nkind = \"login\"\nusername = {:?}\npassword = {:?}\n",
             socket_path,
             state_dir,
             state_dir.join("audit.log"),
             uid,
+            executor_line,
             USERNAME,
             PASSWORD,
             TOTP_SEED,
@@ -199,4 +255,87 @@ fn unknown_login_credential_is_rejected() {
         json!({ "cred_id": "mock:missing", "target_url": "http://127.0.0.1" }),
     );
     error_message(&response, "INVALID_CREDENTIAL");
+}
+
+fn executor_pid(daemon: &Daemon) -> libc::pid_t {
+    let pid_path = daemon.directory.join("executor.js.pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(&pid_path)
+            && let Ok(pid) = contents.trim().parse()
+        {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "executor pid file did not appear"
+        );
+        sleep(Duration::from_millis(20));
+    }
+}
+
+fn process_alive(pid: libc::pid_t) -> bool {
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn wait_for_death(pid: libc::pid_t, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !process_alive(pid) {
+            return true;
+        }
+        sleep(Duration::from_millis(20));
+    }
+    !process_alive(pid)
+}
+
+#[test]
+fn login_failure_reaps_the_executor() {
+    let daemon = Daemon::start_with_executor(FAILING_EXECUTOR);
+    let response = rpc(
+        &daemon.socket_path,
+        "login",
+        json!({ "cred_id": "mock:site", "target_url": "http://127.0.0.1" }),
+    );
+    error_message(&response, "INVALID_CREDENTIAL");
+    let pid = executor_pid(&daemon);
+    assert!(
+        wait_for_death(pid, Duration::from_secs(5)),
+        "executor survived a failed login"
+    );
+}
+
+#[test]
+fn sigterm_reaps_live_session_executors() {
+    let mut daemon = Daemon::start_with_executor(IDLING_EXECUTOR);
+    let response = rpc(
+        &daemon.socket_path,
+        "login",
+        json!({ "cred_id": "mock:site", "target_url": "http://127.0.0.1" }),
+    );
+    assert!(
+        response["result"]["session_id"].is_string(),
+        "login should succeed: {response}"
+    );
+    let pid = executor_pid(&daemon);
+    assert!(
+        process_alive(pid),
+        "executor should be running while the session is live"
+    );
+    unsafe { libc::kill(daemon.child.id() as libc::pid_t, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if daemon.child.try_wait().expect("poll daemon").is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon did not exit after SIGTERM"
+        );
+        sleep(Duration::from_millis(20));
+    }
+    assert!(
+        wait_for_death(pid, Duration::from_secs(5)),
+        "executor survived daemon shutdown"
+    );
 }

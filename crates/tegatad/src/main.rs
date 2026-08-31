@@ -440,18 +440,51 @@ async fn run_daemon(
 }
 
 async fn serve_transport(
+    transport: PlatformTransport,
+    state: SharedState,
+    stop: Option<tokio::sync::oneshot::Receiver<()>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result = accept_connections(transport, state.clone(), stop).await;
+    // The daemon is exiting — on a stop request, a termination signal, or a
+    // transport failure. Reap every live executor before returning so
+    // interrupted sessions do not leave orphaned browser processes behind.
+    terminate_sessions(&state, drain_sessions(&state, None).await).await;
+    result
+}
+
+async fn accept_connections(
     mut transport: PlatformTransport,
     state: SharedState,
     mut stop: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    let (mut sigterm, mut sigint) = {
+        use tokio::signal::unix::{SignalKind, signal};
+        (
+            signal(SignalKind::terminate())?,
+            signal(SignalKind::interrupt())?,
+        )
+    };
     loop {
-        if let Some(stop) = stop.as_mut() {
-            tokio::select! {
-                result = transport.accept() => process_accepted(result?, state.clone()).await?,
-                _ = &mut *stop => break,
+        let stopped = async {
+            match stop.as_mut() {
+                Some(stop) => {
+                    let _ = stop.await;
+                }
+                None => std::future::pending::<()>().await,
             }
-        } else {
-            process_accepted(transport.accept().await?, state.clone()).await?;
+        };
+        #[cfg(unix)]
+        tokio::select! {
+            result = transport.accept() => process_accepted(result?, state.clone()).await?,
+            _ = stopped => break,
+            _ = sigterm.recv() => break,
+            _ = sigint.recv() => break,
+        }
+        #[cfg(windows)]
+        tokio::select! {
+            result = transport.accept() => process_accepted(result?, state.clone()).await?,
+            _ = stopped => break,
         }
     }
     Ok(())
@@ -1340,30 +1373,40 @@ async fn lock_vault(request: &RpcRequest, state: SharedState) -> HandledRequest 
             return classified(request.id.clone(), error);
         }
     }
-    let sessions = {
-        let mut daemon = state.lock().await;
-        let session_ids = daemon
-            .sessions
-            .iter()
-            .filter_map(|(session_id, session)| {
-                namespace
-                    .as_deref()
-                    .is_none_or(|requested| requested == session.namespace)
-                    .then_some(session_id.clone())
-            })
-            .collect::<Vec<_>>();
-        session_ids
-            .into_iter()
-            .filter_map(|session_id| {
-                let session = daemon.sessions.remove(&session_id)?;
-                let _ = daemon
-                    .cdp_ports
-                    .write()
-                    .map(|mut ports| ports.remove(&session_id));
-                Some((session_id, session))
-            })
-            .collect::<Vec<_>>()
-    };
+    let sessions = drain_sessions(&state, namespace.as_deref()).await;
+    terminate_sessions(&state, sessions).await;
+    success(request.id.clone(), json!({ "ok": true }))
+}
+
+/// Removes every session whose namespace matches the filter, dropping the CDP
+/// port mappings, and returns the sessions for termination.
+async fn drain_sessions(state: &SharedState, namespace: Option<&str>) -> Vec<(String, Session)> {
+    let mut daemon = state.lock().await;
+    let session_ids = daemon
+        .sessions
+        .iter()
+        .filter_map(|(session_id, session)| {
+            namespace
+                .is_none_or(|requested| requested == session.namespace)
+                .then_some(session_id.clone())
+        })
+        .collect::<Vec<_>>();
+    session_ids
+        .into_iter()
+        .filter_map(|session_id| {
+            let session = daemon.sessions.remove(&session_id)?;
+            let _ = daemon
+                .cdp_ports
+                .write()
+                .map(|mut ports| ports.remove(&session_id));
+            Some((session_id, session))
+        })
+        .collect()
+}
+
+/// Shuts down the executor behind each drained session and audits the
+/// termination.
+async fn terminate_sessions(state: &SharedState, sessions: Vec<(String, Session)>) {
     for (session_id, session) in sessions {
         let session_namespace = session.namespace.clone();
         shutdown_child(session.child).await;
@@ -1385,7 +1428,6 @@ async fn lock_vault(request: &RpcRequest, state: SharedState) -> HandledRequest 
             eprintln!("tegatad: audit append failed: {error}");
         }
     }
-    success(request.id.clone(), json!({ "ok": true }))
 }
 
 async fn resolve_credential(
@@ -1454,7 +1496,11 @@ async fn start_executor(
         .arg(entry)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::null())
+        // Safety net: if the handle is dropped without an explicit shutdown
+        // (a cancelled login task, runtime teardown), kill the executor
+        // rather than leaking it.
+        .kill_on_drop(true);
     #[cfg(windows)]
     if let Some(browsers_path) = browsers_path {
         command.env("PLAYWRIGHT_BROWSERS_PATH", browsers_path);

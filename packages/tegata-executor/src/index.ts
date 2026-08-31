@@ -412,6 +412,9 @@ async function main(): Promise<void> {
       writeResponse({ ok: false, error: "INTERNAL" satisfies ErrorCode });
     }
   }
+  // stdin has closed: the daemon is gone and no shutdown request can arrive.
+  // Exit instead of idling forever with a live browser keeping the process up.
+  await shutdown();
 }
 
 void main();

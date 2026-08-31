@@ -60,12 +60,40 @@ pub fn totp(seed: &str, unix_time_secs: u64) -> (String, u64) {
 }
 
 fn decode_seed(seed: &str) -> Vec<u8> {
+    let secret = extract_secret(seed);
     BASE32
-        .decode(seed.as_bytes())
-        .or_else(|_| BASE32_NOPAD.decode(seed.as_bytes()))
-        .or_else(|_| BASE32.decode(seed.to_ascii_uppercase().as_bytes()))
-        .or_else(|_| BASE32_NOPAD.decode(seed.to_ascii_uppercase().as_bytes()))
+        .decode(secret.as_bytes())
+        .or_else(|_| BASE32_NOPAD.decode(secret.as_bytes()))
+        .or_else(|_| BASE32.decode(secret.to_ascii_uppercase().as_bytes()))
+        .or_else(|_| BASE32_NOPAD.decode(secret.to_ascii_uppercase().as_bytes()))
         .unwrap_or_else(|_| seed.as_bytes().to_vec())
+}
+
+/// Extracts the shared secret from a stored seed value.
+///
+/// Vault providers commonly store the TOTP seed as a full `otpauth://` URI
+/// (Bitwarden does when the key was enrolled from a QR code) or as base32
+/// grouped with whitespace for readability (the format most setup pages
+/// display). Both carry the same secret, so normalize here before decoding.
+fn extract_secret(seed: &str) -> String {
+    let trimmed = seed.trim();
+    let body = if trimmed
+        .get(..10)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("otpauth://"))
+    {
+        trimmed
+            .split_once('?')
+            .and_then(|(_, query)| {
+                query.split('&').find_map(|pair| {
+                    let (key, value) = pair.split_once('=')?;
+                    key.eq_ignore_ascii_case("secret").then_some(value)
+                })
+            })
+            .unwrap_or(trimmed)
+    } else {
+        trimmed
+    };
+    body.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 #[cfg(test)]
@@ -84,5 +112,22 @@ mod tests {
         let (code, expires_in) = totp("12345678901234567890", 59);
         assert_eq!(code, "287082");
         assert_eq!(expires_in, 1);
+    }
+
+    #[test]
+    fn totp_accepts_otpauth_uri_seed() {
+        let (plain, _) = totp("JBSWY3DPEHPK3PXP", 59);
+        let (from_uri, _) = totp(
+            "otpauth://totp/GitHub:user?secret=JBSWY3DPEHPK3PXP&issuer=GitHub&period=30",
+            59,
+        );
+        assert_eq!(from_uri, plain);
+    }
+
+    #[test]
+    fn totp_accepts_whitespace_grouped_seed() {
+        let (plain, _) = totp("JBSWY3DPEHPK3PXP", 59);
+        let (grouped, _) = totp("jbsw y3dp ehpk 3pxp", 59);
+        assert_eq!(grouped, plain);
     }
 }

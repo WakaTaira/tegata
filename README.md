@@ -120,20 +120,46 @@ by that service account. The trust direction points away from the agent.
 
 ## Quick start
 
-Everything runs through the development shell:
+On NixOS, a working deployment is a module import and one MCP registration.
 
-```sh
-nix develop
+**1. Deploy the daemon.** Add the flake as an input
+(`tegata.url = "github:WakaTaira/tegata"`) and import its module:
+
+```nix
+{
+  imports = [ tegata.nixosModules.tegata ];
+
+  services.tegata = {
+    enable = true;
+    allowedUsers = [ "alice" ];          # the user the agent runs as
+    providers = [{
+      namespace   = "vw";
+      type        = "bitwarden-cli";
+      server_url  = "https://vault.example.com";
+      email       = "vault-account@example.com";
+      askpass_cmd = "…";                 # how the master password enters — see the setup guide
+    }];
+  };
+}
 ```
 
-Then follow the setup guide for your platform:
+**2. Register the broker with the agent.** The broker is a flake package, so no
+checkout is needed. For Claude Code:
+
+```sh
+claude mcp add tegata --env TEGATA_SOCKET=/run/tegata/tegatad.sock \
+  -- nix run github:WakaTaira/tegata#tegata-mcp
+```
+
+**3. Ask the agent to log in.** `list_credentials` shows names and ids, never
+values; `login` returns a CDP endpoint for a browser that is already
+authenticated.
+
+Everything else — other platforms and vault backends, the approval hook,
+deployment without Nix — is in the setup guides:
 
 - **Linux / NixOS** — [docs/setup-linux.md](docs/setup-linux.md)
 - **Windows service + WSL client** — [docs/setup-windows-wsl.md](docs/setup-windows-wsl.md)
-
-On NixOS the `nixosModules.tegata` module deploys the daemon through
-`services.tegata`, and `nixosModules.tegata-bridge` provides the WSL-side bridge
-as `services.tegata-bridge`.
 
 ## MCP tools
 

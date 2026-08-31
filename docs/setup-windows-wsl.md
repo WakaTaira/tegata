@@ -17,7 +17,13 @@ as root.
 - Node.js LTS
 - Bitwarden CLI `2025.9.0`
 - The Playwright browsers, installed into the directory you will configure as
-  `browsers_path`
+  `browsers_path`, with the version pinned in
+  `packages/tegata-executor/package.json`:
+
+  ```powershell
+  $env:PLAYWRIGHT_BROWSERS_PATH = "C:\ProgramData\tegata\browsers"
+  npx playwright-core@1.61.1 install chromium
+  ```
 
 The service account needs read access to the browser directory. `service install`
 sets that up for the configured path; if you install the browsers afterwards,
@@ -216,9 +222,11 @@ token file is never read by the broker.
 
 ### Pointing the broker at the bridge
 
+The broker runs inside the distro and is a flake package:
+
 ```sh
 TEGATA_BRIDGE=1 TEGATA_SOCKET=~/.local/state/tegata/bridge.sock \
-  node packages/tegata-mcp/dist/index.js
+  nix run github:WakaTaira/tegata#tegata-mcp
 ```
 
 Or as MCP client configuration:
@@ -227,8 +235,8 @@ Or as MCP client configuration:
 {
   "mcpServers": {
     "tegata": {
-      "command": "node",
-      "args": ["/path/to/packages/tegata-mcp/dist/index.js"],
+      "command": "nix",
+      "args": ["run", "github:WakaTaira/tegata#tegata-mcp"],
       "env": {
         "TEGATA_BRIDGE": "1",
         "TEGATA_SOCKET": "/home/agent/.local/state/tegata/bridge.sock"
@@ -237,6 +245,10 @@ Or as MCP client configuration:
   }
 }
 ```
+
+Without Nix in the distro, build the broker from a checkout — `npm ci && npm
+run build --workspace @tegata/mcp` — and use
+`node packages/tegata-mcp/dist/index.js` as the command instead.
 
 `TEGATA_BRIDGE=1` matters. The CDP endpoint the daemon returns names a port on the
 Windows side, which a NAT-networked WSL client cannot reach. With the flag set, the

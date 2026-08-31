@@ -5,11 +5,11 @@ escape hatch. Anything not listed here does not cross the boundary.
 
 ## Connecting
 
-The broker is an MCP server speaking stdio. It is started with the path to the
-daemon socket in the environment:
+The broker is an MCP server speaking stdio, published as a flake package. It is
+started with the path to the daemon socket in the environment:
 
 ```sh
-TEGATA_SOCKET=/run/tegata/tegatad.sock node packages/tegata-mcp/dist/index.js
+TEGATA_SOCKET=/run/tegata/tegatad.sock nix run github:WakaTaira/tegata#tegata-mcp
 ```
 
 Registered with an MCP client, that looks like:
@@ -18,13 +18,18 @@ Registered with an MCP client, that looks like:
 {
   "mcpServers": {
     "tegata": {
-      "command": "node",
-      "args": ["/path/to/packages/tegata-mcp/dist/index.js"],
+      "command": "nix",
+      "args": ["run", "github:WakaTaira/tegata#tegata-mcp"],
       "env": { "TEGATA_SOCKET": "/run/tegata/tegatad.sock" }
     }
   }
 }
 ```
+
+Without Nix, build the broker from a checkout — `npm ci && npm run build
+--workspace @tegata/mcp` — and use `node packages/tegata-mcp/dist/index.js` as
+the command instead. Both shapes, and the Claude Code registration, are in
+[setup-linux.md](setup-linux.md#connecting-an-agent).
 
 When the daemon is a Windows service and the agent is inside WSL, add
 `TEGATA_BRIDGE=1` and point `TEGATA_SOCKET` at the bridge's socket instead. See

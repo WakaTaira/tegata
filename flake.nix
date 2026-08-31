@@ -33,6 +33,8 @@
       packages.${system} = {
         bitwarden-cli-compat = pkgsBw.bitwarden-cli;
         tegata-bridge = tegataPackages.tegata-bridge;
+        tegata-mcp = tegataPackages.tegata-mcp;
+        tegata-executor = tegataPackages.executor;
         inherit (tegataPackages)
           leakscan
           tegatad

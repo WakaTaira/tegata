@@ -74,6 +74,27 @@ fails to launch at all.
 
 ## Without Nix
 
+Build the daemon and the executor from a checkout:
+
+```sh
+cargo build --release -p tegatad
+sudo install -Dm755 target/release/tegatad /usr/local/bin/tegatad
+
+npm ci
+npm run build --workspace @tegata/executor
+```
+
+The executor is not a single file: `packages/tegata-executor/dist/index.js`
+resolves `playwright-core` from the workspace's `node_modules` at run time. Set
+`executor_entry` to that `dist/index.js` and leave the checkout's
+`node_modules` in place, or copy the two side by side preserving the layout.
+Install the browsers with the version pinned in
+`packages/tegata-executor/package.json`:
+
+```sh
+npx playwright-core@1.61.1 install chromium
+```
+
 Run the daemon as a dedicated user with a systemd unit of your own:
 
 ```ini
@@ -104,8 +125,12 @@ With a matching socket unit listening on `/run/tegata/tegatad.sock`, the daemon
 inherits the socket through socket activation. Without one, it binds the path
 itself.
 
-Requirements on the host: Node.js for the executor, the Bitwarden CLI on `PATH`,
-and the Playwright browsers installed where the executor can find them.
+Requirements on the host: Node.js for the executor, and the Bitwarden CLI on
+`PATH` if a `bitwarden-cli` provider is configured. The executor finds the
+browsers through `PLAYWRIGHT_BROWSERS_PATH`; the install above lands them in the
+cache of whoever ran it, so either install them as the daemon's user or set
+`Environment=PLAYWRIGHT_BROWSERS_PATH=…` in the unit to a directory that user
+can read.
 
 Set up the accounts and permissions to match the
 [operator checklist](security.md#operator-checklist) — in particular, the agent's
@@ -196,6 +221,15 @@ username       = "agent@example.com"
 password       = "…"
 totp_seed      = "…"      # optional
 totp_exposable = false    # optional, defaults to false
+```
+
+Creating the pair is one `age` ceremony, done as the daemon's user:
+
+```sh
+age-keygen -o identity.txt           # prints the recipient public key
+age -r age1… -o entries.toml.age entries.toml
+shred -u entries.toml
+chmod 600 identity.txt
 ```
 
 Decryption is lazy — it happens on the first call that needs a value, not at
@@ -390,10 +424,17 @@ startup rather than ignored.
 
 ## Connecting an agent
 
-Point the MCP broker at the socket:
+The broker is a flake package; nothing needs a checkout. Point it at the socket:
 
 ```sh
-TEGATA_SOCKET=/run/tegata/tegatad.sock node packages/tegata-mcp/dist/index.js
+TEGATA_SOCKET=/run/tegata/tegatad.sock nix run github:WakaTaira/tegata#tegata-mcp
+```
+
+For Claude Code, registration is one command:
+
+```sh
+claude mcp add tegata --env TEGATA_SOCKET=/run/tegata/tegatad.sock \
+  -- nix run github:WakaTaira/tegata#tegata-mcp
 ```
 
 Or, as MCP client configuration:
@@ -402,12 +443,21 @@ Or, as MCP client configuration:
 {
   "mcpServers": {
     "tegata": {
-      "command": "node",
-      "args": ["/path/to/packages/tegata-mcp/dist/index.js"],
+      "command": "nix",
+      "args": ["run", "github:WakaTaira/tegata#tegata-mcp"],
       "env": { "TEGATA_SOCKET": "/run/tegata/tegatad.sock" }
     }
   }
 }
+```
+
+Without Nix, build the broker from a checkout and use `node` with the built
+entry point as the command:
+
+```sh
+npm ci
+npm run build --workspace @tegata/mcp
+TEGATA_SOCKET=/run/tegata/tegatad.sock node packages/tegata-mcp/dist/index.js
 ```
 
 Then deny the agent every other route to the same secrets — direct `bw` invocation

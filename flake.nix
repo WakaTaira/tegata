@@ -23,6 +23,8 @@
           age
           pkgsBw.bitwarden-cli
           vaultwarden
+          # The Bitwarden integration test mints a throwaway TLS certificate for its vault.
+          openssl
           playwright-driver
         ];
 

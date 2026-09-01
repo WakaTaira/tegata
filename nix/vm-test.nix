@@ -26,9 +26,21 @@
 let
   support = ../tests/acceptance/support;
   masterPassword = "acceptance-master-password";
-  vaultUrl = "http://127.0.0.1:8222";
+  vaultUrl = "https://127.0.0.1:8222";
   fixtureUrl = "http://127.0.0.1:18080";
   credName = "AC Test Site";
+  # bw refuses plain-http servers since 2025.10, so the throwaway vault serves TLS
+  # with a certificate minted at build time. The key is throwaway too: it only
+  # ever exists inside this VM.
+  vaultTls = pkgs.runCommand "tegata-boundary-vault-tls" {
+    nativeBuildInputs = [ pkgs.openssl ];
+  } ''
+    mkdir -p $out
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+      -subj /CN=127.0.0.1 -addext subjectAltName=IP:127.0.0.1 \
+      -keyout $out/key.pem -out $out/cert.pem
+  '';
+  vaultCertificate = "${vaultTls}/cert.pem";
 in
 pkgs.testers.runNixOSTest {
   name = "tegata-boundary";
@@ -54,10 +66,16 @@ pkgs.testers.runNixOSTest {
       enable = true;
       config = {
         ROCKET_PORT = 8222;
+        ROCKET_TLS = ''{certs="${vaultCertificate}",key="${vaultTls}/key.pem"}'';
         SIGNUPS_ALLOWED = true;
         DOMAIN = vaultUrl;
       };
     };
+
+    # The daemon's bw child processes are node programs; this is how node learns
+    # to trust the throwaway certificate. The provisioning tool gets the same
+    # variable on its command line below.
+    systemd.services.tegata.environment.NODE_EXTRA_CA_CERTS = vaultCertificate;
 
     users.users.agent = { isNormalUser = true; };
     users.users.outsider = { isNormalUser = true; };
@@ -95,7 +113,7 @@ pkgs.testers.runNixOSTest {
         "password": pass_canary,
     }])
     machine.succeed(
-        f"echo '{items}' | provision-test-vault"
+        f"echo '{items}' | NODE_EXTRA_CA_CERTS=${vaultCertificate} provision-test-vault"
         " --server ${vaultUrl}"
         " --email acceptance@test.local"
         " --password ${masterPassword}"

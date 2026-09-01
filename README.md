@@ -242,8 +242,10 @@ they are meant to be read as the specification of what the boundary guarantees.
 Implemented today: the systemd and Windows service boundaries; three credential
 backends behind the provider trait — Bitwarden CLI, age-encrypted file, and GNU
 pass — usable together; the Playwright form executor; the five MCP tools;
-human-in-the-loop login approval; and an audit log covering both agent calls and
-the daemon's own session and vault events.
+human-in-the-loop login approval; an audit log covering both agent calls and
+the daemon's own session and vault events; and prebuilt release binaries and
+bundles for non-Nix deployments, published from tags on the
+[releases page](https://github.com/WakaTaira/tegata/releases).
 
 Planned, tracked in the
 [issue tracker](https://github.com/WakaTaira/tegata/issues):
@@ -255,8 +257,6 @@ Planned, tracked in the
 - **OAuth device-flow executor**
   ([#8](https://github.com/WakaTaira/tegata/issues/8)) — device-code grants
   completed on the isolated side, alongside the form executor
-- **Release binaries** ([#1](https://github.com/WakaTaira/tegata/issues/1)) —
-  prebuilt artifacts for non-Nix deployments
 
 Each feature is designed in a private brief before implementation; what lands
 publicly is the design's contract, as acceptance tests under `tests/acceptance/`.

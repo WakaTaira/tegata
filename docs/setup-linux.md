@@ -74,7 +74,14 @@ fails to launch at all.
 
 ## Without Nix
 
-Build the daemon and the executor from a checkout:
+Each [release](https://github.com/WakaTaira/tegata/releases) ships prebuilt
+artifacts for x86_64 Linux: `tegatad-x86_64-linux-gnu` (glibc 2.35 baseline),
+`tegata-executor-node.tar.gz` (the executor `index.js` with `playwright-core`
+beside it), and `tegata-mcp-node.tar.gz` (the broker with its production
+dependencies), plus `SHA256SUMS`. Unpack a bundle anywhere and point
+`executor_entry` or the agent at its `index.js`.
+
+Otherwise build the daemon and the executor from a checkout:
 
 ```sh
 cargo build --release -p tegatad

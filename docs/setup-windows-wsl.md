@@ -182,9 +182,14 @@ account is the whole vault readable by that account.
 The agent's broker talks to an ordinary UNIX socket. `tegata-bridge` provides that
 socket and relays to the Windows daemon's TCP front with the token in its preamble.
 
-Build it, or install the release binary:
+Install the release binary (x86_64, built against glibc 2.35), or build it from a
+checkout:
 
 ```sh
+curl -fsSLO https://github.com/WakaTaira/tegata/releases/latest/download/tegata-bridge-x86_64-linux-gnu
+install -Dm755 tegata-bridge-x86_64-linux-gnu ~/.local/bin/tegata-bridge
+
+# or
 cargo build --release -p tegata-bridge
 ```
 

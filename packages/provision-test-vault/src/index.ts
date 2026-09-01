@@ -133,22 +133,43 @@ function childEnvironment(
   };
 }
 
+const EXCERPT_LIMIT = 2000;
+
+function excerpt(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed === "") return "<empty>";
+  return trimmed.length > EXCERPT_LIMIT
+    ? `${trimmed.slice(0, EXCERPT_LIMIT)}…`
+    : trimmed;
+}
+
+type BwOutput = { stdout: string; stderr: string };
+
 function runBw(
   args: string[],
   appDataDir: string,
   input?: string,
   extra: Record<string, string> = {},
-): string {
+): BwOutput {
   const result = spawnSync("bw", args, {
     env: childEnvironment(appDataDir, extra),
     input,
     encoding: "utf8",
     stdio: ["pipe", "pipe", "pipe"],
   });
-  if (result.error || result.status !== 0) {
-    throw new Error(`bw ${args[0] ?? "command"} failed`);
+  if (result.error) {
+    throw new Error(
+      `bw ${args[0] ?? "command"} could not run: ${result.error.message}`,
+    );
   }
-  return result.stdout;
+  if (result.status !== 0) {
+    const exit =
+      result.status === null ? `signal ${result.signal}` : `${result.status}`;
+    throw new Error(
+      `bw ${args[0] ?? "command"} exited with ${exit}; stderr: ${excerpt(result.stderr)}`,
+    );
+  }
+  return { stdout: result.stdout, stderr: result.stderr };
 }
 
 async function registerAccount(
@@ -191,8 +212,23 @@ async function registerAccount(
   }
 }
 
-function buildItem(template: string, item: ProvisionItem): string {
-  const value = JSON.parse(template) as Record<string, unknown>;
+/**
+ * Parses bw output that must be JSON, reporting the raw output on failure —
+ * bw is known to exit 0 with empty stdout when it loses its session-key
+ * persistence race, and the raw capture is what a diagnosis needs.
+ */
+function parseBwJson(command: string, output: BwOutput): unknown {
+  try {
+    return JSON.parse(output.stdout);
+  } catch {
+    throw new Error(
+      `${command} returned unparseable JSON; stdout: ${excerpt(output.stdout)}; stderr: ${excerpt(output.stderr)}`,
+    );
+  }
+}
+
+function buildItem(template: unknown, item: ProvisionItem): string {
+  const value = template as Record<string, unknown>;
   const login = (value.login ?? {}) as Record<string, unknown>;
   value.type = 1;
   value.name = item.name;
@@ -219,7 +255,7 @@ async function main(): Promise<void> {
       session = runBw(
         ["login", email, "--raw", "--passwordfile", passwordFile],
         appDataDir,
-      ).split(/\r?\n/, 1)[0];
+      ).stdout.split(/\r?\n/, 1)[0];
     } finally {
       rmSync(passwordFile, { force: true });
     }
@@ -238,15 +274,15 @@ async function main(): Promise<void> {
     const items = JSON.parse(input) as ProvisionItem[];
     let created = 0;
     for (const item of items) {
-      const template = runBw(
-        ["get", "template", "item"],
-        appDataDir,
-        undefined,
-        { BW_SESSION: session },
+      const template = parseBwJson(
+        "bw get template",
+        runBw(["get", "template", "item"], appDataDir, undefined, {
+          BW_SESSION: session,
+        }),
       );
       const encoded = runBw(["encode"], appDataDir, buildItem(template, item), {
         BW_SESSION: session,
-      }).trim();
+      }).stdout.trim();
       runBw(["create", "item", encoded], appDataDir, undefined, {
         BW_SESSION: session,
       });

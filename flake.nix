@@ -1,12 +1,10 @@
 {
   inputs.nixpkgs.url = "nixpkgs";
-  inputs.nixpkgs-bw.url = "github:NixOS/nixpkgs/nixos-25.05";
 
-  outputs = { self, nixpkgs, nixpkgs-bw, ... }:
+  outputs = { self, nixpkgs, ... }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
-      pkgsBw = import nixpkgs-bw { inherit system; };
       tegataPackages = import ./nix/packages.nix { inherit pkgs; };
     in
     {
@@ -21,7 +19,7 @@
           pass
           gnupg
           age
-          pkgsBw.bitwarden-cli
+          bitwarden-cli
           vaultwarden
           # The Bitwarden integration test mints a throwaway TLS certificate for its vault.
           openssl
@@ -33,7 +31,6 @@
       };
 
       packages.${system} = {
-        bitwarden-cli-compat = pkgsBw.bitwarden-cli;
         tegata-bridge = tegataPackages.tegata-bridge;
         tegata-mcp = tegataPackages.tegata-mcp;
         tegata-executor = tegataPackages.executor;
@@ -48,7 +45,7 @@
       nixosModules.tegata = import ./nix/module.nix {
         tegatadPackage = tegataPackages.tegatad;
         executorEntry = "${tegataPackages.executor}/lib/tegata-executor/index.js";
-        bitwardenCliPackage = pkgsBw.bitwarden-cli;
+        bitwardenCliPackage = pkgs.bitwarden-cli;
         # Pass the browser from this flake's nixpkgs rather than the host-side pkgs. The
         # playwright-core bundled with the executor must match the browser revision, while the
         # host-side playwright-driver may have a divergent version (confirmed to fail at launch).

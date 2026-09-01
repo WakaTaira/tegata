@@ -61,6 +61,12 @@ Provider submodule fields: `namespace`, `type`, `server_url`, `email`,
 `askpass_cmd`, `totp_exposable`, `session_ttl_secs`, and `entries` (used only by
 the mock provider in tests).
 
+The module ships the Bitwarden CLI from the flake's nixpkgs, and the CLI only
+talks to servers over HTTPS. For a vault whose certificate comes from a private
+CA, set `systemd.services.tegata.environment.NODE_EXTRA_CA_CERTS` to that CA's
+certificate; the daemon passes its environment on to bw. The boundary test in
+`nix/vm-test.nix` does exactly this for its throwaway vault.
+
 The bridge module `nixosModules.tegata-bridge` is documented in
 [setup-windows-wsl.md](setup-windows-wsl.md#nixos-bridge-module); it is only useful
 when the daemon is a Windows service.
@@ -133,9 +139,13 @@ inherits the socket through socket activation. Without one, it binds the path
 itself.
 
 Requirements on the host: Node.js for the executor, and the Bitwarden CLI on
-`PATH` if a `bitwarden-cli` provider is configured. The executor finds the
-browsers through `PLAYWRIGHT_BROWSERS_PATH`; the install above lands them in the
-cache of whoever ran it, so either install them as the daemon's user or set
+`PATH` if a `bitwarden-cli` provider is configured — 2025.12.1 or newer, the
+first release without the session-key persistence race the daemon otherwise
+retries around. The CLI only talks to servers over HTTPS; if your vault's
+certificate comes from a private CA, add `Environment=NODE_EXTRA_CA_CERTS=…` to
+the unit and the daemon passes it on to bw. The executor finds the browsers
+through `PLAYWRIGHT_BROWSERS_PATH`; the install above lands them in the cache of
+whoever ran it, so either install them as the daemon's user or set
 `Environment=PLAYWRIGHT_BROWSERS_PATH=…` in the unit to a directory that user
 can read.
 

@@ -15,7 +15,10 @@ as root.
 ## Prerequisites on the Windows host
 
 - Node.js LTS
-- Bitwarden CLI `2025.9.0`
+- Bitwarden CLI 2025.12.1 or newer. The CLI only talks to servers over HTTPS;
+  if your vault's certificate comes from a private CA, set `NODE_EXTRA_CA_CERTS`
+  to that CA's certificate in the system environment so the service's bw
+  processes trust it.
 - The Playwright browsers, installed into the directory you will configure as
   `browsers_path`, with the version pinned in
   `packages/tegata-executor/package.json`:

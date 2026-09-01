@@ -427,6 +427,10 @@ impl BitwardenCliProvider {
     ) -> Result<(), ErrorCode> {
         let session = self.login_with_password(login_args, password).await?;
         self.session = Some(Secret::new(session));
+        // bw before 2025.12.1 could lose the race between persisting the session-protected
+        // key and initialising the vault timeout (bitwarden/clients#17707), handing back a
+        // session that later commands treat as locked. The `bw status` check is a cheap
+        // invariant on any version; the retries only ever fire on an affected CLI.
         for attempt in 0..=2 {
             let session_is_unlocked = match self.session.as_ref() {
                 Some(session) => self.session_is_unlocked(session).await,

@@ -1,0 +1,133 @@
+name: Release
+
+# Tag pushes build every artifact and publish a GitHub Release with checksums.
+# workflow_dispatch builds the same artifacts for inspection without releasing.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux-binaries:
+    # ubuntu-22.04 states the glibc baseline (2.35) for the published binaries.
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build release binaries
+        run: cargo build --release --locked --package tegatad --package tegata-bridge
+
+      - name: Stage artifacts
+        run: |
+          mkdir stage
+          cp target/release/tegatad stage/tegatad-x86_64-linux-gnu
+          cp target/release/tegata-bridge stage/tegata-bridge-x86_64-linux-gnu
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          path: stage/*
+          if-no-files-found: error
+
+  windows-binary:
+    # Cross-building the service integration from Linux fails (dlltool and
+    # friends), so the Windows daemon is built natively.
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build release binary
+        run: cargo build --release --locked --package tegatad
+
+      - name: Stage artifact
+        run: |
+          mkdir stage
+          cp target/release/tegatad.exe stage/tegatad-x86_64-windows.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-binary
+          path: stage/*
+          if-no-files-found: error
+
+  node-bundles:
+    # The broker and executor bundles mirror the layout of the Nix packages
+    # and the setup docs: dist/index.js renamed to index.js with the pruned
+    # production node_modules beside it.
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build workspaces
+        run: npm run build --workspace @tegata/mcp --workspace @tegata/executor
+
+      - name: Prune to production dependencies
+        run: npm prune --omit=dev
+
+      - name: Stage bundles
+        run: |
+          mkdir -p stage tegata-mcp tegata-executor/node_modules
+          cp packages/tegata-mcp/dist/index.js tegata-mcp/index.js
+          cp -rL node_modules tegata-mcp/node_modules
+          cp packages/tegata-executor/dist/index.js tegata-executor/index.js
+          cp -rL node_modules/playwright-core tegata-executor/node_modules/
+          tar czf stage/tegata-mcp-node.tar.gz tegata-mcp
+          tar czf stage/tegata-executor-node.tar.gz tegata-executor
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-bundles
+          path: stage/*
+          if-no-files-found: error
+
+  release:
+    needs: [linux-binaries, windows-binary, node-bundles]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: cd assets && sha256sum -- * > SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --notes "Linux binaries are built against glibc 2.35 (ubuntu-22.04). The node bundles target Node.js 24: unpack a bundle and point the daemon or agent at its index.js."

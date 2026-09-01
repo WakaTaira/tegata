@@ -113,6 +113,8 @@
             pkgs.cargo
             pkgs.rustc
             pkgs.rustPlatform.cargoSetupHook
+            # The daemon integration tests spawn fake node executors.
+            pkgs.nodejs_24
           ];
           cargoDeps = pkgs.rustPlatform.importCargoLock {
             lockFile = ./Cargo.lock;

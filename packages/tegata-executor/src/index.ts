@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 
+import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:net";
+import os from "node:os";
+import path from "node:path";
 import { createInterface } from "node:readline";
 import { type Browser, chromium, type Page } from "playwright-core";
 
@@ -30,7 +33,7 @@ type LoginRequest = {
   };
 };
 
-type Request = LoginRequest | { op: "shutdown" };
+type Request = LoginRequest | { op: "hello" } | { op: "shutdown" };
 
 type ErrorCode =
   | "INVALID_CREDENTIAL"
@@ -48,7 +51,37 @@ class InvalidCredentialError extends Error {}
 class MfaRequiredError extends Error {}
 
 let activeBrowser: Browser | undefined;
+let activeGuard: CdpGuard | undefined;
+let activeTempDir: string | undefined;
 let shuttingDown = false;
+
+type CdpMessage = {
+  id?: number;
+  method?: string;
+  params?: Record<string, unknown>;
+  sessionId?: string;
+  result?: Record<string, unknown>;
+  error?: { message?: string };
+};
+
+type CdpGuard = {
+  close: () => void;
+  failure: Promise<never>;
+  browserPid: number | undefined;
+  assertOpen: () => void;
+};
+
+type PendingCdpCommand = {
+  resolve: (result: Record<string, unknown> | undefined) => void;
+  reject: (error: unknown) => void;
+  timeout: ReturnType<typeof setTimeout>;
+};
+
+const autoAttachParams = {
+  autoAttach: true,
+  waitForDebuggerOnStart: true,
+  flatten: true,
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -66,9 +99,13 @@ function isSecretPlaceholder(value: unknown): value is FillStep["value"] {
 
 function parseRequest(line: string): Request {
   const value: unknown = JSON.parse(line);
-  if (!isRecord(value) || (value.op !== "login" && value.op !== "shutdown")) {
+  if (
+    !isRecord(value) ||
+    (value.op !== "hello" && value.op !== "login" && value.op !== "shutdown")
+  ) {
     throw new Error("invalid request");
   }
+  if (value.op === "hello") return { op: "hello" };
   if (value.op === "shutdown") return { op: "shutdown" };
 
   const secret = value.secret;
@@ -147,6 +184,195 @@ async function waitForEndpoint(port: number): Promise<string> {
     throw new Error("CDP endpoint was not returned");
   }
   return value.webSocketDebuggerUrl;
+}
+
+async function openGuard(endpoint: string): Promise<CdpGuard> {
+  const ws = new WebSocket(endpoint);
+  let nextId = 1;
+  let rejectOpen: (error: unknown) => void = () => undefined;
+  let rejectFailure: (error: unknown) => void = () => undefined;
+  let failureError: Error | undefined;
+  let intentionallyClosed = false;
+  let browserPid: number | undefined;
+  const pending = new Map<number, PendingCdpCommand>();
+  const failure = new Promise<never>((_resolve, reject) => {
+    rejectFailure = reject;
+  });
+
+  const fail = (error: unknown): void => {
+    if (failureError !== undefined) return;
+    failureError =
+      error instanceof Error ? error : new Error("CDP guard failed");
+    rejectOpen(failureError);
+    rejectFailure(failureError);
+    for (const { reject, timeout } of pending.values()) {
+      clearTimeout(timeout);
+      reject(failureError);
+    }
+    pending.clear();
+  };
+
+  const send = (
+    method: string,
+    params: Record<string, unknown>,
+    sessionId?: string,
+    failOnTimeout = true,
+  ): Promise<Record<string, unknown> | undefined> =>
+    new Promise((resolve, reject) => {
+      if (ws.readyState !== WebSocket.OPEN) {
+        reject(new Error("CDP guard websocket is not open"));
+        return;
+      }
+      const id = nextId++;
+      const timeout = setTimeout(() => {
+        pending.delete(id);
+        const error = new Error("CDP guard command timed out");
+        reject(error);
+        if (failOnTimeout) fail(error);
+      }, 10_000);
+      pending.set(id, { resolve, reject, timeout });
+      try {
+        ws.send(JSON.stringify({ id, method, params, sessionId }));
+      } catch (error) {
+        pending.delete(id);
+        clearTimeout(timeout);
+        reject(error);
+      }
+    });
+
+  const handleEvent = (message: CdpMessage): void => {
+    if (message.method === "Target.attachedToTarget") {
+      const params = message.params;
+      const targetInfo = params?.targetInfo;
+      const sessionId = params?.sessionId;
+      if (
+        !isRecord(targetInfo) ||
+        typeof targetInfo.type !== "string" ||
+        typeof sessionId !== "string"
+      ) {
+        fail(new Error("invalid Target.attachedToTarget event"));
+        return;
+      }
+      void send(
+        "Fetch.enable",
+        {
+          patterns: [{ urlPattern: "file://*", requestStage: "Request" }],
+        },
+        sessionId,
+      )
+        .then(async () => {
+          if (targetInfo.type === "page") {
+            await send("Target.setAutoAttach", autoAttachParams, sessionId);
+          }
+          await send("Runtime.runIfWaitingForDebugger", {}, sessionId);
+        })
+        .catch(fail);
+      return;
+    }
+
+    if (message.method === "Fetch.requestPaused") {
+      const params = message.params;
+      if (
+        typeof message.sessionId !== "string" ||
+        typeof params?.requestId !== "string"
+      ) {
+        fail(new Error("invalid Fetch.requestPaused event"));
+        return;
+      }
+      void send(
+        "Fetch.failRequest",
+        { requestId: params.requestId, errorReason: "AccessDenied" },
+        message.sessionId,
+      ).catch(fail);
+    }
+  };
+
+  ws.onmessage = (event) => {
+    let message: CdpMessage;
+    try {
+      message = JSON.parse(event.data as string) as CdpMessage;
+    } catch (error) {
+      fail(error);
+      return;
+    }
+    if (typeof message.id === "number") {
+      const command = pending.get(message.id);
+      if (command === undefined) return;
+      pending.delete(message.id);
+      clearTimeout(command.timeout);
+      if (message.error !== undefined) {
+        command.reject(
+          new Error(message.error.message ?? "CDP command failed"),
+        );
+      } else {
+        command.resolve(message.result);
+      }
+      return;
+    }
+    handleEvent(message);
+  };
+  ws.onerror = () => fail(new Error("CDP guard websocket failed"));
+  ws.onclose = () => {
+    if (!intentionallyClosed) fail(new Error("CDP guard websocket closed"));
+  };
+
+  const opened = new Promise<void>((resolve, reject) => {
+    rejectOpen = reject;
+    ws.onopen = () => {
+      void send("Target.setAutoAttach", autoAttachParams)
+        .then(() => resolve())
+        .catch(fail);
+    };
+  });
+
+  try {
+    await Promise.race([opened, failure]);
+  } catch (error) {
+    intentionallyClosed = true;
+    ws.close();
+    throw error;
+  }
+
+  try {
+    const result = await send(
+      "SystemInfo.getProcessInfo",
+      {},
+      undefined,
+      false,
+    );
+    const processInfo = result?.processInfo;
+    if (Array.isArray(processInfo)) {
+      const browserProcess = processInfo.find(
+        (value) => isRecord(value) && value.type === "browser",
+      );
+      if (isRecord(browserProcess) && typeof browserProcess.id === "number") {
+        browserPid = browserProcess.id;
+      }
+    }
+  } catch {
+    browserPid = undefined;
+  }
+
+  return {
+    close: () => {
+      intentionallyClosed = true;
+      ws.close();
+      for (const { timeout } of pending.values()) clearTimeout(timeout);
+      pending.clear();
+    },
+    failure,
+    browserPid,
+    assertOpen: () => {
+      if (failureError !== undefined) throw failureError;
+    },
+  };
+}
+
+async function withGuard<T>(
+  guard: CdpGuard,
+  operation: () => Promise<T>,
+): Promise<T> {
+  return Promise.race([operation(), guard.failure]);
 }
 
 function isTimeoutError(error: unknown): boolean {
@@ -336,24 +562,95 @@ async function waitForLoginResult(
 
 async function executeLogin(request: LoginRequest): Promise<string> {
   const port = await reservePort();
+  const dir = await mkdtemp(path.join(os.tmpdir(), "tegata-browser-"));
+  activeTempDir = dir;
+  // ブラウザが参照する設定・キャッシュを executor の作業領域から隔離します。
   const browser = await chromium.launch({
     headless: true,
     args: [`--remote-debugging-port=${port}`],
+    env: {
+      ...process.env,
+      HOME: dir,
+      XDG_CONFIG_HOME: dir,
+      XDG_CACHE_HOME: dir,
+    },
   });
   activeBrowser = browser;
-  const page = await browser.newPage();
-  await page.goto(request.target_url);
-  await runSteps(page, request.steps, request.secret);
-  await waitForLoginResult(
-    page,
-    request.success_selector,
-    request.failure_selector,
+  // ページ操作より先に CDP エンドポイントを取得し、全 target にガードを張ります。
+  const endpoint = await waitForEndpoint(port);
+  const guard = await openGuard(endpoint);
+  activeGuard = guard;
+  const page = await withGuard(guard, () => browser.newPage());
+  await withGuard(guard, () => page.goto(request.target_url));
+  await withGuard(guard, () => runSteps(page, request.steps, request.secret));
+  await withGuard(guard, () =>
+    waitForLoginResult(
+      page,
+      request.success_selector,
+      request.failure_selector,
+    ),
   );
-  return waitForEndpoint(port);
+  monitorGuardFailure(guard);
+  guard.assertOpen();
+  return endpoint;
 }
 
 function writeResponse(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
+function monitorGuardFailure(guard: CdpGuard): void {
+  void guard.failure.then(undefined, async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    await cleanupResources();
+    process.exit(1);
+  });
+}
+
+function killBrowserProcess(browserPid: number | undefined): void {
+  if (browserPid === undefined) {
+    process.stderr.write(
+      "ブラウザプロセスの PID を取得できないため、強制終了を実行できません。\n",
+    );
+    return;
+  }
+  try {
+    process.kill(browserPid, "SIGKILL");
+  } catch {
+    return;
+  }
+}
+
+async function cleanupResources(): Promise<void> {
+  const guard = activeGuard;
+  const browserPid = guard?.browserPid;
+  activeGuard = undefined;
+  if (guard !== undefined) {
+    guard.close();
+  }
+  const browser = activeBrowser;
+  activeBrowser = undefined;
+  if (browser !== undefined) {
+    let closeTimedOut = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      browser.close().catch(() => undefined),
+      new Promise<void>((resolve) => {
+        timeout = setTimeout(() => {
+          closeTimedOut = true;
+          resolve();
+        }, 5_000);
+      }),
+    ]);
+    if (timeout !== undefined) clearTimeout(timeout);
+    if (closeTimedOut) killBrowserProcess(browserPid);
+  }
+  const dir = activeTempDir;
+  activeTempDir = undefined;
+  if (dir !== undefined) {
+    await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  }
 }
 
 async function handleLogin(request: LoginRequest): Promise<void> {
@@ -374,11 +671,7 @@ async function handleLogin(request: LoginRequest): Promise<void> {
           : error instanceof MfaRequiredError
             ? "MFA_REQUIRED"
             : "INTERNAL";
-    const browser = activeBrowser as Browser | undefined;
-    if (browser !== undefined) {
-      await browser.close().catch(() => undefined);
-      activeBrowser = undefined;
-    }
+    await cleanupResources();
     writeResponse({ ok: false, error: errorCode });
   }
 }
@@ -386,12 +679,20 @@ async function handleLogin(request: LoginRequest): Promise<void> {
 async function shutdown(): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
-  if (activeBrowser !== undefined) {
-    await activeBrowser.close().catch(() => undefined);
-    activeBrowser = undefined;
-  }
+  await cleanupResources();
   process.exit(0);
 }
+
+let stdinEofHandled = false;
+
+function handleStdinEof(): void {
+  if (stdinEofHandled || shuttingDown) return;
+  stdinEofHandled = true;
+  void shutdown();
+}
+
+process.stdin.once("end", handleStdinEof);
+process.stdin.once("close", handleStdinEof);
 
 process.once("SIGTERM", () => {
   void shutdown();
@@ -403,6 +704,14 @@ async function main(): Promise<void> {
     if (shuttingDown || line.trim() === "") continue;
     try {
       const request = parseRequest(line);
+      if (request.op === "hello") {
+        writeResponse({
+          ok: true,
+          uid: process.getuid?.() ?? null,
+          pid: process.pid,
+        });
+        continue;
+      }
       if (request.op === "shutdown") {
         await shutdown();
         return;
@@ -412,8 +721,6 @@ async function main(): Promise<void> {
       writeResponse({ ok: false, error: "INTERNAL" satisfies ErrorCode });
     }
   }
-  // stdin has closed: the daemon is gone and no shutdown request can arrive.
-  // Exit instead of idling forever with a live browser keeping the process up.
   await shutdown();
 }
 

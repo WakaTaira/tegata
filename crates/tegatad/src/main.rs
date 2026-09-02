@@ -21,12 +21,14 @@ use leakscan::scan_bytes;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(unix)]
+use tegata_core::wire::{ExecutorHelloRequest, ExecutorHelloResponse};
 use tegata_core::wire::{
     ExecutorLoginRequest, ExecutorResponse, ExecutorSecret, LoginParams, RpcError, RpcRequest,
     RpcResponse,
 };
 use tegata_core::{Secret, totp};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tokio::time::{Instant, interval, timeout};
@@ -43,7 +45,7 @@ use zeroize::Zeroize;
 use crate::provider::StaticProvider;
 use crate::provider::{
     BitwardenCliConfig, BitwardenCliProvider, CredentialProvider, FileProvider, FileProviderConfig,
-    ResolvedCredential, remove_password_file,
+    ResolvedCredential,
 };
 #[cfg(unix)]
 use crate::provider::{PassProvider, PassProviderConfig};
@@ -55,6 +57,7 @@ const JSON_RPC_VERSION: &str = "2.0";
 const METHOD_NOT_FOUND: i32 = -32601;
 const CLASSIFICATION_ERROR: i32 = -32000;
 const EXECUTOR_TIMEOUT: Duration = Duration::from_secs(90);
+const PASSWORD_FILE_DIR: &str = ".bw-passwords";
 
 type ReadySender = Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<Result<(), String>>>>>;
 
@@ -66,6 +69,8 @@ struct Config {
     approve_cmd: Option<String>,
     approve_timeout_secs: Option<u64>,
     executor_entry: Option<String>,
+    #[cfg(unix)]
+    executor_socket: Option<String>,
     session_ttl_secs: Option<u64>,
     #[cfg(windows)]
     #[serde(default = "default_unlock_mode")]
@@ -149,9 +154,24 @@ struct Provider {
 }
 
 struct Session {
-    child: Child,
+    executor: ExecutorHandle,
     expires_at: Instant,
     namespace: String,
+}
+
+enum ExecutorHandle {
+    Spawned(Child),
+    #[cfg(unix)]
+    Socket {
+        reader: Arc<Mutex<tokio::net::unix::OwnedReadHalf>>,
+        writer: tokio::net::unix::OwnedWriteHalf,
+    },
+}
+
+enum ExecutorReader {
+    Spawned(tokio::process::ChildStdout),
+    #[cfg(unix)]
+    Socket(Arc<Mutex<tokio::net::unix::OwnedReadHalf>>),
 }
 
 struct DaemonState {
@@ -164,6 +184,7 @@ struct DaemonState {
     audit_rotated: AtomicBool,
     audit_lock: Arc<Mutex<()>>,
     executor_entry: PathBuf,
+    executor_socket: Option<PathBuf>,
     node_path: PathBuf,
     browsers_path: Option<PathBuf>,
     cdp_ports: Arc<std::sync::RwLock<HashMap<String, u16>>>,
@@ -278,25 +299,6 @@ struct Args {
     command: Option<windows_cli::WindowsCommand>,
 }
 
-const PASSWORD_FILE_DIR: &str = ".bw-passwords";
-
-async fn prepare_password_dir(state_dir: &Path) -> io::Result<PathBuf> {
-    let password_dir = state_dir.join(PASSWORD_FILE_DIR);
-    tokio::fs::create_dir_all(&password_dir).await?;
-    secure_fs::restrict_directory(&password_dir).await?;
-    let mut entries = tokio::fs::read_dir(&password_dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        if entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(".bw-password-")
-        {
-            remove_password_file(&entry.path()).await;
-        }
-    }
-    Ok(password_dir)
-}
-
 fn main() {
     if let Err(error) = run() {
         eprintln!("tegatad: {error}");
@@ -374,9 +376,17 @@ async fn run_daemon(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config_text = tokio::fs::read_to_string(config_path).await?;
     let config: Config = toml::from_str(&config_text)?;
+    remove_legacy_password_dir(Path::new(&config.state_dir)).await?;
     #[cfg(windows)]
     if config.approve_cmd.is_some() {
         return Err("approve_cmd is only supported on Unix".into());
+    }
+    #[cfg(unix)]
+    if let Some(path) = config.executor_socket.as_deref() {
+        let uid = validate_executor_socket(path).await?;
+        eprintln!("executor: socket {path} (uid {uid})");
+    } else {
+        eprintln!("executor: spawned by the daemon (browser is not isolated)");
     }
     #[cfg(windows)]
     if let Some(message) = config.providers.iter().find_map(|provider| {
@@ -403,6 +413,16 @@ async fn run_daemon(
         return Err(message.into());
     }
     #[cfg(windows)]
+    if config
+        .providers
+        .iter()
+        .any(|provider| matches!(&provider.kind, ProviderConfigKind::AgeFile { .. }))
+    {
+        return Err("the age-file provider is not supported on Windows: the browser shares the service account and could read the identity file (see docs/security.md)".into());
+    }
+    #[cfg(windows)]
+    eprintln!("executor: spawned by the daemon (browser is not isolated)");
+    #[cfg(windows)]
     let _ = config.approve_timeout_secs;
     #[cfg(windows)]
     let (token_hash_path, _sealed_blob_path) = resolve_windows_paths(&config);
@@ -411,8 +431,7 @@ async fn run_daemon(
     #[cfg(unix)]
     let transport = PlatformTransport::bind(&config.transport).await?;
     tokio::fs::create_dir_all(&config.state_dir).await?;
-    let password_dir = prepare_password_dir(Path::new(&config.state_dir)).await?;
-    let state = Arc::new(Mutex::new(build_state(config, password_dir)?));
+    let state = Arc::new(Mutex::new(build_state(config)?));
     #[cfg(windows)]
     let transport = {
         let cdp_ports = state.lock().await.cdp_ports.clone();
@@ -450,6 +469,80 @@ async fn serve_transport(
     // interrupted sessions do not leave orphaned browser processes behind.
     terminate_sessions(&state, drain_sessions(&state, None).await).await;
     result
+}
+
+#[cfg(unix)]
+async fn validate_executor_socket(path: &str) -> Result<u32, io::Error> {
+    use tokio::net::UnixStream;
+
+    let mut stream = timeout(Duration::from_secs(10), UnixStream::connect(path))
+        .await
+        .map_err(|error| executor_socket_error(path, error))?
+        .map_err(|error| executor_socket_error(path, error))?;
+    let request = serde_json::to_vec(&ExecutorHelloRequest { op: "hello" })
+        .map_err(|error| executor_socket_error(path, error))?;
+    stream
+        .write_all(&[request.as_slice(), b"\n"].concat())
+        .await
+        .map_err(|error| executor_socket_error(path, error))?;
+    stream
+        .flush()
+        .await
+        .map_err(|error| executor_socket_error(path, error))?;
+    let mut reader = BufReader::new(stream);
+    let mut response_line = String::new();
+    timeout(
+        Duration::from_secs(10),
+        reader.read_line(&mut response_line),
+    )
+    .await
+    .map_err(|error| executor_socket_error(path, error))?
+    .map_err(|error| executor_socket_error(path, error))?;
+    if response_line.is_empty() {
+        return Err(executor_socket_error(path, "empty response"));
+    }
+    let response: ExecutorHelloResponse =
+        serde_json::from_str(&response_line).map_err(|error| executor_socket_error(path, error))?;
+    if !response.ok {
+        return Err(executor_socket_error(path, "executor reported ok=false"));
+    }
+    if response.uid == Some(0) {
+        return Err(io::Error::other("executor must not run as root"));
+    }
+    let Some(uid) = response.uid else {
+        return Err(io::Error::other(
+            "executor must not run as the daemon's own user",
+        ));
+    };
+    if uid == unsafe { libc::geteuid() } {
+        return Err(io::Error::other(
+            "executor must not run as the daemon's own user",
+        ));
+    }
+    Ok(uid)
+}
+
+async fn remove_legacy_password_dir(state_dir: &Path) -> io::Result<()> {
+    let password_dir = state_dir.join(PASSWORD_FILE_DIR);
+    match tokio::fs::metadata(&password_dir).await {
+        Ok(_) => {
+            tokio::fs::remove_dir_all(&password_dir).await?;
+            eprintln!(
+                "removed legacy password directory {}",
+                password_dir.display()
+            );
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn executor_socket_error(path: &str, error: impl fmt::Display) -> io::Error {
+    io::Error::other(format!(
+        "executor socket \"{path}\" is not connectable: {error}"
+    ))
 }
 
 async fn accept_connections(
@@ -505,7 +598,7 @@ where
     Ok(())
 }
 
-fn build_state(config: Config, password_dir: PathBuf) -> Result<DaemonState, io::Error> {
+fn build_state(config: Config) -> Result<DaemonState, io::Error> {
     #[cfg(windows)]
     let (token_hash_path, sealed_blob_path) = resolve_windows_paths(&config);
     #[cfg(windows)]
@@ -521,6 +614,10 @@ fn build_state(config: Config, password_dir: PathBuf) -> Result<DaemonState, io:
     #[cfg(unix)]
     let approve_timeout = Duration::from_secs(config.approve_timeout_secs.unwrap_or(60));
     let executor_entry = resolve_executor_entry(&config);
+    #[cfg(unix)]
+    let executor_socket = config.executor_socket.as_deref().map(PathBuf::from);
+    #[cfg(windows)]
+    let executor_socket = None;
     let node_path = resolve_node_path(&config);
     let browsers_path = resolve_browsers_path(&config);
     let bw_path = resolve_bw_path(&config);
@@ -547,7 +644,6 @@ fn build_state(config: Config, password_dir: PathBuf) -> Result<DaemonState, io:
                     email,
                     askpass_cmd,
                     appdata_dir: state_dir.join(format!("bw-{}", safe_path_component(&namespace))),
-                    password_dir: password_dir.clone(),
                     bw_path: bw_path.clone(),
                     totp_exposable,
                     session_ttl: Duration::from_secs(
@@ -604,6 +700,7 @@ fn build_state(config: Config, password_dir: PathBuf) -> Result<DaemonState, io:
         audit_rotated: AtomicBool::new(false),
         audit_lock: Arc::new(Mutex::new(())),
         executor_entry,
+        executor_socket,
         node_path,
         browsers_path,
         cdp_ports: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -729,7 +826,7 @@ fn spawn_session_reaper(state: SharedState) {
                     .collect::<Vec<_>>()
             };
             for (session_id, session) in expired {
-                shutdown_child(session.child).await;
+                shutdown_child(session.executor).await;
                 let daemon = state.lock().await;
                 if let Err(error) = append_audit(
                     &daemon,
@@ -1156,7 +1253,7 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
             return classified(request.id.clone(), error);
         }
     }
-    let (credential, executor_entry, node_path, browsers_path, ttl) = {
+    let (credential, executor_entry, executor_socket, node_path, browsers_path, ttl) = {
         let credential = match resolve_credential(&state, &params.cred_id).await {
             Ok(Some(credential)) => credential,
             Ok(None) => return classified(request.id.clone(), ErrorCode::InvalidCredential),
@@ -1169,13 +1266,15 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
         (
             credential,
             daemon.executor_entry.clone(),
+            daemon.executor_socket.clone(),
             daemon.node_path.clone(),
             daemon.browsers_path.clone(),
             daemon.session_ttl,
         )
     };
-    let (endpoint, session_id, child) = match start_executor(
+    let (endpoint, session_id, mut executor) = match start_executor(
         &executor_entry,
+        executor_socket.as_deref(),
         &node_path,
         browsers_path.as_deref(),
         &params,
@@ -1186,25 +1285,36 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
         Ok(result) => result,
         Err(error) => return classified(request.id.clone(), error),
     };
+    let reader = executor
+        .take_reader()
+        .ok_or_else(|| io::Error::other("executor stdout or socket reader is unavailable"));
+    let reader = match reader {
+        Ok(reader) => reader,
+        Err(_) => {
+            stop_child(executor).await;
+            return classified(request.id.clone(), ErrorCode::Internal);
+        }
+    };
     let Some(cdp_port) = cdp_port_from_endpoint(&endpoint) else {
-        stop_child(child).await;
+        stop_child(executor).await;
         return classified(request.id.clone(), ErrorCode::Internal);
     };
     let cdp_ports = state.lock().await.cdp_ports.clone();
     if let Ok(mut ports) = cdp_ports.write() {
         ports.insert(session_id.clone(), cdp_port);
     } else {
-        stop_child(child).await;
+        stop_child(executor).await;
         return classified(request.id.clone(), ErrorCode::Internal);
     }
     state.lock().await.sessions.insert(
         session_id.clone(),
         Session {
-            child,
+            executor,
             expires_at: Instant::now() + ttl,
             namespace,
         },
     );
+    spawn_executor_reaper(state.clone(), session_id.clone(), reader);
     success(
         request.id.clone(),
         json!({
@@ -1305,7 +1415,7 @@ async fn logout(request: &RpcRequest, state: SharedState) -> HandledRequest {
         session
     };
     if let Some(session) = session {
-        shutdown_child(session.child).await;
+        shutdown_child(session.executor).await;
     }
     success(request.id.clone(), json!({ "ok": true }))
 }
@@ -1409,7 +1519,7 @@ async fn drain_sessions(state: &SharedState, namespace: Option<&str>) -> Vec<(St
 async fn terminate_sessions(state: &SharedState, sessions: Vec<(String, Session)>) {
     for (session_id, session) in sessions {
         let session_namespace = session.namespace.clone();
-        shutdown_child(session.child).await;
+        shutdown_child(session.executor).await;
         let daemon = state.lock().await;
         if let Err(error) = append_audit(
             &daemon,
@@ -1482,15 +1592,80 @@ fn register_secret(registry: &mut Vec<String>, secret: &Secret) {
     }
 }
 
+impl ExecutorHandle {
+    async fn write_line(&mut self, line: &[u8]) -> io::Result<()> {
+        match self {
+            Self::Spawned(child) => {
+                let stdin = child
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("executor stdin is unavailable"))?;
+                stdin.write_all(line).await?;
+                stdin.flush().await
+            }
+            #[cfg(unix)]
+            Self::Socket { writer, .. } => {
+                writer.write_all(line).await?;
+                writer.flush().await
+            }
+        }
+    }
+
+    async fn read_line(&mut self) -> io::Result<String> {
+        match self {
+            Self::Spawned(child) => {
+                let mut stdout = child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| io::Error::other("executor stdout is unavailable"))?;
+                let result = read_executor_line(&mut stdout).await;
+                child.stdout = Some(stdout);
+                result
+            }
+            #[cfg(unix)]
+            Self::Socket { reader, .. } => {
+                let mut reader = reader.lock().await;
+                read_executor_line(&mut *reader).await
+            }
+        }
+    }
+
+    fn take_reader(&mut self) -> Option<ExecutorReader> {
+        match self {
+            Self::Spawned(child) => child.stdout.take().map(ExecutorReader::Spawned),
+            #[cfg(unix)]
+            Self::Socket { reader, .. } => Some(ExecutorReader::Socket(reader.clone())),
+        }
+    }
+}
+
+async fn read_executor_line<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<String> {
+    let mut line = Vec::new();
+    loop {
+        let mut byte = [0; 1];
+        if reader.read(&mut byte).await? == 0 {
+            break;
+        }
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    String::from_utf8(line).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
 async fn start_executor(
     entry: &Path,
+    executor_socket: Option<&Path>,
     node_path: &Path,
     browsers_path: Option<&Path>,
     params: &LoginParams,
     credential: &ResolvedCredential,
-) -> Result<(String, String, Child), ErrorCode> {
+) -> Result<(String, String, ExecutorHandle), ErrorCode> {
     #[cfg(not(windows))]
     let _ = browsers_path;
+    #[cfg(windows)]
+    let _ = executor_socket;
     let mut command = Command::new(node_path);
     command
         .arg(entry)
@@ -1505,9 +1680,23 @@ async fn start_executor(
     if let Some(browsers_path) = browsers_path {
         command.env("PLAYWRIGHT_BROWSERS_PATH", browsers_path);
     }
-    let mut child = command.spawn().map_err(|_| ErrorCode::Internal)?;
+    #[cfg(unix)]
+    let mut executor = if let Some(socket) = executor_socket {
+        let stream = timeout(EXECUTOR_TIMEOUT, tokio::net::UnixStream::connect(socket))
+            .await
+            .map_err(|_| ErrorCode::Internal)?
+            .map_err(|_| ErrorCode::Internal)?;
+        let (reader, writer) = stream.into_split();
+        ExecutorHandle::Socket {
+            reader: Arc::new(Mutex::new(reader)),
+            writer,
+        }
+    } else {
+        ExecutorHandle::Spawned(command.spawn().map_err(|_| ErrorCode::Internal)?)
+    };
+    #[cfg(windows)]
+    let mut executor = ExecutorHandle::Spawned(command.spawn().map_err(|_| ErrorCode::Internal)?);
     let result = async {
-        let stdout = child.stdout.take().ok_or(ErrorCode::Internal)?;
         let totp = credential.totp_seed.as_ref().map(|seed| {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1529,15 +1718,11 @@ async fn start_executor(
         };
         let mut line = serde_json::to_vec(&request).map_err(|_| ErrorCode::Internal)?;
         line.push(b'\n');
-        let stdin = child.stdin.as_mut().ok_or(ErrorCode::Internal)?;
-        stdin
-            .write_all(&line)
+        executor
+            .write_line(&line)
             .await
             .map_err(|_| ErrorCode::Internal)?;
-        stdin.flush().await.map_err(|_| ErrorCode::Internal)?;
-        let mut reader = BufReader::new(stdout);
-        let mut response_line = String::new();
-        timeout(EXECUTOR_TIMEOUT, reader.read_line(&mut response_line))
+        let response_line = timeout(EXECUTOR_TIMEOUT, executor.read_line())
             .await
             .map_err(|_| ErrorCode::Internal)?
             .map_err(|_| ErrorCode::Internal)?;
@@ -1559,9 +1744,9 @@ async fn start_executor(
     }
     .await;
     match result {
-        Ok((endpoint, session_id)) => Ok((endpoint, session_id, child)),
+        Ok((endpoint, session_id)) => Ok((endpoint, session_id, executor)),
         Err(error) => {
-            stop_child(child).await;
+            stop_child(executor).await;
             Err(error)
         }
     }
@@ -1588,22 +1773,117 @@ fn parse_error_code(value: &str) -> ErrorCode {
     }
 }
 
-async fn shutdown_child(mut child: Child) {
-    if let Some(stdin) = child.stdin.as_mut() {
-        let mut line = b"{\"op\":\"shutdown\"}\n".to_vec();
-        let _ = stdin.write_all(&line).await;
-        let _ = stdin.flush().await;
-        line.fill(0);
-    }
-    if timeout(Duration::from_secs(1), child.wait()).await.is_err() {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
+async fn shutdown_child(mut executor: ExecutorHandle) {
+    let mut line = b"{\"op\":\"shutdown\"}\n".to_vec();
+    let _ = executor.write_line(&line).await;
+    line.fill(0);
+    match &mut executor {
+        ExecutorHandle::Spawned(child) => {
+            if timeout(Duration::from_secs(1), child.wait()).await.is_err() {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+        }
+        #[cfg(unix)]
+        ExecutorHandle::Socket { reader, .. } => {
+            if timeout(Duration::from_secs(1), wait_for_socket_eof(reader))
+                .await
+                .is_err()
+            {
+                eprintln!("executor did not exit within 1s after shutdown");
+            }
+        }
     }
 }
 
-async fn stop_child(mut child: Child) {
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+async fn stop_child(mut executor: ExecutorHandle) {
+    match &mut executor {
+        ExecutorHandle::Spawned(child) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        #[cfg(unix)]
+        ExecutorHandle::Socket { writer, .. } => {
+            let _ = writer.shutdown().await;
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_socket_eof(
+    reader: &Arc<Mutex<tokio::net::unix::OwnedReadHalf>>,
+) -> io::Result<()> {
+    let mut reader = reader.lock().await;
+    let mut buffer = [0; 1024];
+    loop {
+        if reader.read(&mut buffer).await? == 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn spawn_executor_reaper(state: SharedState, session_id: String, mut reader: ExecutorReader) {
+    tokio::spawn(async move {
+        let eof = match &mut reader {
+            ExecutorReader::Spawned(stdout) => {
+                let mut buffer = [0; 1024];
+                loop {
+                    match stdout.read(&mut buffer).await {
+                        Ok(0) => break true,
+                        Ok(_) => {}
+                        Err(_) => break false,
+                    }
+                }
+            }
+            #[cfg(unix)]
+            ExecutorReader::Socket(reader) => {
+                let mut stream = reader.lock().await;
+                let mut buffer = [0; 1024];
+                loop {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) => break true,
+                        Ok(_) => {}
+                        Err(_) => break false,
+                    }
+                }
+            }
+        };
+        if !eof {
+            return;
+        }
+        let session = {
+            let mut daemon = state.lock().await;
+            let session = daemon.sessions.remove(&session_id);
+            if session.is_some() {
+                let _ = daemon
+                    .cdp_ports
+                    .write()
+                    .map(|mut ports| ports.remove(&session_id));
+            }
+            session
+        };
+        let Some(session) = session else {
+            return;
+        };
+        drop(session.executor);
+        let daemon = state.lock().await;
+        if let Err(error) = append_audit(
+            &daemon,
+            AuditPeer::System,
+            "session_terminated".to_owned(),
+            AuditFields {
+                cred_id: None,
+                target_url: None,
+                session_id: Some(session_id),
+                namespace: Some(session.namespace),
+            },
+            "ok".to_owned(),
+        )
+        .await
+        {
+            eprintln!("tegatad: audit append failed: {error}");
+        }
+    });
 }
 
 #[cfg(unix)]

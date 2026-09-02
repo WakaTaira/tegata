@@ -19,6 +19,9 @@
 #   enable        : bool
 #   allowedUsers  : [str]  — rendered into allowed_uids peer-cred allowlist
 #   providers     : [attrset] — rendered into [[providers]] in the TOML config
+#   (executor)    : daemon config executor_socket = /run/tegata-executor/executor.sock;
+#                   the browser worker runs as user tegata-browser via the
+#                   tegata-executor.socket / tegata-executor@.service unit pair (AC-52)
 # The daemon config must land in /var/lib/tegata/config.toml (0600
 # tegata:tegata, NOT in the world-readable nix store), and the socket at
 # /run/tegata/tegatad.sock.
@@ -184,6 +187,48 @@ pkgs.testers.runNixOSTest {
         machine.succeed(
             "leakscan --canaries /root/canaries.json --json"
             " /home/agent /root/ps-samples.txt /tmp"
+        )
+
+    with subtest("AC-52a: the browser worker cannot read state via file://"):
+        # Given: the agent's E2E session (still alive within the TTL) probed
+        # a second CDP connection with Page.navigate to file:///var/lib/tegata/config.toml
+        # When: the navigation result and rendered body text are inspected
+        # Then: the navigation is denied and no canary leaked into the DOM
+        obs = json.loads(machine.succeed("cat /home/agent/obs.json"))
+        file_navigate = obs["fileNavigate"]
+        assert file_navigate["errorText"] == "net::ERR_ACCESS_DENIED", (
+            f"expected net::ERR_ACCESS_DENIED, got {file_navigate['errorText']!r}"
+        )
+        inner_text = file_navigate["innerText"] or ""
+        assert user_canary not in inner_text, "user canary leaked via file://"
+        assert pass_canary not in inner_text, "password canary leaked via file://"
+
+    with subtest("AC-52b: the browser worker cannot write into state via download"):
+        # Given: the same probe requested Browser.setDownloadBehavior for
+        # /var/lib/tegata and clicked an <a download> anchor
+        # When: the isolated state directory is checked for the dropped file
+        # Then: no such file exists
+        machine.fail("test -e /var/lib/tegata/ac52-write.txt")
+
+    with subtest("AC-52c: Chromium runs as the separate executor user"):
+        # Given: the AC-18 session is still within the daemon's TTL window
+        # When: the Chromium process owner is inspected
+        # Then: it is owned by the executor user, never by the daemon's own user
+        # Playwright's headless launch runs chrome-headless-shell, whose comm
+        # is truncated to 15 chars, so match on the full command line with -f.
+        machine.succeed("pgrep -u tegata-browser -f chrome-headless-shell")
+        machine.fail("pgrep -u tegata -f chrome-headless-shell")
+
+    with subtest("AC-52d: the daemon process holds no capabilities"):
+        # Given: the same AC-18 session
+        # When: the daemon process's /proc/<pid>/status CapEff is read
+        # Then: the value is 0000000000000000
+        # `-o` picks the oldest matching pid: systemd's cgroup can retain a
+        # short-lived control process under the same name during restarts,
+        # and the gauntlet must inspect the long-lived service process.
+        cap_eff = machine.succeed("grep CapEff /proc/$(pgrep -o -x tegatad)/status")
+        assert "0000000000000000" in cap_eff, (
+            f"expected CapEff 0000000000000000, got: {cap_eff!r}"
         )
   '';
 }

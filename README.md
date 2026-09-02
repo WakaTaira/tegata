@@ -108,8 +108,8 @@ Full threat model, invariants, and the operator hardening checklist:
 
 | Boundary | Platform | Mechanism | Peer authentication | Sealed storage | Status |
 | --- | --- | --- | --- | --- | --- |
-| systemd | Linux, WSL | Dedicated user + hardened systemd unit | UNIX socket, `SO_PEERCRED` | askpass at unlock | Implemented |
-| Windows service | Windows | Virtual service account `NT SERVICE\tegatad` | Named pipe + SID; loopback TCP + token for the WSL client | DPAPI | Implemented |
+| systemd | Linux, WSL | Dedicated user + hardened systemd unit; browser worker as a separate user via socket activation | UNIX socket, `SO_PEERCRED` | askpass at unlock | Implemented |
+| Windows service | Windows | Virtual service account `NT SERVICE\tegatad` (browser shares the service account) | Named pipe + SID; loopback TCP + token for the WSL client | DPAPI | Implemented |
 | Container | Containerized agents | Separate container, no shared volume | Socket + token | Secret mount | Not implemented |
 | Remote host | Any | Separate host or VM | mTLS / Tailscale identity | Server-side | Not implemented |
 

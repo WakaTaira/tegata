@@ -117,15 +117,17 @@ sideways into a place the agent can read.
 
 **Never in `argv`.** Process arguments are world-readable through `ps`. The
 credential reaches the executor as one JSON line on its stdin, and the Bitwarden
-CLI receives the master password through `--passwordfile` pointing at a file
-created inside a restricted directory, written mode 0600, and deleted as soon as
-the command returns. The plaintext buffer is zeroed after the write.
+CLI receives the master password only in the `bw` child process's environment,
+using `--passwordenv BW_PASSWORD`. The password value and session key are never
+placed in `argv`; `ps` can show only the variable name `BW_PASSWORD`, not its
+value.
 
-**Never in the environment.** `BW_PASSWORD` and any inherited `BW_SESSION` are
-explicitly removed from the environment of every child process the daemon spawns.
-The vault session token is passed only to the specific `bw` invocation that needs
-it. Nothing carrying a secret is exported into an environment the agent's uid can
-read via `/proc`.
+**Never in an environment the agent can observe.** `BW_PASSWORD` and `BW_SESSION`
+exist only in the environment of the specific `bw` child process that needs them;
+they are not present in the daemon, executor, or agent process environments. On
+Linux, another process's `/proc/<pid>/environ` is readable only by the same uid or
+root. The agent uses a different uid, and the browser worker uses the separate
+`tegata-browser` user, so neither can read those variables.
 
 **Never in a log or a formatted string.** Secrets are held in a `Secret` type
 whose `Debug` and `Display` implementations both render `***`, and which zeroes its
@@ -138,6 +140,13 @@ nothing else — no stack trace, no DOM fragment, no echo of what was typed into
 form. The acceptance suite drives both a wrong credential and a missing selector
 specifically to check that the error path leaks nothing the success path would not.
 
+**The browser worker is isolated too.** On Linux, socket activation starts the
+browser (executor) as a separate service under the `tegata-browser` user. The
+daemon is given no capability to change uid and does not switch users itself.
+The executor also has a defense-in-depth guard using CDP `Fetch.enable` that
+rejects navigation to `file://` URLs. On Windows, the browser continues to share
+the daemon's service account; user separation is not implemented there.
+
 ## Unlock
 
 Resolution happens behind the boundary, so the master password is the one value
@@ -148,10 +157,26 @@ session with the agent is not acceptable, however the prompt is drawn.
 
 Two modes are implemented:
 
-| Mode | Where the password comes from | Available on |
-| --- | --- | --- |
-| `askpass` | A command configured as `askpass_cmd`, run by the daemon, whose stdout the daemon reads. The daemon runs it with stdin closed and stderr discarded, in its own process group, and kills the whole group if it does not answer in time — a helper that spawns children cannot leave one orphaned holding a prompt. | Linux (the only mode), Windows (opt-in) |
-| `sealed` | A DPAPI blob unsealed by the daemon itself. Decryptable only by the same account on the same machine. | Windows (the default) |
+<table>
+<thead><tr><th>Mode</th><th>Where the password comes from</th><th>Available on</th></tr></thead>
+<tbody>
+<tr>
+<td><code>askpass</code></td>
+<td>A command configured as <code>askpass_cmd</code>, run by the daemon, whose
+stdout the daemon reads. The daemon runs it with stdin closed and stderr
+discarded, in its own process group, and kills the whole group if it does not
+answer in time — a helper that spawns children cannot leave one orphaned holding
+a prompt.</td>
+<td>Linux (the only mode), Windows (opt-in)</td>
+</tr>
+<tr>
+<td><code>sealed</code></td>
+<td>A DPAPI blob unsealed by the daemon itself. Decryptable only by the same
+account on the same machine.</td>
+<td>Windows (the default)</td>
+</tr>
+</tbody>
+</table>
 
 Windows defaults to `sealed` because the service runs in session 0 and cannot draw
 an interactive prompt. The password is sealed once by an elevated
@@ -264,7 +289,11 @@ Every RPC call appends one JSON line to the audit log, whether it succeeded or
 failed:
 
 ```json
-{"ts":"unix:1756512000","peer_uid":1000,"method":"login","cred_id":"vw:a1b2c3","target_url":"https://example.com/login","session_id":"3f2b1c9e-…","namespace":"vw","outcome":"ok"}
+{
+  "ts":"unix:1756512000","peer_uid":1000,"method":"login",
+  "cred_id":"vw:a1b2c3","target_url":"https://example.com/login",
+  "session_id":"3f2b1c9e-…","namespace":"vw","outcome":"ok"
+}
 ```
 
 `cred_id` is a reference, `target_url` is a destination, and `session_id` and
@@ -283,11 +312,24 @@ token-authenticated TCP client contributes `peer_token`.
 something an agent asked for, so three events carry `"peer_system": true` instead
 of a caller:
 
-| Event | When |
-| --- | --- |
-| `session_expired` | A browser session passed its TTL and was reaped |
-| `vault_autolocked` | A provider's unlock TTL lapsed and it locked itself |
-| `session_terminated` | `lock_vault` tore down a live session in that namespace, or the daemon reaped one while shutting down |
+<table>
+<thead><tr><th>Event</th><th>When</th></tr></thead>
+<tbody>
+<tr>
+<td><code>session_expired</code></td>
+<td>A browser session passed its TTL and was reaped</td>
+</tr>
+<tr>
+<td><code>vault_autolocked</code></td>
+<td>A provider's unlock TTL lapsed and it locked itself</td>
+</tr>
+<tr>
+<td><code>session_terminated</code></td>
+<td><code>lock_vault</code> tore down a live session in that namespace, or the
+daemon reaped one while shutting down</td>
+</tr>
+</tbody>
+</table>
 
 Without these, the log would show a session being created and never show it
 ending, which is exactly the gap an investigation needs closed.
@@ -329,6 +371,19 @@ modify the daemon's code or configuration, it can replace the boundary with
 something that has none. The daemon's binary and configuration must live where the
 agent's user cannot write.
 
+**Windows retains a browser-worker risk.** During unlock, the master password is
+present in the `bw` child process's `BW_PASSWORD` environment variable. On Windows,
+another process's environment block can be read only through debugging APIs, and a
+browser `file://` page cannot read it. The browser nevertheless shares the
+daemon's service account and can read and write the state directory, including
+configuration, token hashes, and appdata. This separation is planned for a later
+release.
+
+**The CDP port has a short connection window.** Between browser launch and the
+executor's guard attaching to CDP, another uid on the same host can connect to
+the loopback CDP port. This is a limitation of the port-based design; network
+namespace isolation is planned for a later release.
+
 ## Operator checklist
 
 The guarantees above assume the deployment is set up correctly. Verify each of
@@ -352,6 +407,8 @@ these.
 - [ ] No real credential exists in any development, test, or acceptance
       environment. Canaries only.
 - [ ] The audit log is collected somewhere the agent cannot rewrite it.
+- [ ] On Linux, `executor_socket` is configured. Non-Nix deployments install both
+      `tegata-executor.socket` and `tegata-executor@.service`.
 
 ## Reporting a vulnerability
 

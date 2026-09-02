@@ -2,6 +2,7 @@
 { config, lib, pkgs, ... }:
 let
   cfg = config.services.tegata;
+  effectiveExecutorEntry = if cfg.executorEntry != null then cfg.executorEntry else executorEntry;
 
   tomlValue = value:
     if builtins.isString value then builtins.toJSON value
@@ -31,6 +32,7 @@ let
 
   baseConfig = {
     socket_path = "/run/tegata/tegatad.sock";
+    executor_socket = "/run/tegata-executor/executor.sock";
     state_dir = "/var/lib/tegata";
     audit_log_path = "/var/lib/tegata/audit.log";
   } // lib.optionalAttrs (cfg.executorEntry != null) {
@@ -158,9 +160,14 @@ in
 
   config = lib.mkIf cfg.enable {
     users.groups.tegata = {};
+    users.groups.tegata-browser = {};
     users.users.tegata = {
       isSystemUser = true;
       group = "tegata";
+    };
+    users.users.tegata-browser = {
+      isSystemUser = true;
+      group = "tegata-browser";
     };
 
     environment.systemPackages = [ bitwardenCliPackage ];
@@ -168,6 +175,7 @@ in
     systemd.tmpfiles.rules = [
       "d /var/lib/tegata 0700 tegata tegata -"
       "d /run/tegata 0755 tegata tegata -"
+      "d /run/tegata-executor 0755 root root -"
     ];
 
     systemd.sockets.tegata = {
@@ -181,11 +189,50 @@ in
       };
     };
 
+    systemd.sockets.tegata-executor = {
+      description = "Tegata executor socket";
+      wantedBy = [ "sockets.target" ];
+      listenStreams = [ "/run/tegata-executor/executor.sock" ];
+      socketConfig = {
+        Accept = true;
+        SocketUser = "tegata";
+        SocketGroup = "tegata";
+        SocketMode = "0600";
+        MaxConnections = 16;
+      };
+    };
+
+    systemd.services."tegata-executor@" = {
+      description = "Tegata executor";
+      serviceConfig = {
+        User = "tegata-browser";
+        Group = "tegata-browser";
+        ExecStart = "${pkgs.nodejs}/bin/node ${effectiveExecutorEntry}";
+        UMask = "0077";
+        StandardInput = "socket";
+        StandardOutput = "socket";
+        StandardError = "journal";
+        Environment = [ "PLAYWRIGHT_BROWSERS_PATH=${playwrightBrowsersPackage}" ];
+        ProtectSystem = "strict";
+        ProtectHome = true;
+        PrivateTmp = true;
+        NoNewPrivileges = true;
+        ProtectKernelTunables = true;
+        ProtectKernelModules = true;
+        ProtectControlGroups = true;
+        RestrictSUIDSGID = true;
+        RestrictRealtime = true;
+        LockPersonality = true;
+        CapabilityBoundingSet = "";
+        RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
+      };
+    };
+
     systemd.services.tegata = {
       description = "Tegata credential isolation daemon";
       wantedBy = [ "multi-user.target" ];
-      requires = [ "tegata.socket" ];
-      after = [ "network.target" "tegata.socket" ];
+      requires = [ "tegata.socket" "tegata-executor.socket" ];
+      after = [ "network.target" "tegata.socket" "tegata-executor.socket" ];
       # sh is needed because frozen tegatad code shells out via Command::new("sh");
       # /bin/sh is provided by NixOS, but this unit's path list replaces PATH entirely.
       path = [ pkgs.coreutils pkgs.nodejs pkgs.bash bitwardenCliPackage ];

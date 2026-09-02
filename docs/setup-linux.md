@@ -105,7 +105,8 @@ Install the browsers with the version pinned in
 `packages/tegata-executor/package.json`:
 
 ```sh
-npx playwright-core@1.61.1 install chromium
+sudo install -d -o root -g root -m 0755 /opt/tegata/browsers
+sudo env PLAYWRIGHT_BROWSERS_PATH=/opt/tegata/browsers npx playwright-core@1.61.1 install chromium
 ```
 
 Run the daemon as a dedicated user with a systemd unit of your own:
@@ -138,6 +139,65 @@ With a matching socket unit listening on `/run/tegata/tegatad.sock`, the daemon
 inherits the socket through socket activation. Without one, it binds the path
 itself.
 
+Create the dedicated browser user:
+
+```sh
+sudo useradd --system tegata-browser
+```
+
+Install the browser worker units. The executor entry point and browser path below
+match the checkout layout described above; adjust them when using a release
+bundle or another installation prefix.
+
+`/etc/systemd/system/tegata-executor.socket`:
+
+```ini
+[Unit]
+Description=tegata executor socket
+
+[Socket]
+ListenStream=/run/tegata-executor/executor.sock
+Accept=yes
+SocketUser=tegata
+SocketGroup=tegata
+SocketMode=0600
+MaxConnections=16
+
+[Install]
+WantedBy=sockets.target
+```
+
+`/etc/systemd/system/tegata-executor@.service`:
+
+```ini
+[Unit]
+Description=tegata browser executor
+
+[Service]
+Type=simple
+User=tegata-browser
+Group=tegata-browser
+ExecStart=/usr/bin/node /opt/tegata/packages/tegata-executor/dist/index.js
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/tegata/browsers
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+```
+
+The earlier command installs the Chromium revision into the world-readable
+`/opt/tegata/browsers` directory; enable the socket with:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now tegata-executor.socket
+```
+
 Requirements on the host: Node.js for the executor, and the Bitwarden CLI on
 `PATH` if a `bitwarden-cli` provider is configured — 2025.12.1 or newer. Earlier
 releases can lose the session-key persistence race on login; the daemon verifies
@@ -147,8 +207,7 @@ certificate comes from a private CA, add `Environment=NODE_EXTRA_CA_CERTS=…` t
 the unit and the daemon passes it on to bw. The executor finds the browsers
 through `PLAYWRIGHT_BROWSERS_PATH`; the install above lands them in the cache of
 whoever ran it, so either install them as the daemon's user or set
-`Environment=PLAYWRIGHT_BROWSERS_PATH=…` in the unit to a directory that user
-can read.
+`Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/tegata/browsers` in the unit.
 
 Set up the accounts and permissions to match the
 [operator checklist](security.md#operator-checklist) — in particular, the agent's
@@ -162,6 +221,7 @@ daemon's user and mode 0600.
 
 ```toml
 socket_path    = "/run/tegata/tegatad.sock"
+executor_socket = "/run/tegata-executor/executor.sock"
 state_dir      = "/var/lib/tegata"
 audit_log_path = "/var/lib/tegata/audit.log"
 allowed_uids   = [1000]
@@ -191,6 +251,7 @@ session_ttl_secs = 900
 | `approve_cmd` | string | no | Command that must approve each `login`. Unset means no approval gate |
 | `approve_timeout_secs` | integer | no | How long to wait for that command; default `60` |
 | `executor_entry` | string | no | Path to the executor's `index.js`. May also come from `TEGATA_EXECUTOR_ENTRY` |
+| `executor_socket` | string | no | Path to the UNIX domain socket. When set, the daemon communicates with an executor in another process over this socket; when `None`, the daemon spawns the executor as before |
 
 ### `[[providers]]`
 
@@ -368,9 +429,10 @@ vault's own at-rest encryption for an OS permission boundary. Prefer an
 interactive prompt unless the deployment truly needs to survive reboots
 unattended.
 
-The password is never passed to `bw` on a command line. The daemon writes it to a
-private file inside the state directory, hands `bw` a `--passwordfile` path, and
-deletes the file as soon as the command returns.
+The password is never passed to `bw` on a command line. The daemon passes it to
+the `bw` child process through `BW_PASSWORD` and invokes `bw` with
+`--passwordenv BW_PASSWORD`. The variable exists only in that child process's
+environment; `ps` can show only the variable name, not the value.
 
 The command runs on the first call that needs a credential value, and again
 whenever the vault session has gone — after the TTL expires, after `lock_vault`,

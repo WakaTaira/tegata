@@ -225,16 +225,10 @@ Provider tables use the same keys as on Linux; see
 [setup-linux.md](setup-linux.md#providers). `totp_exposable` matches the entry's
 **name**.
 
-Two of the three backends work here. `bitwarden-cli` and `age-file` are
-cross-platform; `pass` is UNIX-only, and a Windows configuration containing one is
-refused at startup with an explicit error rather than ignored.
-
-The mode-0600 check on an `age-file` identity is UNIX-only, so on Windows nothing
-verifies that file for you. Put the entries file and the identity inside the
-daemon's state directory, which `service install` gives a protected DACL naming
-only the service account and `SYSTEM`; a copy left anywhere else keeps whatever
-permissions it was created with, and an identity readable by an interactive
-account is the whole vault readable by that account.
+Only `bitwarden-cli` is supported on Windows. `pass` is UNIX-only, and `age-file`
+is refused because the browser shares the daemon's service account and could read
+the identity file containing the private key. A Windows configuration containing
+either provider is refused at startup with an explicit error rather than ignored.
 
 ## WSL client
 

@@ -11,7 +11,6 @@ use tegata_core::Secret;
 
 use crate::ErrorCode;
 
-pub(crate) use bitwarden::remove_password_file;
 pub(crate) use bitwarden::{BitwardenCliConfig, BitwardenCliProvider};
 pub(crate) use file::{FileProvider, FileProviderConfig};
 #[cfg(unix)]

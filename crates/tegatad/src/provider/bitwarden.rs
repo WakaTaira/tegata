@@ -4,10 +4,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tegata_core::Secret;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::{Instant, timeout};
-use uuid::Uuid;
 
 use super::{CredentialProvider, CredentialRef, ProviderFuture, ResolvedCredential};
 use crate::ErrorCode;
@@ -21,7 +20,6 @@ pub(crate) struct BitwardenCliProvider {
     email: String,
     askpass_cmd: String,
     appdata_dir: PathBuf,
-    password_dir: PathBuf,
     bw_path: Option<PathBuf>,
     totp_exposable: Vec<String>,
     session_ttl: Duration,
@@ -41,7 +39,6 @@ pub(crate) struct BitwardenCliConfig {
     pub(crate) email: String,
     pub(crate) askpass_cmd: String,
     pub(crate) appdata_dir: PathBuf,
-    pub(crate) password_dir: PathBuf,
     pub(crate) bw_path: Option<PathBuf>,
     pub(crate) totp_exposable: Vec<String>,
     pub(crate) session_ttl: Duration,
@@ -90,7 +87,6 @@ struct BwOutput {
 #[derive(Debug)]
 enum BwRunError {
     CreateDir(io::Error),
-    PasswordFile(io::Error),
     Process(io::Error, Vec<u8>),
     NonZeroExit(std::process::ExitStatus, Vec<u8>),
     Timeout(Vec<u8>),
@@ -101,9 +97,6 @@ impl fmt::Display for BwRunError {
         match self {
             Self::CreateDir(error) => {
                 write!(formatter, "could not create appdata directory: {error}")
-            }
-            Self::PasswordFile(error) => {
-                write!(formatter, "could not prepare password file: {error}")
             }
             Self::Process(error, _) => write!(formatter, "could not run bw: {error}"),
             Self::NonZeroExit(status, _) => write!(
@@ -123,7 +116,7 @@ impl std::error::Error for BwRunError {}
 impl BwRunError {
     fn stderr(&self) -> &[u8] {
         match self {
-            Self::CreateDir(_) | Self::PasswordFile(_) => &[],
+            Self::CreateDir(_) => &[],
             Self::Process(_, stderr) | Self::NonZeroExit(_, stderr) | Self::Timeout(stderr) => {
                 stderr
             }
@@ -158,7 +151,6 @@ impl BitwardenCliProvider {
             email: config.email,
             askpass_cmd: config.askpass_cmd,
             appdata_dir: config.appdata_dir,
-            password_dir: config.password_dir,
             bw_path: config.bw_path,
             totp_exposable: config.totp_exposable,
             session_ttl: config.session_ttl,
@@ -183,45 +175,10 @@ impl BitwardenCliProvider {
         tokio::fs::create_dir_all(&self.appdata_dir)
             .await
             .map_err(BwRunError::CreateDir)?;
-        tokio::fs::create_dir_all(&self.password_dir)
-            .await
-            .map_err(BwRunError::CreateDir)?;
-        crate::secure_fs::restrict_directory(&self.password_dir)
-            .await
-            .map_err(BwRunError::CreateDir)?;
-        let password_file = if let Some(password) = password {
-            let path = self
-                .password_dir
-                .join(format!(".bw-password-{}", Uuid::new_v4()));
-            let guard = PasswordFileGuard::new(path.clone());
-            let mut file = match crate::secure_fs::create_private_file(&path).await {
-                Ok(file) => file,
-                Err(error) => {
-                    drop(guard);
-                    return Err(BwRunError::PasswordFile(error));
-                }
-            };
-            let mut bytes = password.as_str().as_bytes().to_vec();
-            let write_result = file.write_all(&bytes).await;
-            let write_result = match write_result {
-                Ok(()) => file.flush().await,
-                Err(error) => Err(error),
-            };
-            bytes.fill(0);
-            if let Err(error) = write_result {
-                drop(file);
-                remove_password_file(&path).await;
-                return Err(BwRunError::PasswordFile(error));
-            }
-            drop(file);
-            Some((path, guard))
-        } else {
-            None
-        };
         let mut command_args = args.to_vec();
-        if let Some((path, _)) = &password_file {
-            command_args.push("--passwordfile".to_owned());
-            command_args.push(path.to_string_lossy().into_owned());
+        if password.is_some() {
+            command_args.push("--passwordenv".to_owned());
+            command_args.push("BW_PASSWORD".to_owned());
         }
         let bw_path = self.bw_path.as_deref().unwrap_or_else(|| Path::new("bw"));
         let mut command = Command::new(bw_path);
@@ -237,7 +194,10 @@ impl BitwardenCliProvider {
         if let Some(session) = session {
             command.env("BW_SESSION", session.as_str());
         }
-        let result = match command.spawn() {
+        if let Some(password) = password {
+            command.env("BW_PASSWORD", password.as_str());
+        }
+        match command.spawn() {
             Ok(mut child) => match (child.stdout.take(), child.stderr.take()) {
                 (Some(mut stdout), Some(mut stderr)) => {
                     let mut stdout_output = Vec::new();
@@ -309,11 +269,7 @@ impl BitwardenCliProvider {
                 }
             },
             Err(error) => Err(BwRunError::Process(error, Vec::new())),
-        };
-        if let Some((path, _)) = password_file {
-            remove_password_file(&path).await;
         }
-        result
     }
 
     async fn run_askpass(&self) -> Result<Secret, ErrorCode> {
@@ -711,58 +667,4 @@ impl CredentialProvider for BitwardenCliProvider {
     fn take_autolock_event(&mut self) -> bool {
         std::mem::take(&mut self.autolock_event_pending)
     }
-}
-
-struct PasswordFileGuard {
-    path: Option<PathBuf>,
-}
-
-impl PasswordFileGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
-    }
-}
-
-impl Drop for PasswordFileGuard {
-    fn drop(&mut self) {
-        if let Some(path) = self.path.take() {
-            remove_password_file_sync(&path);
-        }
-    }
-}
-
-fn remove_password_file_sync(path: &Path) {
-    if let Ok(metadata) = std::fs::metadata(path)
-        && let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(path)
-    {
-        let mut remaining = metadata.len();
-        let zeros = [0_u8; 8192];
-        while remaining > 0 {
-            let count = remaining.min(zeros.len() as u64) as usize;
-            if std::io::Write::write_all(&mut file, &zeros[..count]).is_err() {
-                break;
-            }
-            remaining -= count as u64;
-        }
-        let _ = std::io::Write::flush(&mut file);
-    }
-    let _ = std::fs::remove_file(path);
-}
-
-pub(crate) async fn remove_password_file(path: &Path) {
-    if let Ok(metadata) = tokio::fs::metadata(path).await
-        && let Ok(mut file) = tokio::fs::OpenOptions::new().write(true).open(path).await
-    {
-        let mut remaining = metadata.len();
-        let zeros = [0_u8; 8192];
-        while remaining > 0 {
-            let count = remaining.min(zeros.len() as u64) as usize;
-            if file.write_all(&zeros[..count]).await.is_err() {
-                break;
-            }
-            remaining -= count as u64;
-        }
-        let _ = file.flush().await;
-    }
-    let _ = tokio::fs::remove_file(path).await;
 }

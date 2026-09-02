@@ -46,6 +46,18 @@ pub struct LoginStep {
     pub value: Option<String>,
 }
 
+#[derive(Serialize)]
+pub struct ExecutorHelloRequest {
+    pub op: &'static str,
+}
+
+#[derive(Deserialize)]
+pub struct ExecutorHelloResponse {
+    pub ok: bool,
+    pub uid: Option<u32>,
+    pub pid: u32,
+}
+
 /// Login request written as one JSON line to the executor sidecar.
 ///
 /// The sidecar is started as `node <executor_entry>` and receives secrets only

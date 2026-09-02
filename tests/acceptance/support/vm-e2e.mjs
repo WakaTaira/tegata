@@ -1,5 +1,7 @@
 // Full agent-side E2E for the NixOS VM boundary test (AC-18): catalog →
 // login → raw-CDP DOM check, recording everything the agent observed.
+// Also probes the file:// navigation guard and the download write path
+// (AC-52a/AC-52b) over a second CDP connection to the same session.
 // Owned by the acceptance suite (gauntlet); do not modify during
 // implementation.
 //
@@ -52,10 +54,14 @@ function rpc(method, params) {
   });
 }
 
-/** Attach to the fixture page over raw CDP and evaluate two expressions. */
-async function inspectSession(endpoint) {
+/**
+ * Open a raw CDP websocket connection and return its send()/close() helpers.
+ * Factored out of inspectSession() so AC-52's separate probe connection can
+ * share the same request/response plumbing.
+ */
+function connectCdp(endpoint) {
   const ws = new WebSocket(endpoint);
-  await new Promise((resolve, reject) => {
+  const opened = new Promise((resolve, reject) => {
     ws.onopen = resolve;
     ws.onerror = () => reject(new Error("CDP websocket failed to open"));
   });
@@ -78,6 +84,92 @@ async function inspectSession(endpoint) {
       );
       ws.send(JSON.stringify({ id, method, params, sessionId }));
     });
+  return { ws, opened, send };
+}
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * AC-52a/AC-52b: opens a second, independent CDP connection to the same
+ * browser-level endpoint the agent used to log in, and probes the file://
+ * navigation guard and the download write path. Failures are recorded into
+ * the returned observation rather than thrown, since ahead of the fix this
+ * probe is expected to succeed at reading/writing state (red).
+ */
+async function probeFileGuard(endpoint) {
+  const { ws, opened, send } = connectCdp(endpoint);
+  await opened;
+  const observation = { fileNavigate: {}, download: {} };
+  try {
+    const { browserContextId } = await send("Target.createBrowserContext", {});
+    const { targetId } = await send("Target.createTarget", {
+      url: "about:blank",
+      browserContextId,
+    });
+    const { sessionId } = await send("Target.attachToTarget", {
+      targetId,
+      flatten: true,
+    });
+    await send("Page.enable", {}, sessionId);
+
+    const navigate = await send(
+      "Page.navigate",
+      { url: "file:///var/lib/tegata/config.toml" },
+      sessionId,
+    );
+    observation.fileNavigate.errorText = navigate.errorText ?? null;
+    await wait(1500);
+    const innerText = await send(
+      "Runtime.evaluate",
+      {
+        expression: "document.body ? document.body.innerText : ''",
+        returnByValue: true,
+      },
+      sessionId,
+    );
+    observation.fileNavigate.innerText = innerText.result.value;
+
+    try {
+      // Browser-level command: no sessionId.
+      await send("Browser.setDownloadBehavior", {
+        behavior: "allow",
+        downloadPath: "/var/lib/tegata",
+      });
+    } catch (err) {
+      observation.download.error = err.message;
+    }
+
+    // file:// left the page without a body in some Chromium builds; return
+    // to about:blank and confirm document.body exists before clicking.
+    await send("Page.navigate", { url: "about:blank" }, sessionId);
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const bodyReady = await send(
+        "Runtime.evaluate",
+        { expression: "document.body !== null", returnByValue: true },
+        sessionId,
+      );
+      if (bodyReady.result.value) break;
+      await wait(100);
+    }
+    await send(
+      "Runtime.evaluate",
+      {
+        expression:
+          "const a = document.createElement('a'); a.download = 'ac52-write.txt'; a.href = 'data:text/plain,ac52'; document.body.appendChild(a); a.click();",
+      },
+      sessionId,
+    );
+    await wait(2000);
+  } finally {
+    ws.close();
+  }
+  return observation;
+}
+
+/** Attach to the fixture page over raw CDP and evaluate two expressions. */
+async function inspectSession(endpoint) {
+  const { ws, opened, send } = connectCdp(endpoint);
+  await opened;
 
   const { targetInfos } = await send("Target.getTargets", {});
   const page = targetInfos.find(
@@ -130,6 +222,13 @@ observations.login = login;
 const session = await inspectSession(login.channel.endpoint);
 observations.dom = session.dom;
 observations.hasWelcome = session.hasWelcome;
+
+// AC-52a/AC-52b: probe the file:// guard and the download write path over a
+// second connection to the same browser endpoint, while the session is
+// still alive.
+const guardProbe = await probeFileGuard(login.channel.endpoint);
+observations.fileNavigate = guardProbe.fileNavigate;
+observations.download = guardProbe.download;
 
 fs.writeFileSync(outPath, JSON.stringify(observations, null, 2));
 process.exit(session.hasWelcome ? 0 : 2);

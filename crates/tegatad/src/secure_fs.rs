@@ -11,20 +11,6 @@ use std::path::Path;
 
 use tokio::fs::File;
 
-/// Restricts a directory to the account that runs the daemon.
-pub(crate) async fn restrict_directory(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await
-    }
-    #[cfg(not(unix))]
-    {
-        restrict_directory_sync(path)
-    }
-}
-
 /// Creates a file readable only by the account that runs the daemon, failing
 /// if the path already exists.
 pub(crate) async fn create_private_file(path: &Path) -> io::Result<File> {
@@ -57,11 +43,6 @@ pub(crate) const SDDL_SYSTEM: &str = "SY";
 #[cfg(windows)]
 pub(crate) fn daemon_principals() -> io::Result<Vec<String>> {
     Ok(vec![current_user_sid()?, SDDL_SYSTEM.to_owned()])
-}
-
-#[cfg(windows)]
-pub(crate) fn restrict_directory_sync(path: &Path) -> io::Result<()> {
-    restrict_path(path, true, &daemon_principals()?)
 }
 
 #[cfg(windows)]

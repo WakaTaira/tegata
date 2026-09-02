@@ -59,6 +59,50 @@ interface PsSample {
   stdout: string;
 }
 
+// Latency-bound file systems such as 9P (/mnt/c) take tens of seconds to scan
+// thousands of files with sequential lstat calls, so the snapshot traversal
+// runs its fs calls in parallel, bounded by this many in flight.
+const SNAPSHOT_CONCURRENCY = 64;
+
+class Semaphore {
+  private active = 0;
+  private readonly waiters: Array<() => void> = [];
+
+  async run<T>(operation: () => Promise<T>): Promise<T> {
+    await this.acquire();
+    try {
+      return await operation();
+    } finally {
+      this.release();
+    }
+  }
+
+  private acquire(): Promise<void> {
+    if (this.active < SNAPSHOT_CONCURRENCY) {
+      this.active += 1;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      this.waiters.push(() => {
+        this.active += 1;
+        resolve();
+      });
+    });
+  }
+
+  private release(): void {
+    const waiter = this.waiters.shift();
+    if (waiter === undefined) {
+      this.active -= 1;
+      return;
+    }
+    this.active -= 1;
+    waiter();
+  }
+}
+
+const snapshotSemaphore = new Semaphore();
+
 function formatPsSamplerError(command: string, error: unknown): string {
   const errorObject =
     typeof error === "object" && error !== null
@@ -76,16 +120,17 @@ function formatPsSamplerError(command: string, error: unknown): string {
   return `${command}: failed to start`;
 }
 
-function snapshotFiles(
+async function snapshotFiles(
   roots: string[],
   observationErrors: string[] = [],
-): Map<string, FileSnapshot> {
+): Promise<Map<string, FileSnapshot>> {
   const snapshot = new Map<string, FileSnapshot>();
 
-  for (const root of roots) {
-    addFilesToSnapshot(path.resolve(root), snapshot, observationErrors, true);
-  }
-
+  await Promise.all(
+    roots.map((root) =>
+      addFilesToSnapshot(path.resolve(root), snapshot, observationErrors, true),
+    ),
+  );
   return snapshot;
 }
 
@@ -108,14 +153,16 @@ function isIgnorableEnvironError(error: unknown): boolean {
   );
 }
 
-function addFilesToSnapshot(
+async function addFilesToSnapshot(
   directory: string,
   snapshot: Map<string, FileSnapshot>,
   observationErrors: string[] = [],
   isWatchedRoot = false,
-): void {
+): Promise<void> {
+  let stats: fs.Stats;
   try {
-    if (!fs.lstatSync(directory).isDirectory()) {
+    stats = await snapshotSemaphore.run(() => fs.promises.lstat(directory));
+    if (!stats.isDirectory()) {
       return;
     }
   } catch (error) {
@@ -127,7 +174,9 @@ function addFilesToSnapshot(
 
   let entries: fs.Dirent[];
   try {
-    entries = fs.readdirSync(directory, { withFileTypes: true });
+    entries = await snapshotSemaphore.run(() =>
+      fs.promises.readdir(directory, { withFileTypes: true }),
+    );
   } catch (error) {
     if (isWatchedRoot || !isIgnorableFsError(error)) {
       observationErrors.push(`readdir ${directory}: ${String(error)}`);
@@ -135,38 +184,42 @@ function addFilesToSnapshot(
     return;
   }
 
-  for (const entry of entries) {
-    const entryPath = path.join(directory, entry.name);
-    if (entry.isSymbolicLink()) {
-      continue;
-    }
-
-    if (entry.isDirectory()) {
-      addFilesToSnapshot(entryPath, snapshot, observationErrors);
-      continue;
-    }
-
-    if (!entry.isFile()) {
-      continue;
-    }
-
-    try {
-      const stats = fs.lstatSync(entryPath);
-      snapshot.set(entryPath, { size: stats.size, mtimeMs: stats.mtimeMs });
-    } catch (error) {
-      if (!isIgnorableFsError(error)) {
-        observationErrors.push(`lstat ${entryPath}: ${String(error)}`);
+  await Promise.all(
+    entries.map(async (entry) => {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isSymbolicLink()) {
+        return;
       }
-    }
-  }
+
+      if (entry.isDirectory()) {
+        await addFilesToSnapshot(entryPath, snapshot, observationErrors);
+        return;
+      }
+
+      if (!entry.isFile()) {
+        return;
+      }
+
+      try {
+        const stats = await snapshotSemaphore.run(() =>
+          fs.promises.lstat(entryPath),
+        );
+        snapshot.set(entryPath, { size: stats.size, mtimeMs: stats.mtimeMs });
+      } catch (error) {
+        if (!isIgnorableFsError(error)) {
+          observationErrors.push(`lstat ${entryPath}: ${String(error)}`);
+        }
+      }
+    }),
+  );
 }
 
-function changedFiles(
+async function changedFiles(
   roots: string[],
   initialSnapshot: Map<string, FileSnapshot>,
   observationErrors: string[],
-): string[] {
-  const currentSnapshot = snapshotFiles(roots, observationErrors);
+): Promise<string[]> {
+  const currentSnapshot = await snapshotFiles(roots, observationErrors);
   const changed: string[] = [];
 
   for (const [filePath, current] of currentSnapshot) {
@@ -180,6 +233,7 @@ function changedFiles(
     }
   }
 
+  changed.sort();
   return changed;
 }
 
@@ -228,7 +282,7 @@ export async function createLeakGuard(
   const observed: ObservedValue[] = [];
   const psSamples: PsSample[] = [];
   const observationErrors: string[] = [];
-  const initialSnapshot = snapshotFiles(
+  const initialSnapshot = await snapshotFiles(
     opts.agentVisibleRoots,
     observationErrors,
   );
@@ -406,10 +460,12 @@ export async function createLeakGuard(
     ]);
     const fsTargets: ScanTarget[] = [];
     await Promise.all(
-      changedFiles(
-        opts.agentVisibleRoots,
-        initialSnapshot,
-        observationErrors,
+      (
+        await changedFiles(
+          opts.agentVisibleRoots,
+          initialSnapshot,
+          observationErrors,
+        )
       ).map(async (filePath, index) => {
         const targetPath = path.join(fsDir, `${index}`);
         try {

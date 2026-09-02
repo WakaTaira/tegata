@@ -55,6 +55,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { once } from "node:events";
 import fs from "node:fs";
+import https from "node:https";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -90,11 +91,18 @@ export interface RigEnv {
   vaultPort: number;
   vaultEmail: string;
   masterPasswordFile: string;
+  /** The throwaway vault's certificate (PEM); the service trusts it too. */
+  vaultCert: string;
+  /** The private key matching vaultCert (PEM, 0600). */
+  vaultKey: string;
   provisionEntry: string;
 }
 
 export function rigEnv(): RigEnv {
   const home = os.homedir();
+  const vaultTlsDir =
+    process.env.TEGATA_TEST_VAULT_TLS_DIR ??
+    path.join(home, ".config/tegata/test-vault-tls");
   return {
     bridgeBin:
       process.env.TEGATA_BRIDGE_BIN ??
@@ -116,6 +124,8 @@ export function rigEnv(): RigEnv {
     masterPasswordFile:
       process.env.TEGATA_TEST_MASTER_PASSWORD_FILE ??
       path.join(home, ".config/tegata/test-master-password"),
+    vaultCert: path.join(vaultTlsDir, "cert.pem"),
+    vaultKey: path.join(vaultTlsDir, "key.pem"),
     provisionEntry:
       process.env.PROVISION_TEST_VAULT_ENTRY ??
       path.join(REPO_ROOT, "packages/provision-test-vault/dist/index.js"),
@@ -141,6 +151,10 @@ export function requireRig(): RigEnv {
     missing.push(
       `${rig.masterPasswordFile} (TEGATA_TEST_MASTER_PASSWORD_FILE)`,
     );
+  if (!fs.existsSync(rig.vaultCert))
+    missing.push(`${rig.vaultCert} (TEGATA_TEST_VAULT_TLS_DIR)`);
+  if (!fs.existsSync(rig.vaultKey))
+    missing.push(`${rig.vaultKey} (TEGATA_TEST_VAULT_TLS_DIR)`);
   if (!fs.existsSync(rig.bridgeBin))
     missing.push(`${rig.bridgeBin} (TEGATA_BRIDGE_BIN)`);
   if (missing.length > 0) {
@@ -412,10 +426,32 @@ export interface TestVault {
   stop(): Promise<void>;
 }
 
+/** Probe the throwaway vault over TLS, trusting only the rig certificate. */
+function vaultAlive(rig: RigEnv): Promise<boolean> {
+  return new Promise((resolve) => {
+    const req = https.request(
+      {
+        host: "127.0.0.1",
+        port: rig.vaultPort,
+        path: "/alive",
+        ca: fs.readFileSync(rig.vaultCert),
+      },
+      (res) => {
+        res.resume();
+        resolve(res.statusCode === 200);
+      },
+    );
+    req.once("error", () => resolve(false));
+    req.end();
+  });
+}
+
 /**
- * Start a throwaway vaultwarden inside WSL on the FIXED rig port. The Windows
- * service's provider config points at http://localhost:<port>, which reaches
- * this instance through WSL localhost forwarding.
+ * Start a throwaway vaultwarden inside WSL on the FIXED rig port, serving TLS
+ * with the rig certificate (bw refuses plain-http servers since 2025.10). The
+ * Windows service's provider config points at https://localhost:<port>, which
+ * reaches this instance through WSL localhost forwarding; the service trusts
+ * the same certificate through NODE_EXTRA_CA_CERTS.
  */
 export async function startVaultwarden(): Promise<TestVault> {
   const rig = rigEnv();
@@ -425,10 +461,11 @@ export async function startVaultwarden(): Promise<TestVault> {
       ...process.env,
       ROCKET_ADDRESS: "127.0.0.1",
       ROCKET_PORT: String(rig.vaultPort),
+      ROCKET_TLS: `{certs="${rig.vaultCert}",key="${rig.vaultKey}"}`,
       SIGNUPS_ALLOWED: "true",
       WEB_VAULT_ENABLED: "false",
       DATA_FOLDER: dataDir,
-      DOMAIN: `http://localhost:${rig.vaultPort}`,
+      DOMAIN: `https://localhost:${rig.vaultPort}`,
     },
     stdio: ["ignore", "ignore", "inherit"],
   });
@@ -437,17 +474,7 @@ export async function startVaultwarden(): Promise<TestVault> {
       reject(new Error(`vaultwarden exited early (code ${code})`)),
     );
   });
-  await Promise.race([
-    waitFor("vaultwarden", async () => {
-      try {
-        const res = await fetch(`http://127.0.0.1:${rig.vaultPort}/alive`);
-        return res.ok;
-      } catch {
-        return false;
-      }
-    }),
-    exited,
-  ]);
+  await Promise.race([waitFor("vaultwarden", () => vaultAlive(rig)), exited]);
   child.removeAllListeners("exit");
   return {
     port: rig.vaultPort,
@@ -478,13 +505,18 @@ export async function provisionVault(items: VaultItem[]): Promise<void> {
     [
       rig.provisionEntry,
       "--server",
-      `http://127.0.0.1:${rig.vaultPort}`,
+      `https://127.0.0.1:${rig.vaultPort}`,
       "--email",
       rig.vaultEmail,
       "--password",
       masterPassword,
     ],
-    { stdio: ["pipe", "inherit", "inherit"] },
+    {
+      // The provisioning tool is a node program; it trusts the rig
+      // certificate the same way the service's bw does.
+      env: { ...process.env, NODE_EXTRA_CA_CERTS: rig.vaultCert },
+      stdio: ["pipe", "inherit", "inherit"],
+    },
   );
   child.stdin.write(JSON.stringify(items));
   child.stdin.end();

@@ -27,16 +27,41 @@ skips) when the rig is not configured — see `requireRig()` in
 
 ## One-time Windows setup (the Windows host, elevated)
 
-1. Install Node LTS, `bw` CLI **2025.9.0**, and the Playwright browsers into
-   the daemon's `browsers_path`, then grant that path's ACL to the service
-   account.
-2. `tegatad.exe service install --config C:\ProgramData\tegata\config.toml`
+1. Install Node LTS, `bw` CLI **2025.12.1 or newer** (the rig runs
+   2026.8.0), and the Playwright browsers into the daemon's `browsers_path`,
+   then grant that path's ACL to the service account.
+2. Mint the throwaway vault certificate on WSL. bw refuses plain-http
+   servers, so the harness's vaultwarden serves TLS with this certificate,
+   and the service's bw trusts it:
+
+   ```sh
+   mkdir -p ~/.config/tegata/test-vault-tls && cd ~/.config/tegata/test-vault-tls
+   openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj /CN=localhost \
+     -addext subjectAltName=DNS:localhost,IP:127.0.0.1 -keyout key.pem -out cert.pem
+   ```
+
+   Copy `cert.pem` to `C:\ProgramData\tegata\test-vault-ca.pem`, next to the
+   config, before the next step (`service install` protects the directory,
+   and the service account reads through that DACL). Point the provider at
+   `server_url = "https://localhost:8087"`.
+3. `tegatad.exe service install --config C:\ProgramData\tegata\config.toml`
    (registers the service, adds the WSL-subnet-scoped inbound firewall rule
    for the daemon TCP port, creates and ACLs `C:\ProgramData\tegata`, grants
    the operator SID service start/stop).
-3. `tegatad.exe token issue` (elevated) — write the printed token to the WSL
+4. Hand the certificate to the service's bw processes, scoped to this
+   service alone rather than the machine environment:
+
+   ```powershell
+   Set-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\tegatad -Name Environment `
+     -Type MultiString -Value 'NODE_EXTRA_CA_CERTS=C:\ProgramData\tegata\test-vault-ca.pem'
+   Restart-Service tegatad
+   ```
+
+   The daemon passes its environment on to bw. `service uninstall` removes
+   the value along with the service; set it again after a reinstall.
+5. `tegatad.exe token issue` (elevated) — write the printed token to the WSL
    file `TEGATA_TOKEN_FILE` (mode 0600).
-4. `tegatad.exe seal` (elevated) — enter the **test** master password
+6. `tegatad.exe seal` (elevated) — enter the **test** master password
    (never a real vault password). Store the same value in
    `TEGATA_TEST_MASTER_PASSWORD_FILE` on WSL so `provision-test-vault` can
    create a throwaway vault that matches.
@@ -58,9 +83,11 @@ Defaults live in `support/winrig.ts`; override via env when the rig differs.
 | `TEGATA_TEST_VAULT_PORT` | `8087` | throwaway vaultwarden port |
 | `TEGATA_TEST_VAULT_EMAIL` | `acceptance@test.local` | test account email |
 | `TEGATA_TEST_MASTER_PASSWORD_FILE` | `~/.config/tegata/test-master-password` | sealed test password (0600) |
+| `TEGATA_TEST_VAULT_TLS_DIR` | `~/.config/tegata/test-vault-tls` | `cert.pem` + `key.pem` the throwaway vaultwarden serves; the service trusts the same `cert.pem` |
 
-Also required on WSL: `vaultwarden` and the built workspace
-(`npm run build --workspaces`, `cargo build`).
+Also required on WSL: `vaultwarden`, `openssl` (once, to mint the
+certificate), and the built workspace (`npm run build --workspaces`,
+`cargo build`).
 
 ## Running
 

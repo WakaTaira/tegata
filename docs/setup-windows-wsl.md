@@ -42,9 +42,11 @@ launcher is elevated and the gate is open; fix the launcher first.
 
 - Node.js LTS
 - Bitwarden CLI 2025.12.1 or newer. The CLI only talks to servers over HTTPS;
-  if your vault's certificate comes from a private CA, set `NODE_EXTRA_CA_CERTS`
-  to that CA's certificate in the system environment so the service's bw
-  processes trust it.
+  if your vault's certificate comes from a private CA, give the service
+  `NODE_EXTRA_CA_CERTS` pointing at that CA's certificate — in the system
+  environment, or scoped to this service alone through the `Environment` value
+  (`REG_MULTI_SZ`) under `HKLM\SYSTEM\CurrentControlSet\Services\<service_name>`.
+  The daemon passes its environment on to its bw processes.
 - The Playwright browsers, installed into the directory you will configure as
   `browsers_path`, with the version pinned in
   `packages/tegata-executor/package.json`:

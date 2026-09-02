@@ -425,35 +425,14 @@ impl BitwardenCliProvider {
         login_args: &[String],
         password: &Secret,
     ) -> Result<(), ErrorCode> {
-        let session = self.login_with_password(login_args, password).await?;
-        self.session = Some(Secret::new(session));
-        // bw before 2025.12.1 could lose the race between persisting the session-protected
-        // key and initialising the vault timeout (bitwarden/clients#17707), handing back a
-        // session that later commands treat as locked. The `bw status` check is a cheap
-        // invariant on any version; the retries only ever fire on an affected CLI.
-        for attempt in 0..=2 {
-            let session_is_unlocked = match self.session.as_ref() {
-                Some(session) => self.session_is_unlocked(session).await,
-                None => false,
-            };
-            if session_is_unlocked {
-                return Ok(());
-            }
-            if attempt == 2 {
-                break;
-            }
-            let session = self
-                .login_with_password(&["unlock".to_owned(), "--raw".to_owned()], password)
-                .await;
-            let session = match session {
-                Ok(session) => session,
-                Err(error) => {
-                    self.session = None;
-                    self.unlocked_at = None;
-                    return Err(error);
-                }
-            };
-            self.session = Some(Secret::new(session));
+        let session = Secret::new(self.login_with_password(login_args, password).await?);
+        // A fresh session is verified once with `bw status`. CLI releases before 2025.12.1 can lose
+        // the session-key persistence race (bitwarden/clients#17707) and hand back a session that
+        // later commands treat as locked; the daemon requires 2025.12.1 or newer and reports such a
+        // session as a failure.
+        if self.session_is_unlocked(&session).await {
+            self.session = Some(session);
+            return Ok(());
         }
         self.session = None;
         self.unlocked_at = None;
@@ -590,73 +569,47 @@ impl BitwardenCliProvider {
     }
 
     async fn list_items(&mut self) -> Result<Vec<BitwardenItem>, ErrorCode> {
-        for attempt in 0..=1 {
-            if let Err(error) = self.ensure_session().await {
-                if attempt == 0 {
-                    return Err(error);
-                }
-                return Err(ErrorCode::Internal);
-            }
-            let output = self
-                .run_bw(
-                    &["list".to_owned(), "items".to_owned()],
-                    self.session.as_ref(),
-                    None,
-                )
-                .await
-                .map_err(|error| {
-                    log_bw_error("list items", &error);
-                    ErrorCode::Internal
-                })?;
-            match serde_json::from_slice::<Vec<BitwardenItem>>(&output.stdout) {
-                Ok(items) => return Ok(items),
-                Err(_) => {
-                    log_bw_parse_error("list items", &output.stderr);
-                    if attempt == 0 {
-                        self.session = None;
-                        self.unlocked_at = None;
-                        continue;
-                    }
-                    return Err(ErrorCode::Internal);
-                }
+        self.ensure_session().await?;
+        let output = self
+            .run_bw(
+                &["list".to_owned(), "items".to_owned()],
+                self.session.as_ref(),
+                None,
+            )
+            .await
+            .map_err(|error| {
+                log_bw_error("list items", &error);
+                ErrorCode::Internal
+            })?;
+        match serde_json::from_slice::<Vec<BitwardenItem>>(&output.stdout) {
+            Ok(items) => Ok(items),
+            Err(_) => {
+                log_bw_parse_error("list items", &output.stderr);
+                Err(ErrorCode::Internal)
             }
         }
-        Err(ErrorCode::Internal)
     }
 
     async fn get_item(&mut self, item_id: &str) -> Result<BitwardenItem, ErrorCode> {
-        for attempt in 0..=1 {
-            if let Err(error) = self.ensure_session().await {
-                if attempt == 0 {
-                    return Err(error);
-                }
-                return Err(ErrorCode::InvalidCredential);
-            }
-            let output = self
-                .run_bw(
-                    &["get".to_owned(), "item".to_owned(), item_id.to_owned()],
-                    self.session.as_ref(),
-                    None,
-                )
-                .await
-                .map_err(|error| {
-                    log_bw_error("get item", &error);
-                    ErrorCode::InvalidCredential
-                })?;
-            match serde_json::from_slice::<BitwardenItem>(&output.stdout) {
-                Ok(item) => return Ok(item),
-                Err(_) => {
-                    log_bw_parse_error("get item", &output.stderr);
-                    if attempt == 0 {
-                        self.session = None;
-                        self.unlocked_at = None;
-                        continue;
-                    }
-                    return Err(ErrorCode::InvalidCredential);
-                }
+        self.ensure_session().await?;
+        let output = self
+            .run_bw(
+                &["get".to_owned(), "item".to_owned(), item_id.to_owned()],
+                self.session.as_ref(),
+                None,
+            )
+            .await
+            .map_err(|error| {
+                log_bw_error("get item", &error);
+                ErrorCode::InvalidCredential
+            })?;
+        match serde_json::from_slice::<BitwardenItem>(&output.stdout) {
+            Ok(item) => Ok(item),
+            Err(_) => {
+                log_bw_parse_error("get item", &output.stderr);
+                Err(ErrorCode::InvalidCredential)
             }
         }
-        Err(ErrorCode::InvalidCredential)
     }
 
     async fn list_refs_inner(&mut self) -> Result<Vec<CredentialRef>, ErrorCode> {

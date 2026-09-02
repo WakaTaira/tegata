@@ -36,7 +36,12 @@ grant the ACL yourself.
 
 Write the configuration first — `service install` reads it to decide the firewall
 rule, the state directory, and the ACLs. `C:\ProgramData\tegata\config.toml` is
-the conventional location.
+the conventional location. Place each configuration at
+`C:\ProgramData\<dir>\config.toml`: `service install` resolves junctions and
+symbolic links first, treats the configuration's real parent directory as the
+protected root, and refuses — before it touches the service manager — any
+configuration whose real location is not a directory directly under
+`%ProgramData%`.
 
 ```toml
 state_dir      = "C:\\ProgramData\\tegata\\state"
@@ -116,7 +121,7 @@ an opt-in for a deployment that provides its own helper.
 | `tegatad.exe token issue` | yes | Issue a client token |
 | `tegatad.exe seal` | yes | Seal the master password |
 | `tegatad.exe service install --config <path>` | yes | Register and provision |
-| `tegatad.exe service uninstall` | yes | Remove the service and its firewall rule |
+| `tegatad.exe service uninstall [--name <name>]` | yes | Remove the service and its firewall rule |
 | `tegatad.exe --config <path> --foreground` | — | Run in the foreground for debugging |
 
 Each of the first three takes `--pipe <name>` if the pipe was renamed.
@@ -125,6 +130,28 @@ Elevation is not a convention here — the administrative RPCs are refused unles
 calling peer is both elevated and a member of the local administrators group, and
 they are refused outright over the TCP front, which carries no operating system
 identity.
+
+### Running a second instance
+
+A second daemon has its own `C:\ProgramData\<dir>\config.toml` and unique values
+for `service_name`, `pipe_name`, `tcp_port`, `state_dir`, and `browsers_path`.
+The `bw_path`, `node_path`, and `executor_entry` values may be shared. Installing
+that configuration with `service install` creates the named service, its virtual
+account, the `<name> WSL TCP` firewall rule, and the protected DACLs. Choose the
+other daemon from CLI commands with `--pipe <name>`; from WSL, point a bridge at
+the second instance explicitly with `--daemon-addr <gateway>:<port>`, because
+default resolution assumes port `21575` and does not select the second instance.
+This supports, for example, an acceptance rig next to the daemon you actually
+use, each with its own sealed password.
+
+```toml
+service_name    = "tegatad-rig"
+pipe_name       = "tegatad-rig"
+tcp_port        = 21576
+state_dir       = "C:\\ProgramData\\tegata-rig\\state"
+audit_log_path  = "C:\\ProgramData\\tegata-rig\\state\\audit.log"
+browsers_path   = "C:\\ProgramData\\tegata-rig\\browsers"
+```
 
 ## Configuration reference
 
@@ -147,6 +174,7 @@ silently ignored — see [setup-linux.md](setup-linux.md#the-approval-hook).
 
 | Key | Default | Meaning |
 | --- | --- | --- |
+| `service_name` | `tegatad` | Name of the Windows service. The virtual account `NT SERVICE\<name>` and the firewall rule `<name> WSL TCP` are derived from it; `service uninstall --name` takes the same value; allowed characters are ASCII letters, digits, `-`, `_`, and `.`, with 1 to 256 characters |
 | `pipe_name` | `tegatad` | Named pipe name, without the `\\.\pipe\` prefix |
 | `tcp_port` | `21575` | Loopback TCP port. `0` disables the TCP front entirely |
 | `tcp_bind` | `auto` | IPv4 bind address, or `auto` for the WSL adapter |

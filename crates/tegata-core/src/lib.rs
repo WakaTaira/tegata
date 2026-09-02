@@ -1,5 +1,6 @@
 //! Shared secret and TOTP primitives.
 
+pub mod windows_instance;
 pub mod wire;
 
 use data_encoding::{BASE32, BASE32_NOPAD};

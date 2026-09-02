@@ -50,6 +50,10 @@ use super::{Accepted, CdpPortResolver, TcpAccepted, TcpTransport, Transport};
 /// Configuration keys owned by this transport.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct PlatformConfig {
+    /// Name of the Windows service. The virtual account `NT SERVICE\<name>`
+    /// and the firewall rule `<name> WSL TCP` are derived from it as well.
+    #[serde(default = "default_service_name")]
+    pub(crate) service_name: String,
     /// Name of the named pipe, without the `\\.\pipe\` prefix.
     #[serde(default = "default_pipe_name")]
     pub(crate) pipe_name: String,
@@ -84,6 +88,10 @@ pub(crate) struct PlatformConfig {
     /// Optional Node.js executable.
     #[serde(default)]
     pub(crate) node_path: Option<String>,
+}
+
+fn default_service_name() -> String {
+    "tegatad".to_owned()
 }
 
 fn default_pipe_name() -> String {
@@ -718,6 +726,7 @@ type = "mock"
         )
         .expect("parse minimal Windows config");
 
+        assert_eq!(config.service_name, "tegatad");
         assert_eq!(config.pipe_name, "tegatad-test");
         assert_eq!(config.tcp_port, 0);
         assert_eq!(config.tcp_bind, "auto");
@@ -728,5 +737,26 @@ type = "mock"
         assert!(config.browsers_path.is_none());
         assert!(config.bw_path.is_none());
         assert!(config.node_path.is_none());
+    }
+
+    #[test]
+    fn explicit_service_name_is_read() {
+        let config: PlatformConfig = toml::from_str(
+            r#"
+service_name = "tegatad-rig"
+pipe_name = "tegatad-test"
+tcp_port = 0
+state_dir = "C:\\Temp\\tegata\\state"
+audit_log_path = "C:\\Temp\\tegata\\state\\audit.log"
+allowed_sids = ["S-1-5-21-1"]
+
+[[providers]]
+namespace = "mock"
+type = "mock"
+"#,
+        )
+        .expect("parse minimal Windows config");
+
+        assert_eq!(config.service_name, "tegatad-rig");
     }
 }

@@ -6,6 +6,9 @@ use std::time::Duration;
 
 use super::{Config, ReadySender};
 
+use tegata_core::windows_instance::{
+    firewall_rule_name, install_root_under, service_account, validate_service_name,
+};
 use windows_service::service::{
     ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceInfo,
     ServiceStartType, ServiceState, ServiceStatus, ServiceType,
@@ -20,19 +23,19 @@ pub(crate) enum ServiceCommand {
         #[arg(long)]
         config: PathBuf,
     },
-    Uninstall,
+    Uninstall {
+        #[arg(long, default_value = DISPATCHER_SERVICE_NAME)]
+        name: String,
+    },
 }
 
-const SERVICE_NAME: &str = "tegatad";
-
-const SERVICE_ACCOUNT: &str = r"NT SERVICE\tegatad";
-
-const FIREWALL_RULE_NAME: &str = "tegatad WSL TCP";
+// For `SERVICE_WIN32_OWN_PROCESS`, the service control manager ignores this name.
+const DISPATCHER_SERVICE_NAME: &str = "tegatad";
 
 windows_service::define_windows_service!(ffi_service_main, service_main_entry);
 
 pub(crate) const START: fn() -> windows_service::Result<()> =
-    || service_dispatcher::start(SERVICE_NAME, ffi_service_main);
+    || service_dispatcher::start(DISPATCHER_SERVICE_NAME, ffi_service_main);
 
 fn service_main_entry(arguments: Vec<OsString>) {
     let _ = service_main(arguments);
@@ -60,7 +63,7 @@ fn config_path_from_command_line() -> Option<PathBuf> {
 fn service_main(_arguments: Vec<OsString>) -> windows_service::Result<()> {
     let (stop_sender, stop_receiver) = tokio::sync::oneshot::channel();
     let stop_sender = Arc::new(std::sync::Mutex::new(Some(stop_sender)));
-    let status_handle = service_control_handler::register(SERVICE_NAME, {
+    let status_handle = service_control_handler::register(DISPATCHER_SERVICE_NAME, {
         let stop_sender = stop_sender.clone();
         move |control_event| match control_event {
             ServiceControl::Stop => {
@@ -162,15 +165,19 @@ fn stopped_status(exit_code: windows_service::service::ServiceExitCode) -> Servi
 }
 
 pub(crate) fn install_service(config_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let config_text = std::fs::read_to_string(config_path)?;
+    let config_path = std::path::absolute(config_path)?;
+    let config_text = std::fs::read_to_string(&config_path)?;
     let config: Config = toml::from_str(&config_text)?;
+    validate_service_name(&config.transport.service_name).map_err(io::Error::other)?;
+    let root = install_root(&config_path)?;
+    let name = config.transport.service_name.clone();
     let service_manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )?;
     let service_info = ServiceInfo {
-        name: OsString::from(SERVICE_NAME),
-        display_name: OsString::from(SERVICE_NAME),
+        name: OsString::from(name.as_str()),
+        display_name: OsString::from(name.as_str()),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
@@ -180,33 +187,60 @@ pub(crate) fn install_service(config_path: &Path) -> Result<(), Box<dyn std::err
             config_path.as_os_str().to_owned(),
         ],
         dependencies: Vec::new(),
-        account_name: Some(OsString::from(SERVICE_ACCOUNT)),
+        account_name: Some(OsString::from(service_account(&name))),
         account_password: None,
     };
     service_manager.create_service(
         &service_info,
         ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
     )?;
-    configure_firewall(config.transport.tcp_port)?;
-    prepare_program_data(config_path, &config)?;
+    configure_firewall(&name, config.transport.tcp_port)?;
+    prepare_program_data(&config_path, &config, &root)?;
     if let Some(operator_sid) = config.transport.operator_sid.as_deref() {
-        grant_service_control(operator_sid)?;
+        grant_service_control(&name, operator_sid)?;
     }
     Ok(())
 }
 
-pub(crate) fn uninstall_service() -> Result<(), Box<dyn std::error::Error>> {
-    remove_firewall_rule()?;
+pub(crate) fn uninstall_service(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    validate_service_name(name).map_err(io::Error::other)?;
+    remove_firewall_rule(name)?;
     let service_manager =
         ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
-    let service = service_manager.open_service(SERVICE_NAME, ServiceAccess::DELETE)?;
+    let service = service_manager.open_service(name, ServiceAccess::DELETE)?;
     service.delete()?;
     Ok(())
+}
+
+fn install_root(config_path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let program_data = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    let program_data = strip_verbatim_prefix(&std::fs::canonicalize(program_data)?);
+    let config_path = strip_verbatim_prefix(&std::fs::canonicalize(config_path)?);
+    install_root_under(
+        &program_data.to_string_lossy(),
+        &config_path.to_string_lossy(),
+    )
+    .map(PathBuf::from)
+    .map_err(|message| io::Error::other(message).into())
+}
+
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let path = path.to_string_lossy();
+    if let Some(path) = path.strip_prefix("\\\\?\\UNC\\") {
+        return PathBuf::from(format!("\\\\{path}"));
+    }
+    if let Some(path) = path.strip_prefix("\\\\?\\") {
+        return PathBuf::from(path);
+    }
+    PathBuf::from(path.as_ref())
 }
 
 fn prepare_program_data(
     config_path: &Path,
     config: &Config,
+    root: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The daemon state belongs to the service account, never to the account
     // that happened to run the installation: an interactive account that keeps
@@ -214,10 +248,9 @@ fn prepare_program_data(
     // The local administrators group is excluded for the same reason, since
     // the WSL file server behind `/mnt/c` reads with that group enabled.
     let principals = vec![
-        service_account_sid()?,
+        service_account_sid(&config.transport.service_name)?,
         crate::secure_fs::SDDL_SYSTEM.to_owned(),
     ];
-    let root = Path::new(r"C:\ProgramData\tegata");
     let default_state = root.join("state");
     let default_browsers = root.join("browsers");
     let state = Path::new(&config.state_dir);
@@ -237,9 +270,7 @@ fn prepare_program_data(
         std::fs::create_dir_all(path)?;
         restrict_windows_path(path, true, &principals)?;
     }
-    if config_path.starts_with(root) {
-        restrict_windows_path(config_path, false, &principals)?;
-    }
+    restrict_windows_path(config_path, false, &principals)?;
     Ok(())
 }
 
@@ -253,7 +284,7 @@ fn restrict_windows_path(
 }
 
 /// Resolves the SID of the virtual account the service runs under.
-fn service_account_sid() -> Result<String, Box<dyn std::error::Error>> {
+fn service_account_sid(name: &str) -> Result<String, Box<dyn std::error::Error>> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr::null_mut;
@@ -262,7 +293,7 @@ fn service_account_sid() -> Result<String, Box<dyn std::error::Error>> {
     use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
     use windows_sys::Win32::Security::{LookupAccountNameW, SID_NAME_USE};
 
-    let name = OsStr::new(SERVICE_ACCOUNT)
+    let name = OsStr::new(&service_account(name))
         .encode_wide()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
@@ -320,29 +351,31 @@ fn service_account_sid() -> Result<String, Box<dyn std::error::Error>> {
     Ok(value)
 }
 
-fn configure_firewall(tcp_port: u16) -> Result<(), Box<dyn std::error::Error>> {
+fn configure_firewall(name: &str, tcp_port: u16) -> Result<(), Box<dyn std::error::Error>> {
     if tcp_port == 0 {
         return Ok(());
     }
+    let rule_name = firewall_rule_name(name);
     run_powershell(&format!(
         "New-NetFirewallRule -DisplayName '{}' -Direction Inbound -Action Allow -Protocol TCP -LocalPort {} -InterfaceAlias 'vEthernet (WSL*' -Profile Any",
-        FIREWALL_RULE_NAME, tcp_port
+        rule_name, tcp_port
     ))
 }
 
-fn remove_firewall_rule() -> Result<(), Box<dyn std::error::Error>> {
+fn remove_firewall_rule(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let rule_name = firewall_rule_name(name);
     run_powershell(&format!(
         "Get-NetFirewallRule -DisplayName '{}' -ErrorAction SilentlyContinue | Remove-NetFirewallRule",
-        FIREWALL_RULE_NAME
+        rule_name
     ))
 }
 
-fn grant_service_control(operator_sid: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn grant_service_control(name: &str, operator_sid: &str) -> Result<(), Box<dyn std::error::Error>> {
     if !operator_sid.starts_with("S-1-") {
         return Err("operator_sid must be a Windows SID".into());
     }
     let output = std::process::Command::new("sc.exe")
-        .args(["sdshow", SERVICE_NAME])
+        .args(["sdshow", name])
         .output()?;
     if !output.status.success() {
         return Err(io::Error::other(String::from_utf8_lossy(&output.stderr)).into());
@@ -361,10 +394,7 @@ fn grant_service_control(operator_sid: &str) -> Result<(), Box<dyn std::error::E
         ace,
         &descriptor[insert_at..]
     );
-    run_windows_command(
-        "sc.exe",
-        &["sdset".to_owned(), SERVICE_NAME.to_owned(), updated],
-    )
+    run_windows_command("sc.exe", &["sdset".to_owned(), name.to_owned(), updated])
 }
 
 fn run_powershell(script: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -409,4 +439,61 @@ fn run_daemon_runtime_for_service(
             stop,
             Some(ready_sender),
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use std::path::{Path, PathBuf};
+
+    use super::{
+        DISPATCHER_SERVICE_NAME, ServiceCommand, ServiceCommand::Uninstall, strip_verbatim_prefix,
+    };
+
+    #[derive(clap::Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    }
+
+    #[test]
+    fn parses_explicit_uninstall_name() {
+        let cli = Cli::try_parse_from([
+            DISPATCHER_SERVICE_NAME,
+            "uninstall",
+            "--name",
+            "tegatad-rig",
+        ])
+        .expect("explicit uninstall name should parse");
+        let Uninstall { name } = cli.command else {
+            panic!("expected the uninstall command");
+        };
+        assert_eq!(name, "tegatad-rig");
+    }
+
+    #[test]
+    fn defaults_uninstall_name() {
+        let cli = Cli::try_parse_from([DISPATCHER_SERVICE_NAME, "uninstall"])
+            .expect("default uninstall name should parse");
+        let Uninstall { name } = cli.command else {
+            panic!("expected the uninstall command");
+        };
+        assert_eq!(name, DISPATCHER_SERVICE_NAME);
+    }
+
+    #[test]
+    fn strips_verbatim_drive_prefix() {
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\ProgramData\tegata")),
+            PathBuf::from(r"C:\ProgramData\tegata")
+        );
+    }
+
+    #[test]
+    fn strips_verbatim_unc_prefix() {
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\x")),
+            PathBuf::from(r"\\server\share\x")
+        );
+    }
 }

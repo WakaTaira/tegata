@@ -257,6 +257,9 @@ Planned, tracked in the
 - **OAuth device-flow executor**
   ([#8](https://github.com/WakaTaira/tegata/issues/8)) — device-code grants
   completed on the isolated side, alongside the form executor
+- **Windows approval hook**
+  ([#11](https://github.com/WakaTaira/tegata/issues/11)) — the human-in-the-loop
+  hook for the Windows service, which currently refuses `approve_cmd`
 
 Each feature is designed in a private brief before implementation; what lands
 publicly is the design's contract, as acceptance tests under `tests/acceptance/`.

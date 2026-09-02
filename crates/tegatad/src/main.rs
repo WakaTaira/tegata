@@ -334,8 +334,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     windows_service::ServiceCommand::Install { config } => {
                         windows_service::install_service(&config)
                     }
-                    windows_service::ServiceCommand::Uninstall => {
-                        windows_service::uninstall_service()
+                    windows_service::ServiceCommand::Uninstall { name } => {
+                        windows_service::uninstall_service(&name)
                     }
                 },
             };

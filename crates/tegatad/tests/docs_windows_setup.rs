@@ -1,4 +1,5 @@
-//! Acceptance test for the Windows setup documentation.
+//! Contract test for the Windows setup documentation, written before the
+//! implementation.
 //!
 //! The documentation is part of the contract: a second daemon instance is
 //! only usable if the keys and commands that make it possible are written

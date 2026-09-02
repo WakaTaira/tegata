@@ -1,8 +1,10 @@
-//! Acceptance tests for the Windows service command line.
+//! Contract tests for the Windows service command line, written before the
+//! implementation. (The end-to-end acceptance suite lives under
+//! `tests/acceptance/`; these pin behaviour it cannot reach from WSL.)
 //!
-//! One test per acceptance condition of the private brief. These drive the
-//! built `tegatad.exe` and therefore only compile on Windows, where the CI
-//! job runs them without elevation: nothing here creates a service.
+//! They drive the built `tegatad.exe` and therefore only compile on Windows,
+//! where the CI job runs them without elevation: nothing here creates a
+//! service.
 
 #![cfg(windows)]
 

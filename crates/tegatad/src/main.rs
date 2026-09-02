@@ -376,7 +376,7 @@ async fn run_daemon(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config_text = tokio::fs::read_to_string(config_path).await?;
     let config: Config = toml::from_str(&config_text)?;
-    remove_legacy_password_dir(Path::new(&config.state_dir)).await?;
+    remove_legacy_password_dir(Path::new(&config.state_dir)).await;
     #[cfg(windows)]
     if config.approve_cmd.is_some() {
         return Err("approve_cmd is only supported on Unix".into());
@@ -522,20 +522,21 @@ async fn validate_executor_socket(path: &str) -> Result<u32, io::Error> {
     Ok(uid)
 }
 
-async fn remove_legacy_password_dir(state_dir: &Path) -> io::Result<()> {
+async fn remove_legacy_password_dir(state_dir: &Path) {
     let password_dir = state_dir.join(PASSWORD_FILE_DIR);
-    match tokio::fs::metadata(&password_dir).await {
-        Ok(_) => {
-            tokio::fs::remove_dir_all(&password_dir).await?;
+    match tokio::fs::remove_dir_all(&password_dir).await {
+        Ok(()) => {
             eprintln!(
                 "removed legacy password directory {}",
                 password_dir.display()
             );
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        Err(error) => eprintln!(
+            "failed to remove legacy password directory {}: {error}",
+            password_dir.display()
+        ),
     }
-    Ok(())
 }
 
 #[cfg(unix)]

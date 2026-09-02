@@ -18,7 +18,12 @@ skips) when the rig is not configured — see `requireRig()` in
 - **The WSL distro** — a WSL2 distro on the Windows host, **NAT networking, interop and
   automount enabled** (the weakest configuration, on purpose: the point is
   that isolation holds even when interop is available). The vitest harness
-  runs here.
+  runs here. Start the distro from a non-elevated interactive session, never
+  from a boot-time task that runs without a logon: that hands interop the
+  full administrator token, AC-24 fails, and the harness's `token issue` /
+  `seal` calls land on the daemon (see `docs/setup-windows-wsl.md`, "How the
+  distro is started matters"). `whoami.exe /groups` must report
+  `Medium Mandatory Level`.
 
 ## One-time Windows setup (the Windows host, elevated)
 

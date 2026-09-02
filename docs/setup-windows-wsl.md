@@ -12,6 +12,32 @@ the agent. The reverse arrangement, with the daemon inside the distro, is
 defeated by the agent launching `powershell.exe` and reading back into the distro
 as root.
 
+## How the distro is started matters
+
+The boundary holds only while the WSL side runs under the user's *non-elevated*
+token. Interop processes inherit the token of whatever started the distro, and
+that includes its elevation. A distro started by a scheduled task set to "run
+whether user is logged on or not" runs with the user's full token — high
+integrity, `Administrators` enabled — even when the task is marked "run with
+limited privileges", because that logon type never receives the UAC split token.
+The daemon's elevation gate then accepts `token issue` and `seal` from inside
+WSL. The protected files stay protected; what opens up is the administrative RPC
+surface, which lets the agent side re-seal the password or invalidate the token.
+
+Start the distro from a non-elevated interactive session: the user's own
+terminal, or an at-logon task with the interactive logon type ("run only when
+user is logged on") and least privilege. A boot-time task that runs without a
+logon is not acceptable on a host that also runs the daemon.
+
+Check before installing, from inside the distro:
+
+```sh
+whoami.exe /groups | grep 'Mandatory Level'
+```
+
+Expect `Mandatory Label\Medium Mandatory Level`. `High Mandatory Level` means the
+launcher is elevated and the gate is open; fix the launcher first.
+
 ## Prerequisites on the Windows host
 
 - Node.js LTS
@@ -338,6 +364,11 @@ gateway address is what the bridge resolved; a mirrored-networking distro needs
 **`UNAUTHORIZED` from the bridge.** The token file does not match the stored hash.
 Re-issue with `tegatad.exe token issue` and copy the new value; issuing invalidates
 the previous token.
+
+**`token issue` or `seal` succeeds from inside WSL without elevation.** The
+distro was started from an elevated context, so every interop process carries
+the full administrator token. See [How the distro is started
+matters](#how-the-distro-is-started-matters).
 
 **The daemon starts but no credential resolves.** The master password has not been
 sealed on this machine, or was sealed by a different account. DPAPI blobs are

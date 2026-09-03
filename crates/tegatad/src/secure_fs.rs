@@ -28,7 +28,7 @@ pub(crate) fn write_private_file_atomic(path: &Path, contents: &[u8]) -> io::Res
         file.write_all(contents)?;
         file.sync_all()?;
         #[cfg(windows)]
-        restrict_path(&temporary, false, &daemon_principals())?;
+        restrict_path(&temporary, false, &daemon_principals()?)?;
         #[cfg(not(windows))]
         std::fs::rename(&temporary, path)?;
         #[cfg(windows)]
@@ -68,7 +68,7 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
     if result == 0 {
         return Err(io::Error::last_os_error());
     }
-    restrict_path(&destination_path, false, &daemon_principals())
+    restrict_path(&destination_path, false, &daemon_principals()?)
 }
 
 /// Creates a file readable only by the account that runs the daemon, failing

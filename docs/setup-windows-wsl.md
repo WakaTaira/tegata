@@ -349,6 +349,8 @@ to `INTERNAL` on purpose — details would be a leak channel. Look at the audit 
 in `state_dir` for the method and outcome, and the Windows event log for the
 service.
 
+**To record the service's stderr.** Add `TEGATA_LOG_FILE=C:\ProgramData\tegata\daemon.log` to the service's `Environment` registry value to append stderr to that file. Place the file under the state directory in a location readable only by the service account. It does not contain secret values, but it does contain paths and error messages.
+
 **The browser fails to launch.** The Playwright browser revision must match the
 `playwright-core` bundled with the executor, and the service account needs read
 access to `browsers_path`. A revision mismatch fails immediately at launch.

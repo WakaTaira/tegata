@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+
 use super::{Config, ReadySender};
 
 use tegata_core::windows_instance::{
@@ -60,7 +63,33 @@ fn config_path_from_command_line() -> Option<PathBuf> {
     })
 }
 
+#[cfg(windows)]
+fn redirect_stderr_to_log_file() {
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
+
+    let Some(path) = std::env::var_os("TEGATA_LOG_FILE") else {
+        return;
+    };
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    if unsafe { SetStdHandle(STD_ERROR_HANDLE, file.as_raw_handle()) } != 0 {
+        eprintln!(
+            "tegatad: stderr redirected to {}",
+            PathBuf::from(&path).display()
+        );
+        std::mem::forget(file);
+    }
+}
+
 fn service_main(_arguments: Vec<OsString>) -> windows_service::Result<()> {
+    #[cfg(windows)]
+    redirect_stderr_to_log_file();
+
     let (stop_sender, stop_receiver) = tokio::sync::oneshot::channel();
     let stop_sender = Arc::new(std::sync::Mutex::new(Some(stop_sender)));
     let status_handle = service_control_handler::register(DISPATCHER_SERVICE_NAME, {

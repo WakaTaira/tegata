@@ -78,12 +78,13 @@ impl UnixTransport {
         let Ok(uid) = peer_uid(&stream) else {
             return Ok(Accepted::Consumed);
         };
-        if !self.allowed_uids.contains(&uid) {
+        if uid != 0 && !self.allowed_uids.contains(&uid) && !self.operator_uids.contains(&uid) {
             return Ok(Accepted::Consumed);
         }
-        Ok(Accepted::Rpc {
+        Ok(Accepted::UnixRpc {
             peer: PeerIdentity::Uid(uid),
             stream,
+            allowed_uids: self.allowed_uids.clone(),
             operator_uids: self.operator_uids.clone(),
         })
     }
@@ -121,6 +122,17 @@ impl PlatformTransport {
                                     stream: Box::new(stream) as Box<dyn ClientStream>,
                                     operator_uids,
                                 },
+                                Accepted::UnixRpc {
+                                    peer,
+                                    stream,
+                                    allowed_uids,
+                                    operator_uids,
+                                } => Accepted::UnixRpc {
+                                    peer,
+                                    stream: Box::new(stream) as Box<dyn ClientStream>,
+                                    allowed_uids,
+                                    operator_uids,
+                                },
                                 Accepted::Consumed => Accepted::Consumed,
                             });
                             if sender.send(accepted).await.is_err() {
@@ -151,6 +163,17 @@ impl PlatformTransport {
                                 } => Accepted::Rpc {
                                     peer,
                                     stream: Box::new(stream) as Box<dyn ClientStream>,
+                                    operator_uids,
+                                },
+                                Accepted::UnixRpc {
+                                    peer,
+                                    stream,
+                                    allowed_uids,
+                                    operator_uids,
+                                } => Accepted::UnixRpc {
+                                    peer,
+                                    stream: Box::new(stream) as Box<dyn ClientStream>,
+                                    allowed_uids,
                                     operator_uids,
                                 },
                                 Accepted::Consumed => Accepted::Consumed,

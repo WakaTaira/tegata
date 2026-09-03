@@ -119,6 +119,90 @@ fn call_unix(socket_path: &Path, method: &str, params: Value) -> std::io::Result
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
+fn start_daemon_with_unix_permissions(allowed_uids: &[u32], operator_uids: &[u32]) -> Daemon {
+    let directory = std::env::temp_dir().join(format!("tegatad-peers-{}", Uuid::new_v4()));
+    std::fs::create_dir(&directory).expect("create test directory");
+    let state_dir = directory.join("state");
+    std::fs::create_dir(&state_dir).expect("create state directory");
+    let socket_path = directory.join("tegatad.sock");
+    let allowed_uids = allowed_uids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let operator_uids = operator_uids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let config = format!(
+        "state_dir = {:?}\naudit_log_path = {:?}\n\n[[listen]]\nkind = \"unix\"\npath = {:?}\nallowed_uids = [{}]\noperator_uids = [{}]\n",
+        state_dir,
+        state_dir.join("audit.log"),
+        socket_path,
+        allowed_uids,
+        operator_uids,
+    );
+    let config_path = directory.join("config.toml");
+    std::fs::write(&config_path, config).expect("write daemon config");
+    let child = Command::new(env!("CARGO_BIN_EXE_tegatad"))
+        .arg("--config")
+        .arg(&config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tegatad");
+    let daemon = Daemon {
+        child,
+        directory,
+        state_dir,
+        socket_path,
+        tcp_port: 0,
+    };
+    wait_for_connection(&daemon.socket_path);
+    daemon
+}
+
+fn wait_for_connection(socket_path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if UnixStream::connect(socket_path).is_ok() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!("tegatad did not become ready");
+}
+
+#[test]
+fn operator_uid_can_use_admin_rpc_but_not_normal_rpc() {
+    let daemon = start_daemon_with_unix_permissions(&[], &[unsafe { libc::geteuid() }]);
+
+    let issued = call_unix(
+        &daemon.socket_path,
+        "admin_peer_issue",
+        json!({ "label": "ops" }),
+    )
+    .expect("issue peer");
+    assert!(issued["result"]["peer_id"].is_string());
+    assert!(issued["result"]["token"].is_string());
+
+    for (method, params) in [
+        ("status", json!({})),
+        (
+            "login",
+            json!({
+                "cred_id": "site",
+                "target_url": "http://127.0.0.1",
+            }),
+        ),
+    ] {
+        let response = call_unix(&daemon.socket_path, method, params).expect("call RPC");
+        assert_eq!(response["error"]["message"], "UNAUTHORIZED");
+    }
+}
+
 fn tcp_exchange(daemon: &Daemon, token: &str, method: &str) -> Value {
     let mut stream =
         std::net::TcpStream::connect(("127.0.0.1", daemon.tcp_port)).expect("connect TCP");

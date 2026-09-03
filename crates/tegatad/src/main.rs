@@ -296,7 +296,6 @@ enum ErrorCode {
     ApprovalTimeout,
     Internal,
     NotFound,
-    #[cfg(windows)]
     Unauthorized,
     AdminRequired,
     #[cfg(windows)]
@@ -316,7 +315,6 @@ impl ErrorCode {
             Self::ApprovalTimeout => "APPROVAL_TIMEOUT",
             Self::Internal => "INTERNAL",
             Self::NotFound => "NOT_FOUND",
-            #[cfg(windows)]
             Self::Unauthorized => "UNAUTHORIZED",
             Self::AdminRequired => "ADMIN_REQUIRED",
             #[cfg(windows)]
@@ -839,16 +837,24 @@ async fn process_accepted<S>(
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    if let Accepted::Rpc {
-        peer,
-        stream,
-        operator_uids,
-    } = accepted
-    {
-        tokio::spawn(async move {
-            serve_connection(stream, peer, operator_uids, state).await;
-        });
-    }
+    let (peer, stream, allowed_uids, operator_uids) = match accepted {
+        Accepted::Rpc {
+            peer,
+            stream,
+            operator_uids,
+        } => (peer, stream, Vec::new(), operator_uids),
+        #[cfg(unix)]
+        Accepted::UnixRpc {
+            peer,
+            stream,
+            allowed_uids,
+            operator_uids,
+        } => (peer, stream, allowed_uids, operator_uids),
+        Accepted::Consumed => return Ok(()),
+    };
+    tokio::spawn(async move {
+        serve_connection(stream, peer, allowed_uids, operator_uids, state).await;
+    });
     Ok(())
 }
 
@@ -1194,6 +1200,7 @@ async fn audit_provider_autolock(state: &SharedState, namespace: String) {
 async fn serve_connection<S>(
     stream: S,
     peer: PeerIdentity,
+    allowed_uids: Vec<u32>,
     operator_uids: Vec<u32>,
     state: SharedState,
 ) where
@@ -1216,7 +1223,14 @@ async fn serve_connection<S>(
         let (request, response, outcome, fields) = match parsed {
             Ok(request) => {
                 let fields = audit_fields(&request.params);
-                let handled = handle_request(&request, state.clone(), &peer, &operator_uids).await;
+                let handled = handle_request(
+                    &request,
+                    state.clone(),
+                    &peer,
+                    &allowed_uids,
+                    &operator_uids,
+                )
+                .await;
                 let mut fields = fields;
                 if request.method == "login"
                     && handled.outcome == "ok"
@@ -1407,6 +1421,7 @@ async fn handle_request(
     request: &RpcRequest,
     state: SharedState,
     peer: &PeerIdentity,
+    allowed_uids: &[u32],
     operator_uids: &[u32],
 ) -> HandledRequest {
     if request.jsonrpc != JSON_RPC_VERSION {
@@ -1426,8 +1441,7 @@ async fn handle_request(
             _ => classified(request.id.clone(), ErrorCode::Internal),
         };
     }
-    #[cfg(windows)]
-    if !peer.allows_normal_rpc() {
+    if !peer.allows_normal_rpc(allowed_uids) {
         return classified(request.id.clone(), ErrorCode::Unauthorized);
     }
     match request.method.as_str() {

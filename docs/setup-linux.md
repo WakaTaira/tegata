@@ -296,6 +296,8 @@ records include `shared` for a shared browser lease. The existing `tegatad token
 issue` command is an alias for `peer issue --label default` and is deprecated; it
 will be removed in the next release.
 
+Root and uids listed in `operator_uids` can connect to the socket and call administrative RPCs such as `admin_peer_issue`, while normal RPCs such as `login` are limited to uids listed in `allowed_uids`. The expected invocation is `sudo tegatad peer issue --socket /run/tegata/tegatad.sock`.
+
 ### `[[providers]]`
 
 | Key | Type | Required | Meaning |

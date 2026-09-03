@@ -51,6 +51,14 @@ pub(crate) enum Accepted<S> {
         stream: S,
         operator_uids: Vec<u32>,
     },
+    #[cfg(unix)]
+    /// 通常 RPC 用の許可 uid 集合を持つ認証済み UNIX クライアントです。
+    UnixRpc {
+        peer: PeerIdentity,
+        stream: S,
+        allowed_uids: Vec<u32>,
+        operator_uids: Vec<u32>,
+    },
     /// The connection was handled inside the transport and has no RPC surface,
     /// either because the peer was refused or because the connection was taken
     /// over for another purpose, such as a tunnel.
@@ -77,10 +85,9 @@ pub(crate) enum PeerIdentity {
 }
 
 impl PeerIdentity {
-    #[allow(dead_code)]
-    pub(crate) fn allows_normal_rpc(&self) -> bool {
+    pub(crate) fn allows_normal_rpc(&self, allowed_uids: &[u32]) -> bool {
         match self {
-            Self::Uid(_) => true,
+            Self::Uid(uid) => allowed_uids.contains(uid),
             Self::Sid { normal_allowed, .. } => *normal_allowed,
             Self::Peer { .. } => true,
             Self::System => false,

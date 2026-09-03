@@ -111,3 +111,20 @@ nix develop -c npm run test:acceptance:windows
   master password are the same throwaway value, created only for the rig.
 - Never modify anything under `tests/acceptance/` during implementation; this
   suite is the pinned contract.
+
+## Phase 4a additions (identity and session sharing)
+
+- `legacy-token.test.ts` (AC-67) starts a throwaway foreground `tegatad.exe`
+  with a loopback TCP listener on a random high port and drives it with
+  PowerShell clients on the Windows side (`System.Net.Sockets.TcpClient`,
+  `System.IO.Pipes.NamedPipeClientStream`), because WSL cannot reach the
+  host's `127.0.0.1`. Nothing to configure.
+- `pipe-principal.test.ts` (AC-68) logs in through the **service's named
+  pipe** from the interop SID as well as through the bridge. The service
+  config's `allowed_sids` must therefore include the interop user's SID
+  (the same SID `setup-windows-wsl.md` puts there). The pipe name comes from
+  `TEGATA_WIN_PIPE` (default: the value of `TEGATA_WIN_SERVICE`).
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `TEGATA_WIN_PIPE` | `$TEGATA_WIN_SERVICE` | Named pipe of the rig service (without `\\.\pipe\`) |

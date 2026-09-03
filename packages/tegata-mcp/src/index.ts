@@ -11,12 +11,14 @@ type RpcResponse = {
 };
 
 // Keep in sync with crates/tegatad/src/main.rs and tests/acceptance/support/harness.ts.
+// Keep in sync with tests/acceptance/support/phase4.ts.
 const ERROR_CODES = [
   "INVALID_CREDENTIAL",
   "MFA_REQUIRED",
   "SELECTOR_NOT_FOUND",
   "VAULT_LOCKED",
   "RATE_LIMITED",
+  "NOT_FOUND",
   "TOTP_NOT_EXPOSABLE",
   "APPROVAL_DENIED",
   "APPROVAL_TIMEOUT",
@@ -229,6 +231,7 @@ server.registerTool(
       steps: z.array(loginStep).optional(),
       success_selector: z.string().optional(),
       failure_selector: z.string().optional(),
+      exclusive: z.boolean().optional(),
     },
   },
   (args) => loginHandler(args),

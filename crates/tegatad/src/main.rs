@@ -49,9 +49,10 @@ use crate::provider::{
 };
 #[cfg(unix)]
 use crate::provider::{PassProvider, PassProviderConfig};
-#[cfg(windows)]
-use crate::transport::CdpPortResolver;
-use crate::transport::{Accepted, PeerIdentity, PlatformConfig, PlatformTransport, Transport};
+use crate::transport::{
+    Accepted, CdpPortResolver, ListenConfig, PeerIdentity, PlatformConfig, PlatformTransport,
+    Transport, legacy_peer_authenticator,
+};
 
 const JSON_RPC_VERSION: &str = "2.0";
 const METHOD_NOT_FOUND: i32 = -32601;
@@ -77,11 +78,88 @@ struct Config {
     unlock_mode: UnlockMode,
     #[serde(default)]
     providers: Vec<ProviderConfig>,
+    #[serde(default)]
+    listen: Option<Vec<ListenConfig>>,
+    #[serde(default = "default_max_pending_connections")]
+    max_pending_connections: usize,
     /// Keys of the platform transport, read from the same top level table.
     /// Which keys those are depends on the target, so the transport module
     /// owns them.
     #[serde(flatten)]
     transport: PlatformConfig,
+}
+
+fn default_max_pending_connections() -> usize {
+    8
+}
+
+fn normalize_listeners(config_text: &str, config: &Config) -> Result<Vec<ListenConfig>, io::Error> {
+    let document: toml::Value = toml::from_str(config_text).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("could not parse config: {error}"),
+        )
+    })?;
+    let legacy_keys = [
+        #[cfg(unix)]
+        "socket_path",
+        #[cfg(unix)]
+        "allowed_uids",
+        #[cfg(windows)]
+        "pipe_name",
+        #[cfg(windows)]
+        "tcp_port",
+        #[cfg(windows)]
+        "tcp_bind",
+        #[cfg(windows)]
+        "allowed_sids",
+        #[cfg(windows)]
+        "operator_sid",
+    ];
+    if config.listen.is_some() && legacy_keys.iter().any(|key| document.get(*key).is_some()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "listen cannot be combined with legacy transport keys",
+        ));
+    }
+    if let Some(listeners) = &config.listen {
+        if listeners.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "listen must contain at least one listener",
+            ));
+        }
+        return Ok(listeners.clone());
+    }
+    #[cfg(unix)]
+    {
+        let path = config.transport.socket_path.clone().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "socket_path is required")
+        })?;
+        let allowed_uids = config.transport.allowed_uids.clone().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "allowed_uids is required")
+        })?;
+        Ok(vec![ListenConfig::Unix {
+            path,
+            allowed_uids,
+            operator_uids: Vec::new(),
+        }])
+    }
+    #[cfg(windows)]
+    {
+        let mut listeners = vec![ListenConfig::Pipe {
+            name: config.transport.pipe_name.clone(),
+            allowed_sids: config.transport.allowed_sids.clone(),
+            operator_sid: config.transport.operator_sid.clone(),
+        }];
+        if config.transport.tcp_port != 0 {
+            listeners.push(ListenConfig::Tcp {
+                bind: config.transport.tcp_bind.clone(),
+                port: config.transport.tcp_port,
+            });
+        }
+        return Ok(listeners);
+    }
 }
 
 #[cfg(windows)]
@@ -215,7 +293,6 @@ enum ErrorCode {
     Internal,
     #[cfg(windows)]
     Unauthorized,
-    #[cfg(windows)]
     AdminRequired,
     #[cfg(windows)]
     AdminSealUnavailable,
@@ -235,7 +312,6 @@ impl ErrorCode {
             Self::Internal => "INTERNAL",
             #[cfg(windows)]
             Self::Unauthorized => "UNAUTHORIZED",
-            #[cfg(windows)]
             Self::AdminRequired => "ADMIN_REQUIRED",
             #[cfg(windows)]
             Self::AdminSealUnavailable => "ADMIN_SEAL_UNAVAILABLE",
@@ -376,6 +452,7 @@ async fn run_daemon(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config_text = tokio::fs::read_to_string(config_path).await?;
     let config: Config = toml::from_str(&config_text)?;
+    let listeners = normalize_listeners(&config_text, &config)?;
     remove_legacy_password_dir(Path::new(&config.state_dir)).await;
     #[cfg(windows)]
     if config.approve_cmd.is_some() {
@@ -426,23 +503,26 @@ async fn run_daemon(
     let _ = config.approve_timeout_secs;
     #[cfg(windows)]
     let (token_hash_path, _sealed_blob_path) = resolve_windows_paths(&config);
-    #[cfg(windows)]
-    let transport_config = config.transport.clone();
     #[cfg(unix)]
-    let transport = PlatformTransport::bind(&config.transport).await?;
+    let token_hash_path = PathBuf::from(&config.state_dir).join("token_hash");
+    let max_pending_connections = config.max_pending_connections;
     tokio::fs::create_dir_all(&config.state_dir).await?;
     let state = Arc::new(Mutex::new(build_state(config)?));
-    #[cfg(windows)]
-    let transport = {
-        let cdp_ports = state.lock().await.cdp_ports.clone();
-        let resolver: CdpPortResolver = Arc::new(move |session_id| {
-            cdp_ports
-                .read()
-                .ok()
-                .and_then(|ports| ports.get(session_id).copied())
-        });
-        PlatformTransport::bind(&transport_config, &token_hash_path, resolver).await?
-    };
+    let cdp_ports = state.lock().await.cdp_ports.clone();
+    let resolver: CdpPortResolver = Arc::new(move |session_id| {
+        cdp_ports
+            .read()
+            .ok()
+            .and_then(|ports| ports.get(session_id).copied())
+    });
+    let transport = PlatformTransport::bind(
+        &listeners,
+        &token_hash_path,
+        resolver,
+        legacy_peer_authenticator(),
+        max_pending_connections,
+    )
+    .await?;
     if let Some(sender) = ready_sender
         && let Some(sender) = sender.lock().expect("service ready lock").take()
     {
@@ -591,9 +671,14 @@ async fn process_accepted<S>(
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
-    if let Accepted::Rpc { peer, stream } = accepted {
+    if let Accepted::Rpc {
+        peer,
+        stream,
+        operator_uids,
+    } = accepted
+    {
         tokio::spawn(async move {
-            serve_connection(stream, peer, state).await;
+            serve_connection(stream, peer, operator_uids, state).await;
         });
     }
     Ok(())
@@ -896,8 +981,12 @@ async fn audit_provider_autolock(state: &SharedState, namespace: String) {
     }
 }
 
-async fn serve_connection<S>(stream: S, peer: PeerIdentity, state: SharedState)
-where
+async fn serve_connection<S>(
+    stream: S,
+    peer: PeerIdentity,
+    operator_uids: Vec<u32>,
+    state: SharedState,
+) where
     S: AsyncRead + AsyncWrite + Send + Unpin,
 {
     let (read_half, mut write_half) = tokio::io::split(stream);
@@ -907,7 +996,7 @@ where
         let (request, response, outcome, fields) = match parsed {
             Ok(request) => {
                 let fields = audit_fields(&request.params);
-                let handled = handle_request(&request, state.clone(), &peer).await;
+                let handled = handle_request(&request, state.clone(), &peer, &operator_uids).await;
                 (Some(request), handled.response, handled.outcome, fields)
             }
             Err(_) => (
@@ -1085,27 +1174,30 @@ async fn handle_request(
     request: &RpcRequest,
     state: SharedState,
     peer: &PeerIdentity,
+    operator_uids: &[u32],
 ) -> HandledRequest {
     if request.jsonrpc != JSON_RPC_VERSION {
         return classified(request.id.clone(), ErrorCode::Internal);
     }
-    #[cfg(windows)]
-    if request.method == "admin_seal" || request.method == "admin_token_issue" {
-        if !peer.allows_admin_rpc() {
+    if request.method.starts_with("admin_") {
+        if !peer.allows_admin_rpc(operator_uids) {
             return classified(request.id.clone(), ErrorCode::AdminRequired);
         }
-        return match request.method.as_str() {
-            "admin_seal" => admin_seal(request, state).await,
-            "admin_token_issue" => admin_token_issue(request, state).await,
-            _ => unreachable!(),
-        };
+        #[cfg(windows)]
+        {
+            return match request.method.as_str() {
+                "admin_seal" => admin_seal(request, state).await,
+                "admin_token_issue" => admin_token_issue(request, state).await,
+                _ => classified(request.id.clone(), ErrorCode::Internal),
+            };
+        }
+        #[cfg(not(windows))]
+        return classified(request.id.clone(), ErrorCode::Internal);
     }
     #[cfg(windows)]
     if !peer.allows_normal_rpc() {
         return classified(request.id.clone(), ErrorCode::Unauthorized);
     }
-    #[cfg(not(windows))]
-    let _ = peer;
     match request.method.as_str() {
         "status" => success(request.id.clone(), json!({ "ok": true })),
         "list_credentials" => list_credentials(request, state).await,
@@ -1374,6 +1466,7 @@ async fn approve_login(
     };
     let peer_uid = match peer {
         PeerIdentity::Uid(uid) => uid.to_string(),
+        _ => peer.principal(),
     };
     let mut command = Command::new("sh");
     command
@@ -1995,7 +2088,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&record).expect("serialize audit record"),
-            r#"{"ts":"unix:1","peer_uid":1000,"method":"status","cred_id":null,"target_url":null,"session_id":null,"namespace":null,"outcome":"ok"}"#
+            r#"{"ts":"unix:1","peer_uid":1000,"principal":"uid:1000","method":"status","cred_id":null,"target_url":null,"session_id":null,"namespace":null,"outcome":"ok"}"#
         );
     }
 }

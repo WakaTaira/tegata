@@ -18,12 +18,11 @@ mod windows;
 use std::future::Future;
 use std::io;
 
-use serde::Serializer;
 use serde::ser::SerializeMap;
+use serde::{Deserialize, Serializer};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-#[cfg(windows)]
-pub(crate) use tcp::{Accepted as TcpAccepted, CdpPortResolver, TcpTransport};
+pub(crate) use tcp::{CdpPortResolver, PeerAuthenticator, TcpTransport, legacy_peer_authenticator};
 
 #[cfg(unix)]
 pub(crate) use unix::{PlatformConfig, PlatformTransport};
@@ -47,7 +46,11 @@ pub(crate) trait Transport {
 /// Outcome of a single accept.
 pub(crate) enum Accepted<S> {
     /// Authenticated client that speaks the JSON-RPC protocol.
-    Rpc { peer: PeerIdentity, stream: S },
+    Rpc {
+        peer: PeerIdentity,
+        stream: S,
+        operator_uids: Vec<u32>,
+    },
     /// The connection was handled inside the transport and has no RPC surface,
     /// either because the peer was refused or because the connection was taken
     /// over for another purpose, such as a tunnel.
@@ -55,18 +58,10 @@ pub(crate) enum Accepted<S> {
 }
 
 /// Identity of an authenticated peer, as established by the transport.
-#[cfg(unix)]
+#[allow(dead_code)]
 pub(crate) enum PeerIdentity {
     /// Peer credentials of a UNIX domain socket client.
     Uid(u32),
-}
-
-/// Identity of an authenticated peer, as established by the transport.
-///
-/// The Windows transport establishes both the ordinary-RPC and administrative
-/// permissions before handing the stream to the RPC layer.
-#[cfg(windows)]
-pub(crate) enum PeerIdentity {
     /// Named pipe client, identified by the SID of its access token. The
     /// elevation flag gates the administrative RPC surface.
     Sid {
@@ -75,28 +70,37 @@ pub(crate) enum PeerIdentity {
         administrator: bool,
         normal_allowed: bool,
     },
-    /// Loopback TCP client that presented a valid preamble token. Such a peer
-    /// carries no operating system identity.
-    Token,
+    /// TCP client that presented a valid preamble token.
+    Peer { peer_id: String, label: String },
 }
 
-#[cfg(windows)]
 impl PeerIdentity {
+    #[allow(dead_code)]
     pub(crate) fn allows_normal_rpc(&self) -> bool {
         match self {
+            Self::Uid(_) => true,
             Self::Sid { normal_allowed, .. } => *normal_allowed,
-            Self::Token => true,
+            Self::Peer { .. } => true,
         }
     }
 
-    pub(crate) fn allows_admin_rpc(&self) -> bool {
+    pub(crate) fn allows_admin_rpc(&self, operator_uids: &[u32]) -> bool {
         match self {
+            Self::Uid(uid) => *uid == 0 || operator_uids.contains(uid),
             Self::Sid {
                 elevated,
                 administrator,
                 ..
             } => *elevated && *administrator,
-            Self::Token => false,
+            Self::Peer { .. } => false,
+        }
+    }
+
+    pub(crate) fn principal(&self) -> String {
+        match self {
+            Self::Uid(uid) => format!("uid:{uid}"),
+            Self::Sid { sid, .. } => format!("sid:{sid}"),
+            Self::Peer { peer_id, .. } => format!("peer:{peer_id}"),
         }
     }
 }
@@ -105,11 +109,9 @@ impl PeerIdentity {
 /// flattened into the audit record.
 impl serde::Serialize for PeerIdentity {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(3))?;
+        let mut map = serializer.serialize_map(Some(5))?;
         match self {
-            #[cfg(unix)]
             Self::Uid(uid) => map.serialize_entry("peer_uid", uid)?,
-            #[cfg(windows)]
             Self::Sid {
                 sid,
                 elevated,
@@ -120,9 +122,39 @@ impl serde::Serialize for PeerIdentity {
                 map.serialize_entry("elevated", elevated)?;
                 map.serialize_entry("administrator", administrator)?;
             }
-            #[cfg(windows)]
-            Self::Token => map.serialize_entry("peer_token", &true)?,
+            Self::Peer { peer_id, label } => {
+                map.serialize_entry("peer_token", &true)?;
+                map.serialize_entry("peer_id", peer_id)?;
+                map.serialize_entry("peer_label", label)?;
+            }
         }
+        map.serialize_entry("principal", &self.principal())?;
         map.end()
     }
+}
+
+pub(crate) trait ClientStream: AsyncRead + AsyncWrite + Send + Unpin {}
+
+impl<T: AsyncRead + AsyncWrite + Send + Unpin> ClientStream for T {}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub(crate) enum ListenConfig {
+    Unix {
+        path: String,
+        allowed_uids: Vec<u32>,
+        #[serde(default)]
+        operator_uids: Vec<u32>,
+    },
+    Tcp {
+        bind: String,
+        port: u16,
+    },
+    Pipe {
+        name: String,
+        allowed_sids: Vec<String>,
+        #[serde(default)]
+        operator_sid: Option<String>,
+    },
 }

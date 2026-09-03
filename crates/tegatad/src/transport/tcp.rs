@@ -1,17 +1,17 @@
 //! Token-authenticated TCP transport shared by the platform implementations.
 
-#![cfg_attr(not(windows), allow(dead_code))]
-
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tegata_core::wire::{PREAMBLE_VERSION, Preamble, PreambleError, PreambleResponse};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 const MAX_PREAMBLE_BYTES: usize = 4 * 1024;
@@ -20,16 +20,18 @@ const MAX_REFUSAL_DRAIN_BYTES: usize = 64 * 1024;
 const REFUSAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) type CdpPortResolver = Arc<dyn Fn(&str) -> Option<u16> + Send + Sync>;
-
-pub(crate) enum Accepted {
-    Rpc { stream: TcpStream },
-    Consumed,
-}
+pub(crate) type PeerAuthenticator =
+    Arc<dyn Fn(&str, &[u8; 32]) -> Option<super::PeerIdentity> + Send + Sync>;
 
 pub(crate) struct TcpTransport {
     listener: TcpListener,
     token_hash_path: Box<Path>,
     cdp_port_resolver: CdpPortResolver,
+    peer_authenticator: PeerAuthenticator,
+    pending_connections: Arc<AtomicUsize>,
+    max_pending_connections: usize,
+    accepted_sender: mpsc::Sender<io::Result<super::Accepted<TcpStream>>>,
+    accepted: mpsc::Receiver<io::Result<super::Accepted<TcpStream>>>,
 }
 
 impl TcpTransport {
@@ -37,12 +39,20 @@ impl TcpTransport {
         address: SocketAddr,
         token_hash_path: &Path,
         cdp_port_resolver: CdpPortResolver,
+        peer_authenticator: PeerAuthenticator,
+        max_pending_connections: usize,
     ) -> io::Result<Self> {
         let listener = bind_tcp_listener(address).await?;
+        let (accepted_sender, accepted) = mpsc::channel(max_pending_connections.max(1));
         Ok(Self {
             listener,
             token_hash_path: token_hash_path.into(),
             cdp_port_resolver,
+            peer_authenticator,
+            pending_connections: Arc::new(AtomicUsize::new(0)),
+            max_pending_connections,
+            accepted_sender,
+            accepted,
         })
     }
 
@@ -60,6 +70,8 @@ impl TcpTransport {
             SocketAddr::from(([127, 0, 0, 1], 0)),
             &path,
             cdp_port_resolver,
+            legacy_peer_authenticator(),
+            8,
         )
         .await
     }
@@ -81,55 +93,126 @@ impl TcpTransport {
         self.listener.local_addr()
     }
 
-    pub(crate) async fn accept(&self) -> io::Result<Accepted> {
-        let (mut stream, _) = self.listener.accept().await?;
-        let preamble = match timeout(PREAMBLE_TIMEOUT, read_preamble(&mut stream)).await {
-            Ok(Ok(preamble)) => preamble,
-            Ok(Err(_)) | Err(_) => {
-                log_authentication_failure();
-                refuse_connection(&mut stream, PreambleError::Unauthorized).await;
-                return Ok(Accepted::Consumed);
+    pub(crate) async fn accept(&mut self) -> io::Result<super::Accepted<TcpStream>> {
+        loop {
+            tokio::select! {
+                result = self.listener.accept() => {
+                    let (stream, _) = result?;
+                    if !reserve_pending_connection(
+                        &self.pending_connections,
+                        self.max_pending_connections,
+                    ) {
+                        let mut stream = stream;
+                        let _ = stream.shutdown().await;
+                        continue;
+                    }
+                    let token_hash_path = self.token_hash_path.to_owned();
+                    let cdp_port_resolver = self.cdp_port_resolver.clone();
+                    let peer_authenticator = self.peer_authenticator.clone();
+                    let pending_connections = self.pending_connections.clone();
+                    let sender = self.accepted_sender.clone();
+                    tokio::spawn(async move {
+                        let accepted = handle_connection(
+                            stream,
+                            &token_hash_path,
+                            &cdp_port_resolver,
+                            &peer_authenticator,
+                            &pending_connections,
+                        )
+                        .await;
+                        let _ = sender.send(accepted).await;
+                    });
+                }
+                accepted = self.accepted.recv() => {
+                    return accepted.unwrap_or_else(|| Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "TCP accept queue stopped",
+                    )));
+                }
             }
-        };
+        }
+    }
+}
 
-        let token_digest = match load_token_digest(&self.token_hash_path).await {
-            Ok(token_digest) => token_digest,
-            Err(_) => {
-                log_authentication_failure();
-                refuse_connection(&mut stream, PreambleError::Unauthorized).await;
-                return Ok(Accepted::Consumed);
-            }
-        };
-        if preamble.v != PREAMBLE_VERSION
-            || !constant_time_digest_matches(&preamble.auth, &token_digest)
-        {
+async fn handle_connection(
+    mut stream: TcpStream,
+    token_hash_path: &Path,
+    cdp_port_resolver: &CdpPortResolver,
+    peer_authenticator: &PeerAuthenticator,
+    pending_connections: &AtomicUsize,
+) -> io::Result<super::Accepted<TcpStream>> {
+    let preamble = match timeout(PREAMBLE_TIMEOUT, read_preamble(&mut stream)).await {
+        Ok(Ok(preamble)) => preamble,
+        Ok(Err(_)) | Err(_) => {
+            pending_connections.fetch_sub(1, Ordering::AcqRel);
             log_authentication_failure();
             refuse_connection(&mut stream, PreambleError::Unauthorized).await;
-            return Ok(Accepted::Consumed);
+            return Ok(super::Accepted::Consumed);
         }
+    };
+    pending_connections.fetch_sub(1, Ordering::AcqRel);
 
-        let Some(tunnel) = preamble.tunnel else {
-            return Ok(Accepted::Rpc { stream });
-        };
-        if tunnel.port == 0 || (self.cdp_port_resolver)(&tunnel.session_id) != Some(tunnel.port) {
-            refuse_connection(&mut stream, PreambleError::Forbidden).await;
-            return Ok(Accepted::Consumed);
+    let token_digest = match load_token_digest(token_hash_path).await {
+        Ok(token_digest) => token_digest,
+        Err(_) => {
+            log_authentication_failure();
+            refuse_connection(&mut stream, PreambleError::Unauthorized).await;
+            return Ok(super::Accepted::Consumed);
         }
+    };
+    let peer = if preamble.v == PREAMBLE_VERSION {
+        (peer_authenticator)(&preamble.auth, &token_digest)
+    } else {
+        None
+    };
+    let Some(peer) = peer else {
+        log_authentication_failure();
+        refuse_connection(&mut stream, PreambleError::Unauthorized).await;
+        return Ok(super::Accepted::Consumed);
+    };
 
-        let mut cdp_stream =
-            match TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], tunnel.port))).await {
-                Ok(stream) => stream,
-                Err(error) => {
-                    eprintln!("tegatad: could not connect to the requested CDP endpoint: {error}");
-                    return Ok(Accepted::Consumed);
-                }
-            };
-        let _ = write_response(&mut stream, &PreambleResponse::accepted()).await;
-        tokio::spawn(async move {
-            let _ = copy_bidirectional(&mut stream, &mut cdp_stream).await;
+    let Some(tunnel) = preamble.tunnel else {
+        return Ok(super::Accepted::Rpc {
+            peer,
+            stream,
+            operator_uids: Vec::new(),
         });
-        Ok(Accepted::Consumed)
+    };
+    if tunnel.port == 0 || (cdp_port_resolver)(&tunnel.session_id) != Some(tunnel.port) {
+        refuse_connection(&mut stream, PreambleError::Forbidden).await;
+        return Ok(super::Accepted::Consumed);
     }
+
+    let mut cdp_stream =
+        match TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], tunnel.port))).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("tegatad: could not connect to the requested CDP endpoint: {error}");
+                return Ok(super::Accepted::Consumed);
+            }
+        };
+    let _ = write_response(&mut stream, &PreambleResponse::accepted()).await;
+    tokio::spawn(async move {
+        let _ = copy_bidirectional(&mut stream, &mut cdp_stream).await;
+    });
+    Ok(super::Accepted::Consumed)
+}
+
+fn reserve_pending_connection(pending: &AtomicUsize, limit: usize) -> bool {
+    pending
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < limit).then_some(count + 1)
+        })
+        .is_ok()
+}
+
+pub(crate) fn legacy_peer_authenticator() -> PeerAuthenticator {
+    Arc::new(|token, expected| {
+        constant_time_digest_matches(token, expected).then(|| super::PeerIdentity::Peer {
+            peer_id: "legacy".to_owned(),
+            label: "legacy".to_owned(),
+        })
+    })
 }
 
 pub(crate) async fn bind_tcp_listener(address: SocketAddr) -> io::Result<TcpListener> {
@@ -261,7 +344,8 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::time::{Duration, timeout};
 
-    use super::{Accepted, CdpPortResolver, TcpTransport, parse_token_digest};
+    use super::super::Accepted;
+    use super::{CdpPortResolver, TcpTransport, parse_token_digest};
 
     const TOKEN: &str = "test-token";
     const UNAUTHORIZED: &[u8] = b"{\"ok\":false,\"error\":\"UNAUTHORIZED\"}\n";
@@ -285,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_token_without_tunnel_returns_rpc_stream() {
-        let transport = transport(Arc::new(|_| None)).await;
+        let mut transport = transport(Arc::new(|_| None)).await;
         let mut client = tokio::net::TcpStream::connect(transport.local_addr().unwrap())
             .await
             .unwrap();
@@ -295,7 +379,7 @@ mod tests {
             .unwrap();
 
         let accepted = transport.accept().await.expect("accept TCP connection");
-        let Accepted::Rpc { mut stream } = accepted else {
+        let Accepted::Rpc { mut stream, .. } = accepted else {
             panic!("expected RPC stream");
         };
         client
@@ -319,7 +403,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_token_is_refused_without_rpc_processing() {
-        let transport = transport(Arc::new(|_| None)).await;
+        let mut transport = transport(Arc::new(|_| None)).await;
         let mut client = tokio::net::TcpStream::connect(transport.local_addr().unwrap())
             .await
             .unwrap();
@@ -342,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_auth_is_refused() {
-        let transport = transport(Arc::new(|_| None)).await;
+        let mut transport = transport(Arc::new(|_| None)).await;
         let mut client = tokio::net::TcpStream::connect(transport.local_addr().unwrap())
             .await
             .unwrap();
@@ -357,7 +441,7 @@ mod tests {
     #[tokio::test]
     async fn forbidden_tunnel_is_refused_when_port_does_not_match() {
         let resolver: CdpPortResolver = Arc::new(|session| (session == "session").then_some(9222));
-        let transport = transport(resolver).await;
+        let mut transport = transport(resolver).await;
         let mut client = tokio::net::TcpStream::connect(transport.local_addr().unwrap())
             .await
             .unwrap();
@@ -386,7 +470,7 @@ mod tests {
         });
         let resolver: CdpPortResolver =
             Arc::new(move |session| (session == "session").then_some(cdp_port));
-        let transport = transport(resolver).await;
+        let mut transport = transport(resolver).await;
         let mut client = tokio::net::TcpStream::connect(transport.local_addr().unwrap())
             .await
             .unwrap();
@@ -410,7 +494,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_and_oversized_preambles_are_refused() {
         for preamble in [b"not-json\n".to_vec(), vec![b'x'; 4097]] {
-            let transport = transport(Arc::new(|_| None)).await;
+            let mut transport = transport(Arc::new(|_| None)).await;
             let mut client = tokio::net::TcpStream::connect(transport.local_addr().unwrap())
                 .await
                 .unwrap();
@@ -432,7 +516,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_hash_rotation_takes_effect_without_rebinding() {
-        let transport = transport(Arc::new(|_| None)).await;
+        let mut transport = transport(Arc::new(|_| None)).await;
         let mut client = tokio::net::TcpStream::connect(transport.local_addr().unwrap())
             .await
             .unwrap();
@@ -461,7 +545,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_token_hash_is_unauthorized() {
-        let transport = transport(Arc::new(|_| None)).await;
+        let mut transport = transport(Arc::new(|_| None)).await;
         tokio::fs::remove_file(&transport.token_hash_path)
             .await
             .unwrap();

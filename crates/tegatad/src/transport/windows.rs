@@ -45,7 +45,10 @@ use windows_sys::Win32::System::SystemServices::{
 };
 use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
-use super::{Accepted, CdpPortResolver, TcpAccepted, TcpTransport, Transport};
+use super::{
+    Accepted, CdpPortResolver, ClientStream, ListenConfig, PeerAuthenticator, PeerIdentity,
+    TcpTransport, Transport,
+};
 
 /// Configuration keys owned by this transport.
 #[derive(Clone, Debug, Deserialize)]
@@ -107,22 +110,14 @@ fn default_tcp_bind() -> String {
     "auto".to_owned()
 }
 
-/// Client stream of the Windows transport.
-///
-/// The two fronts produce different concrete streams, so they are boxed behind
-/// this trait rather than forcing the RPC layer to know about either of them.
-pub(crate) trait ClientStream: AsyncRead + AsyncWrite + Send + Unpin {}
-
-impl<T: AsyncRead + AsyncWrite + Send + Unpin> ClientStream for T {}
-
-/// Named pipe and loopback TCP listeners of the Windows service.
+/// Named pipe and TCP listeners of the Windows service.
 pub(crate) struct PlatformTransport {
-    pipe: PipeTransport,
-    tcp: Option<TcpTransport>,
+    receiver: mpsc::Receiver<io::Result<Accepted<Box<dyn ClientStream>>>>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 struct PipeTransport {
-    receiver: mpsc::Receiver<io::Result<(super::PeerIdentity, PrefixedStream<NamedPipeServer>)>>,
+    receiver: mpsc::Receiver<io::Result<(PeerIdentity, PrefixedStream<NamedPipeServer>)>>,
     accept_task: tokio::task::JoinHandle<()>,
 }
 
@@ -261,7 +256,7 @@ async fn accept_loop(
     name: OsString,
     allowed_sids: Vec<String>,
     daemon_sid: String,
-    sender: mpsc::Sender<io::Result<(super::PeerIdentity, PrefixedStream<NamedPipeServer>)>>,
+    sender: mpsc::Sender<io::Result<(PeerIdentity, PrefixedStream<NamedPipeServer>)>>,
 ) {
     loop {
         if let Err(error) = server.connect().await {
@@ -289,7 +284,7 @@ async fn accept_loop(
 async fn validate_client(
     mut connected: NamedPipeServer,
     allowed_sids: &[String],
-) -> Option<(super::PeerIdentity, PrefixedStream<NamedPipeServer>)> {
+) -> Option<(PeerIdentity, PrefixedStream<NamedPipeServer>)> {
     // The client becomes impersonable only once it has sent data, so the first
     // byte of its request is read here and replayed to the RPC layer.
     let mut prefix = [0_u8; 1];
@@ -303,7 +298,7 @@ async fn validate_client(
         return None;
     }
     Some((
-        super::PeerIdentity::Sid {
+        PeerIdentity::Sid {
             sid: identity.sid,
             elevated: identity.elevated,
             administrator: identity.administrator,
@@ -558,30 +553,91 @@ fn is_administrator(token: HANDLE) -> io::Result<bool> {
 }
 
 impl PlatformTransport {
-    /// Prepares the named pipe and, unless `tcp_port` is zero, the loopback
-    /// TCP listener.
+    /// Prepares the configured named pipe and TCP listeners.
     pub(crate) async fn bind(
-        config: &PlatformConfig,
+        listeners: &[ListenConfig],
         token_hash_path: &Path,
         cdp_port_resolver: CdpPortResolver,
+        peer_authenticator: PeerAuthenticator,
+        max_pending_connections: usize,
     ) -> io::Result<Self> {
-        let pipe = PipeTransport::bind(&config.pipe_name, &config.allowed_sids)?;
-        let tcp = if config.tcp_port == 0 {
-            None
-        } else {
-            let address = resolve_tcp_bind(&config.tcp_bind, config.tcp_port)?;
-            Some(TcpTransport::bind(address, token_hash_path, cdp_port_resolver).await?)
-        };
-        Ok(Self { pipe, tcp })
+        let (sender, receiver) = mpsc::channel(listeners.len().max(1) * 16);
+        let mut tasks = Vec::new();
+        let mut has_pipe = false;
+        for listener in listeners {
+            match listener {
+                ListenConfig::Pipe {
+                    name, allowed_sids, ..
+                } => {
+                    let mut pipe = PipeTransport::bind(name, allowed_sids)?;
+                    has_pipe = true;
+                    let sender = sender.clone();
+                    tasks.push(tokio::spawn(async move {
+                        loop {
+                            let accepted = PlatformTransport::pipe_result(pipe.accept().await);
+                            if sender.send(accepted).await.is_err() {
+                                return;
+                            }
+                        }
+                    }));
+                }
+                ListenConfig::Tcp { bind, port } => {
+                    let address = resolve_tcp_bind(bind, *port)?;
+                    let mut tcp = TcpTransport::bind(
+                        address,
+                        token_hash_path,
+                        cdp_port_resolver.clone(),
+                        peer_authenticator.clone(),
+                        max_pending_connections,
+                    )
+                    .await?;
+                    let sender = sender.clone();
+                    tasks.push(tokio::spawn(async move {
+                        loop {
+                            let accepted = tcp.accept().await.map(|accepted| match accepted {
+                                Accepted::Rpc {
+                                    peer,
+                                    stream,
+                                    operator_uids,
+                                } => Accepted::Rpc {
+                                    peer,
+                                    stream: Box::new(stream) as Box<dyn ClientStream>,
+                                    operator_uids,
+                                },
+                                Accepted::Consumed => Accepted::Consumed,
+                            });
+                            if sender.send(accepted).await.is_err() {
+                                return;
+                            }
+                        }
+                    }));
+                }
+                ListenConfig::Unix { .. } => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "UNIX listeners are only supported on Unix",
+                    ));
+                }
+            }
+        }
+        if !has_pipe {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a pipe listener is required on Windows",
+            ));
+        }
+        drop(sender);
+        Ok(Self { receiver, tasks })
     }
 
     fn pipe_result(
-        result: io::Result<Option<(super::PeerIdentity, PrefixedStream<NamedPipeServer>)>>,
+        result: io::Result<Option<(PeerIdentity, PrefixedStream<NamedPipeServer>)>>,
     ) -> io::Result<Accepted<Box<dyn ClientStream>>> {
         match result? {
             Some((peer, stream)) => Ok(Accepted::Rpc {
                 peer,
                 stream: Box::new(stream),
+                operator_uids: Vec::new(),
             }),
             None => Ok(Accepted::Consumed),
         }
@@ -592,19 +648,19 @@ impl Transport for PlatformTransport {
     type Stream = Box<dyn ClientStream>;
 
     async fn accept(&mut self) -> io::Result<Accepted<Self::Stream>> {
-        if let Some(tcp) = &self.tcp {
-            tokio::select! {
-                result = tcp.accept() => match result? {
-                    TcpAccepted::Rpc { stream } => Ok(Accepted::Rpc {
-                        peer: super::PeerIdentity::Token,
-                        stream: Box::new(stream),
-                    }),
-                    TcpAccepted::Consumed => Ok(Accepted::Consumed),
-                },
-                result = self.pipe.accept() => Self::pipe_result(result),
-            }
-        } else {
-            Self::pipe_result(self.pipe.accept().await)
+        self.receiver.recv().await.unwrap_or_else(|| {
+            Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "listener accept loop stopped",
+            ))
+        })
+    }
+}
+
+impl Drop for PlatformTransport {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
         }
     }
 }
@@ -625,6 +681,12 @@ fn resolve_tcp_bind(bind: &str, port: u16) -> io::Result<SocketAddr> {
             )
         })?
     };
+    if address.is_unspecified() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tcp_bind must not be an unspecified address",
+        ));
+    }
     Ok(SocketAddr::from((address, port)))
 }
 

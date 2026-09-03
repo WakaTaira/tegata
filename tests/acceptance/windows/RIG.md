@@ -43,7 +43,14 @@ skips) when the rig is not configured — see `requireRig()` in
    Copy `cert.pem` to `C:\ProgramData\tegata\test-vault-ca.pem`, next to the
    config, before the next step (`service install` protects the directory,
    and the service account reads through that DACL). Point the provider at
-   `server_url = "https://localhost:8087"`.
+   `server_url = "https://127.0.0.1:8087"`, not `localhost`: Windows resolves
+   `localhost` to `::1` before `127.0.0.1`, WSL's localhost forwarding only
+   carries IPv4, and the Bitwarden CLI does not fall back to IPv4 when the
+   IPv6 connection is refused. With `localhost` the service answers `INTERNAL`
+   to the first `list_credentials` after a restart (`Unable to fetch
+   ServerConfig ... ECONNREFUSED` in the CLI), and whether it fails at all
+   depends on the host's current address ordering. The certificate above
+   already carries `127.0.0.1` in its SAN.
 3. `tegatad.exe service install --config C:\ProgramData\tegata\config.toml`
    (registers the service, adds the WSL-subnet-scoped inbound firewall rule
    for the daemon TCP port, creates and ACLs `C:\ProgramData\tegata`, grants

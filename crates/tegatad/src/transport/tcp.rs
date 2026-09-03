@@ -19,7 +19,8 @@ const PREAMBLE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REFUSAL_DRAIN_BYTES: usize = 64 * 1024;
 const REFUSAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
-pub(crate) type CdpPortResolver = Arc<dyn Fn(&str) -> Option<u16> + Send + Sync>;
+pub(crate) type CdpPortResolver =
+    Arc<dyn Fn(&str, &super::PeerIdentity) -> Option<u16> + Send + Sync>;
 pub(crate) type PeerAuthenticator =
     Arc<dyn Fn(&str, &[u8; 32]) -> Option<super::PeerIdentity> + Send + Sync>;
 
@@ -153,7 +154,11 @@ async fn handle_connection(
             operator_uids: Vec::new(),
         });
     };
-    if tunnel.port == 0 || (cdp_port_resolver)(&tunnel.session_id) != Some(tunnel.port) {
+    let Some(cdp_port) = (cdp_port_resolver)(&tunnel.session_id, &peer) else {
+        refuse_connection(&mut stream, PreambleError::NotFound).await;
+        return Ok(super::Accepted::Consumed);
+    };
+    if tunnel.port == 0 || cdp_port != tunnel.port {
         refuse_connection(&mut stream, PreambleError::Forbidden).await;
         return Ok(super::Accepted::Consumed);
     }
@@ -281,7 +286,7 @@ mod tests {
 
     #[tokio::test]
     async fn valid_token_without_tunnel_returns_rpc_stream() {
-        let mut transport = transport(Arc::new(|_| None)).await;
+        let mut transport = transport(Arc::new(|_, _| None)).await;
         let mut client = tokio::net::TcpStream::connect(transport.local_addr().unwrap())
             .await
             .unwrap();
@@ -315,7 +320,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_token_is_refused_without_rpc_processing() {
-        let mut transport = transport(Arc::new(|_| None)).await;
+        let mut transport = transport(Arc::new(|_, _| None)).await;
         let mut client = tokio::net::TcpStream::connect(transport.local_addr().unwrap())
             .await
             .unwrap();
@@ -338,7 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_auth_is_refused() {
-        let mut transport = transport(Arc::new(|_| None)).await;
+        let mut transport = transport(Arc::new(|_, _| None)).await;
         let mut client = tokio::net::TcpStream::connect(transport.local_addr().unwrap())
             .await
             .unwrap();
@@ -352,7 +357,8 @@ mod tests {
 
     #[tokio::test]
     async fn forbidden_tunnel_is_refused_when_port_does_not_match() {
-        let resolver: CdpPortResolver = Arc::new(|session| (session == "session").then_some(9222));
+        let resolver: CdpPortResolver =
+            Arc::new(|session, _| (session == "session").then_some(9222));
         let mut transport = transport(resolver).await;
         let mut client = tokio::net::TcpStream::connect(transport.local_addr().unwrap())
             .await
@@ -381,7 +387,7 @@ mod tests {
             stream.write_all(&bytes).await.unwrap();
         });
         let resolver: CdpPortResolver =
-            Arc::new(move |session| (session == "session").then_some(cdp_port));
+            Arc::new(move |session, _| (session == "session").then_some(cdp_port));
         let mut transport = transport(resolver).await;
         let mut client = tokio::net::TcpStream::connect(transport.local_addr().unwrap())
             .await
@@ -406,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_and_oversized_preambles_are_refused() {
         for preamble in [b"not-json\n".to_vec(), vec![b'x'; 4097]] {
-            let mut transport = transport(Arc::new(|_| None)).await;
+            let mut transport = transport(Arc::new(|_, _| None)).await;
             let mut client = tokio::net::TcpStream::connect(transport.local_addr().unwrap())
                 .await
                 .unwrap();

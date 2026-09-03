@@ -188,6 +188,8 @@ impl PreambleResponse {
 pub enum PreambleError {
     /// The preamble was malformed, unsupported, or carried a wrong token.
     Unauthorized,
+    /// The requested tunnel is not owned by the authenticated peer.
+    NotFound,
     /// The token was accepted but the requested tunnel target is not allowed.
     Forbidden,
 }
@@ -196,6 +198,7 @@ impl PreambleError {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unauthorized => "UNAUTHORIZED",
+            Self::NotFound => "NOT_FOUND",
             Self::Forbidden => "FORBIDDEN",
         }
     }

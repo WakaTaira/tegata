@@ -3,6 +3,7 @@ mod dpapi;
 mod peers;
 mod provider;
 mod secure_fs;
+mod sessions;
 mod transport;
 #[cfg(windows)]
 mod windows_cli;
@@ -25,14 +26,15 @@ use serde_json::{Value, json};
 #[cfg(unix)]
 use tegata_core::wire::{ExecutorHelloRequest, ExecutorHelloResponse};
 use tegata_core::wire::{
-    ExecutorLoginRequest, ExecutorResponse, ExecutorSecret, LoginParams, RpcError, RpcRequest,
-    RpcResponse,
+    ExecutorLeaseRequest, ExecutorLoginRequest, ExecutorReleaseRequest, ExecutorResponse,
+    ExecutorSecret, LoginParams, RpcError, RpcRequest, RpcResponse,
 };
 use tegata_core::{Secret, totp};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
-use tokio::time::{Instant, interval, timeout};
+use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinSet;
+use tokio::time::{Instant, interval, sleep, timeout};
 use uuid::Uuid;
 
 #[cfg(windows)]
@@ -57,6 +59,9 @@ const JSON_RPC_VERSION: &str = "2.0";
 const METHOD_NOT_FOUND: i32 = -32601;
 const CLASSIFICATION_ERROR: i32 = -32000;
 const EXECUTOR_TIMEOUT: Duration = Duration::from_secs(90);
+const EXECUTOR_OPERATION_TIMEOUT: Duration = Duration::from_secs(1);
+const EXECUTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const EXECUTOR_LEASE_READY_DELAY: Duration = Duration::from_millis(100);
 const PASSWORD_FILE_DIR: &str = ".bw-passwords";
 
 type ReadySender = Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<Result<(), String>>>>>;
@@ -230,12 +235,6 @@ struct Provider {
     provider: Arc<Mutex<dyn CredentialProvider + Send>>,
 }
 
-struct Session {
-    executor: ExecutorHandle,
-    expires_at: Instant,
-    namespace: String,
-}
-
 enum ExecutorHandle {
     Spawned(Child),
     #[cfg(unix)]
@@ -251,9 +250,17 @@ enum ExecutorReader {
     Socket(Arc<Mutex<tokio::net::unix::OwnedReadHalf>>),
 }
 
+pub(crate) struct ExecutorConnection {
+    executor: Mutex<ExecutorHandle>,
+    responses: Mutex<mpsc::UnboundedReceiver<io::Result<String>>>,
+    operation: Mutex<()>,
+}
+
 struct DaemonState {
     providers: Vec<Provider>,
-    sessions: HashMap<String, Session>,
+    browsers: HashMap<String, sessions::Browser>,
+    shared_browsers: HashMap<sessions::BrowserKey, String>,
+    start_controls: HashMap<sessions::BrowserKey, Arc<Mutex<sessions::StartControl>>>,
     last_totp: HashMap<String, Instant>,
     registry: Arc<Mutex<Vec<String>>>,
     audit_log_path: PathBuf,
@@ -264,8 +271,9 @@ struct DaemonState {
     executor_socket: Option<PathBuf>,
     node_path: PathBuf,
     browsers_path: Option<PathBuf>,
-    cdp_ports: Arc<std::sync::RwLock<HashMap<String, u16>>>,
+    cdp_ports: Arc<std::sync::RwLock<HashMap<String, (String, u16)>>>,
     session_ttl: Duration,
+    provider_ttls: HashMap<String, Duration>,
     #[cfg(unix)]
     approve_cmd: Option<String>,
     #[cfg(unix)]
@@ -347,6 +355,8 @@ struct AuditRecord<'a> {
     target_url: Option<String>,
     session_id: Option<String>,
     namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shared: Option<bool>,
     outcome: String,
 }
 
@@ -356,11 +366,28 @@ struct AuditFields {
     target_url: Option<String>,
     session_id: Option<String>,
     namespace: Option<String>,
+    shared: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct LoginRequestParams {
+    #[serde(flatten)]
+    login: LoginParams,
+    #[serde(default)]
+    exclusive: bool,
 }
 
 struct HandledRequest {
     response: RpcResponse,
     outcome: String,
+    audit_shared: Option<bool>,
+}
+
+impl HandledRequest {
+    fn with_audit_shared(mut self, shared: bool) -> Self {
+        self.audit_shared = Some(shared);
+        self
+    }
 }
 
 #[derive(Parser)]
@@ -652,11 +679,13 @@ async fn run_daemon(
     let peers = peers::PeerStore::load_or_import(&peers_path, &token_hash_path)?;
     let state = Arc::new(Mutex::new(build_state(config, peers.clone())?));
     let cdp_ports = state.lock().await.cdp_ports.clone();
-    let resolver: CdpPortResolver = Arc::new(move |session_id| {
-        cdp_ports
-            .read()
-            .ok()
-            .and_then(|ports| ports.get(session_id).copied())
+    let resolver: CdpPortResolver = Arc::new(move |session_id, peer| {
+        cdp_ports.read().ok().and_then(|ports| {
+            ports
+                .get(session_id)
+                .filter(|(principal, _)| principal == &peer.principal())
+                .map(|(_, port)| *port)
+        })
     });
     let transport = PlatformTransport::bind(
         &listeners,
@@ -690,7 +719,7 @@ async fn serve_transport(
     // The daemon is exiting — on a stop request, a termination signal, or a
     // transport failure. Reap every live executor before returning so
     // interrupted sessions do not leave orphaned browser processes behind.
-    terminate_sessions(&state, drain_sessions(&state, None).await).await;
+    terminate_browsers(&state, drain_browsers(&state, None).await).await;
     result
 }
 
@@ -827,6 +856,25 @@ where
     Ok(())
 }
 
+fn provider_ttl_secs(kind: &ProviderConfigKind) -> Option<u64> {
+    match kind {
+        #[cfg(feature = "mock-provider")]
+        ProviderConfigKind::Mock { .. } => None,
+        ProviderConfigKind::BitwardenCli {
+            session_ttl_secs, ..
+        }
+        | ProviderConfigKind::AgeFile {
+            session_ttl_secs, ..
+        } => *session_ttl_secs,
+        #[cfg(unix)]
+        ProviderConfigKind::Pass {
+            session_ttl_secs, ..
+        } => *session_ttl_secs,
+        #[cfg(windows)]
+        ProviderConfigKind::Pass { .. } => None,
+    }
+}
+
 fn build_state(config: Config, peers: peers::SharedPeerStore) -> Result<DaemonState, io::Error> {
     #[cfg(windows)]
     let (_, sealed_blob_path) = resolve_windows_paths(&config);
@@ -852,11 +900,15 @@ fn build_state(config: Config, peers: peers::SharedPeerStore) -> Result<DaemonSt
     let bw_path = resolve_bw_path(&config);
     let session_ttl = Duration::from_secs(config.session_ttl_secs.unwrap_or(300));
     let state_dir = PathBuf::from(&config.state_dir);
+    let mut provider_ttls = HashMap::new();
     let providers = config
         .providers
         .into_iter()
         .map(|provider| -> Result<Provider, io::Error> {
             let namespace = provider.namespace;
+            if let Some(ttl) = provider_ttl_secs(&provider.kind) {
+                provider_ttls.insert(namespace.clone(), Duration::from_secs(ttl));
+            }
             let provider: Arc<Mutex<dyn CredentialProvider + Send>> = match provider.kind {
                 #[cfg(feature = "mock-provider")]
                 ProviderConfigKind::Mock { entries } => Arc::new(Mutex::new(
@@ -921,7 +973,9 @@ fn build_state(config: Config, peers: peers::SharedPeerStore) -> Result<DaemonSt
         .collect::<Result<Vec<_>, _>>()?;
     Ok(DaemonState {
         providers,
-        sessions: HashMap::new(),
+        browsers: HashMap::new(),
+        shared_browsers: HashMap::new(),
+        start_controls: HashMap::new(),
         last_totp: HashMap::new(),
         registry: Arc::new(Mutex::new(registry)),
         audit_log_path,
@@ -934,6 +988,7 @@ fn build_state(config: Config, peers: peers::SharedPeerStore) -> Result<DaemonSt
         browsers_path,
         cdp_ports: Arc::new(std::sync::RwLock::new(HashMap::new())),
         session_ttl,
+        provider_ttls,
         #[cfg(unix)]
         approve_cmd,
         #[cfg(unix)]
@@ -1040,21 +1095,60 @@ fn spawn_session_reaper(state: SharedState) {
             let expired = {
                 let mut daemon = state.lock().await;
                 let now = Instant::now();
-                let ids: Vec<String> = daemon
-                    .sessions
+                let mut expired = Vec::new();
+                let browser_ids = daemon.browsers.keys().cloned().collect::<Vec<_>>();
+                for browser_id in browser_ids {
+                    let mut removed_ids = Vec::new();
+                    {
+                        let Some(browser) = daemon.browsers.get_mut(&browser_id) else {
+                            continue;
+                        };
+                        let lease_ids = browser
+                            .leases
+                            .iter()
+                            .filter_map(|(id, lease)| {
+                                (lease.expires_at <= now).then_some(id.clone())
+                            })
+                            .collect::<Vec<_>>();
+                        for session_id in lease_ids {
+                            let Some(lease) = browser.leases.remove(&session_id) else {
+                                continue;
+                            };
+                            removed_ids.push(session_id.clone());
+                            expired.push((
+                                session_id,
+                                lease,
+                                browser.executor.clone(),
+                                browser.key.namespace.clone(),
+                                browser.leases.is_empty(),
+                            ));
+                        }
+                    }
+                    if let Ok(mut ports) = daemon.cdp_ports.write() {
+                        for session_id in removed_ids {
+                            ports.remove(&session_id);
+                        }
+                    }
+                }
+                let empty_browsers = daemon
+                    .browsers
                     .iter()
-                    .filter_map(|(id, session)| (session.expires_at <= now).then_some(id.clone()))
-                    .collect();
-                ids.into_iter()
-                    .filter_map(|id| {
-                        let session = daemon.sessions.remove(&id)?;
-                        let _ = daemon.cdp_ports.write().map(|mut ports| ports.remove(&id));
-                        Some((id, session))
-                    })
-                    .collect::<Vec<_>>()
+                    .filter_map(|(id, browser)| browser.leases.is_empty().then_some(id.clone()))
+                    .collect::<Vec<_>>();
+                for browser_id in empty_browsers {
+                    if let Some(browser) = daemon.browsers.remove(&browser_id)
+                        && !browser.exclusive
+                    {
+                        daemon.shared_browsers.remove(&browser.key);
+                    }
+                }
+                expired
             };
-            for (session_id, session) in expired {
-                shutdown_child(session.executor).await;
+            for (session_id, lease, executor, namespace, shutdown) in expired {
+                let release_failed = executor_release(&executor, lease.target_id).await.is_err();
+                if shutdown || release_failed {
+                    shutdown_executor(executor).await;
+                }
                 let daemon = state.lock().await;
                 if let Err(error) = append_audit(
                     &daemon,
@@ -1064,7 +1158,8 @@ fn spawn_session_reaper(state: SharedState) {
                         cred_id: None,
                         target_url: None,
                         session_id: Some(session_id),
-                        namespace: None,
+                        namespace: Some(namespace),
+                        shared: None,
                     },
                     "ok".to_owned(),
                 )
@@ -1114,6 +1209,7 @@ async fn audit_provider_autolock(state: &SharedState, namespace: String) {
             target_url: None,
             session_id: None,
             namespace: Some(namespace),
+            shared: None,
         },
         "ok".to_owned(),
     )
@@ -1139,6 +1235,17 @@ async fn serve_connection<S>(
             Ok(request) => {
                 let fields = audit_fields(&request.params);
                 let handled = handle_request(&request, state.clone(), &peer, &operator_uids).await;
+                let mut fields = fields;
+                if request.method == "login"
+                    && handled.outcome == "ok"
+                    && let Some(result) = handled.response.result.as_ref()
+                {
+                    fields.session_id = result
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned);
+                    fields.shared = handled.audit_shared;
+                }
                 (Some(request), handled.response, handled.outcome, fields)
             }
             Err(_) => (
@@ -1150,6 +1257,7 @@ async fn serve_connection<S>(
                     target_url: None,
                     session_id: None,
                     namespace: None,
+                    shared: None,
                 },
             ),
         };
@@ -1265,6 +1373,7 @@ async fn append_audit(
         target_url: fields.target_url,
         session_id: fields.session_id,
         namespace: fields.namespace,
+        shared: fields.shared,
         outcome,
     };
     let mut bytes = serde_json::to_vec(&record).map_err(AppendAuditError::Serialize)?;
@@ -1340,10 +1449,10 @@ async fn handle_request(
         return classified(request.id.clone(), ErrorCode::Unauthorized);
     }
     match request.method.as_str() {
-        "status" => success(request.id.clone(), json!({ "ok": true })),
+        "status" => status(request, state).await,
         "list_credentials" => list_credentials(request, state).await,
         "login" => login(request, state, peer).await,
-        "logout" => logout(request, state).await,
+        "logout" => logout(request, state, peer).await,
         "get_totp" => get_totp(request, state).await,
         "lock_vault" => lock_vault(request, state).await,
         _ => HandledRequest {
@@ -1357,6 +1466,7 @@ async fn handle_request(
                 }),
             },
             outcome: "method_not_found".to_owned(),
+            audit_shared: None,
         },
     }
 }
@@ -1412,7 +1522,10 @@ async fn admin_peer_revoke(request: &RpcRequest, state: SharedState) -> HandledR
     };
     let peers = state.lock().await.peers.clone();
     match peers::revoke(&peers, &params.peer_id) {
-        Ok(true) => success(request.id.clone(), json!({ "ok": true })),
+        Ok(true) => {
+            terminate_peer_leases(state, &params.peer_id).await;
+            success(request.id.clone(), json!({ "ok": true }))
+        }
         Ok(false) => classified(request.id.clone(), ErrorCode::NotFound),
         Err(_) => classified(request.id.clone(), ErrorCode::Internal),
     }
@@ -1522,17 +1635,122 @@ async fn list_credentials(request: &RpcRequest, state: SharedState) -> HandledRe
     success(request.id.clone(), Value::Array(result))
 }
 
+async fn status(request: &RpcRequest, state: SharedState) -> HandledRequest {
+    let daemon = state.lock().await;
+    let leases = daemon
+        .browsers
+        .values()
+        .map(|browser| browser.leases.len())
+        .sum::<usize>();
+    success(
+        request.id.clone(),
+        json!({ "ok": true, "browsers": daemon.browsers.len(), "leases": leases }),
+    )
+}
+
+async fn join_browser(
+    state: &SharedState,
+    key: &sessions::BrowserKey,
+    principal: &str,
+) -> Option<Result<Value, ErrorCode>> {
+    let (browser_id, executor, endpoint, ttl) = {
+        let daemon = state.lock().await;
+        let browser_id = daemon.shared_browsers.get(key)?.clone();
+        let browser = daemon.browsers.get(&browser_id)?;
+        (
+            browser_id,
+            browser.executor.clone(),
+            browser.endpoint.clone(),
+            daemon
+                .provider_ttls
+                .get(&key.namespace)
+                .copied()
+                .unwrap_or(daemon.session_ttl),
+        )
+    };
+    let target_id = match executor_lease(&executor).await {
+        Ok(target_id) => target_id,
+        Err(error) => return Some(Err(error)),
+    };
+    // Executor は lease 応答後も CDP guard の target 初期化を継続するため、直後の release との競合を避けます。
+    sleep(EXECUTOR_LEASE_READY_DELAY).await;
+    let session_id = Uuid::new_v4().to_string();
+    let lease = sessions::Lease {
+        principal: principal.to_owned(),
+        expires_at: Instant::now() + ttl,
+        target_id: target_id.clone(),
+    };
+    let mut daemon = state.lock().await;
+    let Some(cdp_port) = daemon
+        .browsers
+        .get(&browser_id)
+        .map(|browser| browser.cdp_port)
+    else {
+        drop(daemon);
+        let _ = executor_release(&executor, target_id).await;
+        return None;
+    };
+    daemon
+        .browsers
+        .get_mut(&browser_id)
+        .expect("browser checked above")
+        .leases
+        .insert(session_id.clone(), lease);
+    if let Ok(mut ports) = daemon.cdp_ports.write() {
+        ports.insert(session_id.clone(), (principal.to_owned(), cdp_port));
+    }
+    Some(Ok(json!({
+        "session_id": session_id,
+        "target_id": target_id,
+        "channel": { "kind": "cdp", "endpoint": endpoint },
+    })))
+}
+
 async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) -> HandledRequest {
-    #[cfg(windows)]
-    let _ = peer;
-    let params = match parse_params::<LoginParams>(&request.params) {
+    let request_params = match parse_params::<LoginRequestParams>(&request.params) {
         Ok(params) => params,
         Err(error) => return classified(request.id.clone(), error),
     };
+    let params = request_params.login;
     let Some((namespace, _)) = params.cred_id.split_once(':') else {
         return classified(request.id.clone(), ErrorCode::InvalidCredential);
     };
     let namespace = namespace.to_owned();
+    let principal = peer.principal();
+    let key = sessions::BrowserKey::new(principal.clone(), namespace, params.cred_id.clone());
+    if !request_params.exclusive
+        && let Some(result) = join_browser(&state, &key, &principal).await
+    {
+        return match result {
+            Ok(result) => success(request.id.clone(), result).with_audit_shared(true),
+            Err(error) => classified(request.id.clone(), error),
+        };
+    }
+    let start_gate = {
+        let mut daemon = state.lock().await;
+        daemon
+            .start_controls
+            .entry(key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(sessions::StartControl::new())))
+            .clone()
+    };
+    let mut start_guard = start_gate.lock().await;
+    if !request_params.exclusive
+        && let Some(result) = join_browser(&state, &key, &principal).await
+    {
+        return match result {
+            Ok(result) => success(request.id.clone(), result).with_audit_shared(true),
+            Err(error) => classified(request.id.clone(), error),
+        };
+    }
+    {
+        let now = Instant::now();
+        start_guard.prune_attempts(now);
+        if start_guard.attempts.len() >= 3 || start_guard.retry_at.is_some_and(|retry| retry > now)
+        {
+            return classified(request.id.clone(), ErrorCode::RateLimited);
+        }
+    }
     #[cfg(unix)]
     if state.lock().await.approve_cmd.is_some() {
         let credential_state = match credential_state(&state, &params.cred_id).await {
@@ -1563,10 +1781,18 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
             daemon.executor_socket.clone(),
             daemon.node_path.clone(),
             daemon.browsers_path.clone(),
-            daemon.session_ttl,
+            daemon
+                .provider_ttls
+                .get(&key.namespace)
+                .copied()
+                .unwrap_or(daemon.session_ttl),
         )
     };
-    let (endpoint, session_id, mut executor) = match start_executor(
+    {
+        start_guard.prune_attempts(Instant::now());
+        start_guard.attempts.push(Instant::now());
+    }
+    let (endpoint, target_id, mut executor) = match start_executor(
         &executor_entry,
         executor_socket.as_deref(),
         &node_path,
@@ -1576,9 +1802,23 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
     )
     .await
     {
-        Ok(result) => result,
-        Err(error) => return classified(request.id.clone(), error),
+        Ok(result) => {
+            start_guard.consecutive_failures = 0;
+            start_guard.retry_at = None;
+            result
+        }
+        Err(error) => {
+            start_guard.consecutive_failures += 1;
+            let delay = match start_guard.consecutive_failures {
+                1 => 2,
+                2 => 5,
+                _ => 15,
+            };
+            start_guard.retry_at = Some(Instant::now() + Duration::from_secs(delay));
+            return classified(request.id.clone(), error);
+        }
     };
+    let session_id = Uuid::new_v4().to_string();
     let reader = executor
         .take_reader()
         .ok_or_else(|| io::Error::other("executor stdout or socket reader is unavailable"));
@@ -1593,29 +1833,52 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
         stop_child(executor).await;
         return classified(request.id.clone(), ErrorCode::Internal);
     };
+    let (response_sender, response_receiver) = mpsc::unbounded_channel();
+    let connection = Arc::new(ExecutorConnection {
+        executor: Mutex::new(executor),
+        responses: Mutex::new(response_receiver),
+        operation: Mutex::new(()),
+    });
+    let browser_id = Uuid::new_v4().to_string();
+    let response_target_id = target_id.clone();
+    let browser = sessions::Browser {
+        key: key.clone(),
+        executor: connection.clone(),
+        cdp_port,
+        endpoint: endpoint.clone(),
+        leases: HashMap::from([(
+            session_id.clone(),
+            sessions::Lease {
+                principal: principal.clone(),
+                expires_at: Instant::now() + ttl,
+                target_id,
+            },
+        )]),
+        exclusive: request_params.exclusive,
+    };
     let cdp_ports = state.lock().await.cdp_ports.clone();
     if let Ok(mut ports) = cdp_ports.write() {
-        ports.insert(session_id.clone(), cdp_port);
+        ports.insert(session_id.clone(), (principal, cdp_port));
     } else {
-        stop_child(executor).await;
+        shutdown_executor(connection).await;
         return classified(request.id.clone(), ErrorCode::Internal);
     }
-    state.lock().await.sessions.insert(
-        session_id.clone(),
-        Session {
-            executor,
-            expires_at: Instant::now() + ttl,
-            namespace,
-        },
-    );
-    spawn_executor_reaper(state.clone(), session_id.clone(), reader);
+    let mut daemon = state.lock().await;
+    daemon.browsers.insert(browser_id.clone(), browser);
+    if !request_params.exclusive {
+        daemon.shared_browsers.insert(key, browser_id.clone());
+    }
+    drop(daemon);
+    spawn_executor_reaper(state.clone(), browser_id, reader, response_sender);
     success(
         request.id.clone(),
         json!({
             "session_id": session_id,
+            "target_id": response_target_id,
             "channel": { "kind": "cdp", "endpoint": endpoint },
         }),
     )
+    .with_audit_shared(false)
 }
 
 #[cfg(unix)]
@@ -1693,24 +1956,52 @@ async fn approve_login(
     }
 }
 
-async fn logout(request: &RpcRequest, state: SharedState) -> HandledRequest {
+async fn logout(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) -> HandledRequest {
     let session_id = match required_string_param(&request.params, "session_id") {
         Ok(session_id) => session_id,
         Err(error) => return classified(request.id.clone(), error),
     };
-    let session = {
+    let principal = peer.principal();
+    let removed = {
         let mut daemon = state.lock().await;
-        let session = daemon.sessions.remove(&session_id);
-        if session.is_some() {
-            let _ = daemon
-                .cdp_ports
-                .write()
-                .map(|mut ports| ports.remove(&session_id));
+        let browser_id = daemon.browsers.iter().find_map(|(id, browser)| {
+            browser
+                .leases
+                .get(&session_id)
+                .filter(|lease| lease.principal == principal)
+                .map(|_| id.clone())
+        });
+        let Some(browser_id) = browser_id else {
+            return classified(request.id.clone(), ErrorCode::NotFound);
+        };
+        let (lease, executor, empty, namespace) = {
+            let browser = daemon
+                .browsers
+                .get_mut(&browser_id)
+                .expect("browser exists");
+            let lease = browser.leases.remove(&session_id).expect("lease exists");
+            let executor = browser.executor.clone();
+            let empty = browser.leases.is_empty();
+            let namespace = browser.key.namespace.clone();
+            (lease, executor, empty, namespace)
+        };
+        if empty {
+            let browser = daemon.browsers.remove(&browser_id).expect("browser exists");
+            if !browser.exclusive {
+                daemon.shared_browsers.remove(&browser.key);
+            }
         }
-        session
+        let _ = daemon
+            .cdp_ports
+            .write()
+            .map(|mut ports| ports.remove(&session_id));
+        Some((lease, executor, empty, namespace))
     };
-    if let Some(session) = session {
-        shutdown_child(session.executor).await;
+    if let Some((lease, executor, empty, _)) = removed {
+        let release_failed = executor_release(&executor, lease.target_id).await.is_err();
+        if empty || release_failed {
+            shutdown_executor(executor).await;
+        }
     }
     success(request.id.clone(), json!({ "ok": true }))
 }
@@ -1778,43 +2069,120 @@ async fn lock_vault(request: &RpcRequest, state: SharedState) -> HandledRequest 
             return classified(request.id.clone(), error);
         }
     }
-    let sessions = drain_sessions(&state, namespace.as_deref()).await;
-    terminate_sessions(&state, sessions).await;
+    let browsers = drain_browsers(&state, namespace.as_deref()).await;
+    terminate_browsers(&state, browsers).await;
     success(request.id.clone(), json!({ "ok": true }))
 }
 
-/// Removes every session whose namespace matches the filter, dropping the CDP
-/// port mappings, and returns the sessions for termination.
-async fn drain_sessions(state: &SharedState, namespace: Option<&str>) -> Vec<(String, Session)> {
+async fn drain_browsers(state: &SharedState, namespace: Option<&str>) -> Vec<sessions::Browser> {
     let mut daemon = state.lock().await;
-    let session_ids = daemon
-        .sessions
+    let browser_ids = daemon
+        .browsers
         .iter()
-        .filter_map(|(session_id, session)| {
+        .filter_map(|(browser_id, browser)| {
             namespace
-                .is_none_or(|requested| requested == session.namespace)
-                .then_some(session_id.clone())
+                .is_none_or(|requested| requested == browser.key.namespace)
+                .then_some(browser_id.clone())
         })
         .collect::<Vec<_>>();
-    session_ids
-        .into_iter()
-        .filter_map(|session_id| {
-            let session = daemon.sessions.remove(&session_id)?;
+    let mut browsers = Vec::new();
+    for browser_id in browser_ids {
+        let Some(browser) = daemon.browsers.remove(&browser_id) else {
+            continue;
+        };
+        {
+            if !browser.exclusive {
+                daemon.shared_browsers.remove(&browser.key);
+            }
+            let session_ids = browser.leases.keys().cloned().collect::<Vec<_>>();
+            if let Ok(mut ports) = daemon.cdp_ports.write() {
+                for session_id in session_ids {
+                    ports.remove(&session_id);
+                }
+            }
+        }
+        browsers.push(browser);
+    }
+    browsers
+}
+
+async fn terminate_browsers(state: &SharedState, browsers: Vec<sessions::Browser>) {
+    let mut tasks = JoinSet::new();
+    for browser in browsers {
+        let state = state.clone();
+        tasks.spawn(async move { terminate_browser(&state, browser).await });
+    }
+    while tasks.join_next().await.is_some() {}
+}
+
+async fn terminate_browser(state: &SharedState, browser: sessions::Browser) {
+    let namespace = browser.key.namespace.clone();
+    let leases = browser.leases.into_iter().collect::<Vec<_>>();
+    for (_, lease) in &leases {
+        if executor_release(&browser.executor, lease.target_id.clone())
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+    shutdown_executor(browser.executor).await;
+    for (session_id, _) in leases {
+        audit_system_session(state, "session_terminated", session_id, namespace.clone()).await;
+    }
+}
+
+async fn terminate_peer_leases(state: SharedState, peer_id: &str) {
+    let principal = format!("peer:{peer_id}");
+    let removed = {
+        let mut daemon = state.lock().await;
+        let browser_ids = daemon.browsers.keys().cloned().collect::<Vec<_>>();
+        let mut removed = Vec::new();
+        for browser_id in browser_ids {
+            let Some(browser) = daemon.browsers.get_mut(&browser_id) else {
+                continue;
+            };
+            let session_ids = browser
+                .leases
+                .iter()
+                .filter_map(|(id, lease)| (lease.principal == principal).then_some(id.clone()))
+                .collect::<Vec<_>>();
+            for session_id in session_ids {
+                let lease = browser.leases.remove(&session_id).expect("lease exists");
+                removed.push((
+                    session_id,
+                    lease,
+                    browser.executor.clone(),
+                    browser.key.namespace.clone(),
+                    browser.leases.is_empty(),
+                ));
+            }
+        }
+        let empty = daemon
+            .browsers
+            .iter()
+            .filter_map(|(id, browser)| browser.leases.is_empty().then_some(id.clone()))
+            .collect::<Vec<_>>();
+        for browser_id in empty {
+            if let Some(browser) = daemon.browsers.remove(&browser_id)
+                && !browser.exclusive
+            {
+                daemon.shared_browsers.remove(&browser.key);
+            }
+        }
+        for (session_id, _, _, _, _) in &removed {
             let _ = daemon
                 .cdp_ports
                 .write()
-                .map(|mut ports| ports.remove(&session_id));
-            Some((session_id, session))
-        })
-        .collect()
-}
-
-/// Shuts down the executor behind each drained session and audits the
-/// termination.
-async fn terminate_sessions(state: &SharedState, sessions: Vec<(String, Session)>) {
-    for (session_id, session) in sessions {
-        let session_namespace = session.namespace.clone();
-        shutdown_child(session.executor).await;
+                .map(|mut ports| ports.remove(session_id));
+        }
+        removed
+    };
+    for (session_id, lease, executor, namespace, shutdown) in removed {
+        let _ = executor_release(&executor, lease.target_id).await;
+        if shutdown {
+            shutdown_executor(executor).await;
+        }
         let daemon = state.lock().await;
         if let Err(error) = append_audit(
             &daemon,
@@ -1824,7 +2192,8 @@ async fn terminate_sessions(state: &SharedState, sessions: Vec<(String, Session)
                 cred_id: None,
                 target_url: None,
                 session_id: Some(session_id),
-                namespace: Some(session_namespace),
+                namespace: Some(namespace),
+                shared: None,
             },
             "ok".to_owned(),
         )
@@ -1832,6 +2201,32 @@ async fn terminate_sessions(state: &SharedState, sessions: Vec<(String, Session)
         {
             eprintln!("tegatad: audit append failed: {error}");
         }
+    }
+}
+
+async fn audit_system_session(
+    state: &SharedState,
+    method: &str,
+    session_id: String,
+    namespace: String,
+) {
+    let daemon = state.lock().await;
+    if let Err(error) = append_audit(
+        &daemon,
+        AuditPeer::System,
+        method.to_owned(),
+        AuditFields {
+            cred_id: None,
+            target_url: None,
+            session_id: Some(session_id),
+            namespace: Some(namespace),
+            shared: None,
+        },
+        "ok".to_owned(),
+    )
+    .await
+    {
+        eprintln!("tegatad: audit append failed: {error}");
     }
 }
 
@@ -2028,7 +2423,8 @@ async fn start_executor(
             serde_json::from_str(&response_line).map_err(|_| ErrorCode::Internal)?;
         if response.ok {
             let endpoint = response.endpoint.ok_or(ErrorCode::Internal)?;
-            Ok((endpoint, Uuid::new_v4().to_string()))
+            let target_id = response.target_id.ok_or(ErrorCode::Internal)?;
+            Ok((endpoint, target_id))
         } else {
             Err(response
                 .error
@@ -2039,7 +2435,7 @@ async fn start_executor(
     }
     .await;
     match result {
-        Ok((endpoint, session_id)) => Ok((endpoint, session_id, executor)),
+        Ok((endpoint, target_id)) => Ok((endpoint, target_id, executor)),
         Err(error) => {
             stop_child(executor).await;
             Err(error)
@@ -2069,25 +2465,143 @@ fn parse_error_code(value: &str) -> ErrorCode {
     }
 }
 
-async fn shutdown_child(mut executor: ExecutorHandle) {
-    let mut line = b"{\"op\":\"shutdown\"}\n".to_vec();
-    let _ = executor.write_line(&line).await;
-    line.fill(0);
-    match &mut executor {
+async fn executor_request(
+    connection: &Arc<ExecutorConnection>,
+    mut request: Vec<u8>,
+) -> Result<Value, ErrorCode> {
+    let _operation = timeout(EXECUTOR_OPERATION_TIMEOUT, connection.operation.lock())
+        .await
+        .map_err(|_| ErrorCode::Internal)?;
+    request.push(b'\n');
+    let mut executor = timeout(EXECUTOR_OPERATION_TIMEOUT, connection.executor.lock())
+        .await
+        .map_err(|_| ErrorCode::Internal)?;
+    timeout(EXECUTOR_OPERATION_TIMEOUT, executor.write_line(&request))
+        .await
+        .map_err(|_| ErrorCode::Internal)?
+        .map_err(|_| ErrorCode::Internal)?;
+    drop(executor);
+    let mut responses = timeout(EXECUTOR_OPERATION_TIMEOUT, connection.responses.lock())
+        .await
+        .map_err(|_| ErrorCode::Internal)?;
+    let response = timeout(EXECUTOR_OPERATION_TIMEOUT, responses.recv())
+        .await
+        .map_err(|_| ErrorCode::Internal)?
+        .ok_or(ErrorCode::Internal)?
+        .map_err(|_| ErrorCode::Internal)?;
+    serde_json::from_str(&response).map_err(|_| ErrorCode::Internal)
+}
+
+async fn executor_lease(connection: &Arc<ExecutorConnection>) -> Result<String, ErrorCode> {
+    let request = serde_json::to_vec(&ExecutorLeaseRequest { op: "lease" })
+        .map_err(|_| ErrorCode::Internal)?;
+    let response = executor_request(connection, request).await?;
+    let response: tegata_core::wire::ExecutorLeaseResponse =
+        serde_json::from_value(response).map_err(|_| ErrorCode::Internal)?;
+    if response.ok {
+        response.target_id.ok_or(ErrorCode::Internal)
+    } else {
+        Err(response
+            .error
+            .as_deref()
+            .map(parse_error_code)
+            .unwrap_or(ErrorCode::Internal))
+    }
+}
+
+async fn executor_release(
+    connection: &Arc<ExecutorConnection>,
+    target_id: String,
+) -> Result<(), ErrorCode> {
+    let request = serde_json::to_vec(&ExecutorReleaseRequest {
+        op: "release",
+        target_id,
+    })
+    .map_err(|_| ErrorCode::Internal)?;
+    let response = executor_request(connection, request).await?;
+    let response: tegata_core::wire::ExecutorLeaseResponse =
+        serde_json::from_value(response).map_err(|_| ErrorCode::Internal)?;
+    response.ok.then_some(()).ok_or_else(|| {
+        response
+            .error
+            .as_deref()
+            .map(parse_error_code)
+            .unwrap_or(ErrorCode::Internal)
+    })
+}
+
+async fn shutdown_executor(connection: Arc<ExecutorConnection>) {
+    let Ok(_operation) = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, connection.operation.lock()).await
+    else {
+        kill_executor(&connection).await;
+        return;
+    };
+    let Ok(mut executor) = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, connection.executor.lock()).await
+    else {
+        kill_executor(&connection).await;
+        return;
+    };
+    let write_result = timeout(
+        EXECUTOR_SHUTDOWN_TIMEOUT,
+        executor.write_line(b"{\"op\":\"shutdown\"}\n"),
+    )
+    .await;
+    if !matches!(write_result, Ok(Ok(()))) {
+        kill_executor_handle(&mut executor).await;
+        return;
+    }
+    if wait_or_kill_executor(&mut executor).await {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        drop(executor);
+        let Ok(mut responses) =
+            timeout(EXECUTOR_SHUTDOWN_TIMEOUT, connection.responses.lock()).await
+        else {
+            return;
+        };
+        let _ = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, async {
+            while responses.recv().await.is_some() {}
+        })
+        .await;
+    }
+}
+
+async fn wait_or_kill_executor(executor: &mut ExecutorHandle) -> bool {
+    match executor {
         ExecutorHandle::Spawned(child) => {
-            if timeout(Duration::from_secs(1), child.wait()).await.is_err() {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-            }
-        }
-        #[cfg(unix)]
-        ExecutorHandle::Socket { reader, .. } => {
-            if timeout(Duration::from_secs(1), wait_for_socket_eof(reader))
+            if timeout(EXECUTOR_SHUTDOWN_TIMEOUT, child.wait())
                 .await
                 .is_err()
             {
-                eprintln!("executor did not exit within 1s after shutdown");
+                let _ = child.start_kill();
+                let _ = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, child.wait()).await;
             }
+            true
+        }
+        #[cfg(unix)]
+        ExecutorHandle::Socket { .. } => false,
+    }
+}
+
+async fn kill_executor(connection: &Arc<ExecutorConnection>) {
+    let Ok(mut executor) = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, connection.executor.lock()).await
+    else {
+        return;
+    };
+    kill_executor_handle(&mut executor).await;
+}
+
+async fn kill_executor_handle(executor: &mut ExecutorHandle) {
+    match executor {
+        ExecutorHandle::Spawned(child) => {
+            let _ = child.start_kill();
+            let _ = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, child.wait()).await;
+        }
+        #[cfg(unix)]
+        ExecutorHandle::Socket { writer, .. } => {
+            let _ = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, writer.shutdown()).await;
         }
     }
 }
@@ -2105,79 +2619,64 @@ async fn stop_child(mut executor: ExecutorHandle) {
     }
 }
 
-#[cfg(unix)]
-async fn wait_for_socket_eof(
-    reader: &Arc<Mutex<tokio::net::unix::OwnedReadHalf>>,
-) -> io::Result<()> {
-    let mut reader = reader.lock().await;
-    let mut buffer = [0; 1024];
-    loop {
-        if reader.read(&mut buffer).await? == 0 {
-            return Ok(());
-        }
-    }
-}
-
-fn spawn_executor_reaper(state: SharedState, session_id: String, mut reader: ExecutorReader) {
+fn spawn_executor_reaper(
+    state: SharedState,
+    browser_id: String,
+    mut reader: ExecutorReader,
+    sender: mpsc::UnboundedSender<io::Result<String>>,
+) {
     tokio::spawn(async move {
-        let eof = match &mut reader {
-            ExecutorReader::Spawned(stdout) => {
-                let mut buffer = [0; 1024];
-                loop {
-                    match stdout.read(&mut buffer).await {
-                        Ok(0) => break true,
-                        Ok(_) => {}
-                        Err(_) => break false,
+        loop {
+            let result = match &mut reader {
+                ExecutorReader::Spawned(stdout) => read_executor_line(stdout).await,
+                #[cfg(unix)]
+                ExecutorReader::Socket(reader) => {
+                    let mut reader = reader.lock().await;
+                    read_executor_line(&mut *reader).await
+                }
+            };
+            match result {
+                Ok(line) if !line.is_empty() => {
+                    if sender.send(Ok(line)).is_err() {
+                        return;
                     }
                 }
-            }
-            #[cfg(unix)]
-            ExecutorReader::Socket(reader) => {
-                let mut stream = reader.lock().await;
-                let mut buffer = [0; 1024];
-                loop {
-                    match stream.read(&mut buffer).await {
-                        Ok(0) => break true,
-                        Ok(_) => {}
-                        Err(_) => break false,
-                    }
+                Ok(_) | Err(_) => {
+                    let _ = sender.send(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "executor disconnected",
+                    )));
+                    break;
                 }
             }
-        };
-        if !eof {
-            return;
         }
-        let session = {
+        let browser = {
             let mut daemon = state.lock().await;
-            let session = daemon.sessions.remove(&session_id);
-            if session.is_some() {
-                let _ = daemon
-                    .cdp_ports
-                    .write()
-                    .map(|mut ports| ports.remove(&session_id));
+            let browser = daemon.browsers.remove(&browser_id);
+            if let Some(browser) = &browser {
+                if !browser.exclusive {
+                    daemon.shared_browsers.remove(&browser.key);
+                }
+                let session_ids = browser.leases.keys().cloned().collect::<Vec<_>>();
+                if let Ok(mut ports) = daemon.cdp_ports.write() {
+                    for session_id in session_ids {
+                        ports.remove(&session_id);
+                    }
+                }
             }
-            session
+            browser
         };
-        let Some(session) = session else {
+        let Some(browser) = browser else {
             return;
         };
-        drop(session.executor);
-        let daemon = state.lock().await;
-        if let Err(error) = append_audit(
-            &daemon,
-            AuditPeer::System,
-            "session_terminated".to_owned(),
-            AuditFields {
-                cred_id: None,
-                target_url: None,
-                session_id: Some(session_id),
-                namespace: Some(session.namespace),
-            },
-            "ok".to_owned(),
-        )
-        .await
-        {
-            eprintln!("tegatad: audit append failed: {error}");
+        for (session_id, _) in browser.leases {
+            audit_system_session(
+                &state,
+                "session_terminated",
+                session_id,
+                browser.key.namespace.clone(),
+            )
+            .await;
         }
     });
 }
@@ -2237,6 +2736,7 @@ fn audit_fields(params: &Value) -> AuditFields {
             .get("namespace")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        shared: None,
     }
 }
 
@@ -2249,6 +2749,7 @@ fn success(id: Value, result: Value) -> HandledRequest {
             error: None,
         },
         outcome: "ok".to_owned(),
+        audit_shared: None,
     }
 }
 
@@ -2256,6 +2757,7 @@ fn classified(id: Value, error: ErrorCode) -> HandledRequest {
     HandledRequest {
         response: error_response(id, error),
         outcome: error.as_str().to_owned(),
+        audit_shared: None,
     }
 }
 
@@ -2286,6 +2788,7 @@ mod tests {
             target_url: None,
             session_id: None,
             namespace: None,
+            shared: None,
             outcome: "ok".to_owned(),
         };
         assert_eq!(

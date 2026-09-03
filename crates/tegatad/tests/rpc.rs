@@ -29,7 +29,7 @@ rl.on("line", (line) => {
   const request = JSON.parse(line);
   if (request.op === "login") {
     process.stdout.write(
-      JSON.stringify({ ok: true, endpoint: "ws://127.0.0.1:38999/devtools/browser/test" }) + "\n",
+      JSON.stringify({ ok: true, endpoint: "ws://127.0.0.1:38999/devtools/browser/test", target_id: "test-target" }) + "\n",
     );
   } else if (request.op === "shutdown") {
     process.exit(0);
@@ -152,7 +152,9 @@ fn error_message(response: &Value, expected_code: &str) {
 fn status_returns_ok() {
     let daemon = Daemon::start();
     let response = rpc(&daemon.socket_path, "status", json!({}));
-    assert_eq!(response["result"], json!({ "ok": true }));
+    assert_eq!(response["result"]["ok"], json!(true));
+    assert_eq!(response["result"]["browsers"], json!(0));
+    assert_eq!(response["result"]["leases"], json!(0));
 }
 
 #[test]

@@ -130,7 +130,9 @@ fn listen_config_serves_unix_and_tcp_and_records_principals() {
     BufReader::new(unix)
         .read_line(&mut unix_response)
         .expect("read UDS status response");
-    assert!(unix_response.contains("\"result\":{\"ok\":true}"));
+    let unix_json: Value =
+        serde_json::from_str(unix_response.trim()).expect("parse UDS status response");
+    assert_eq!(unix_json["result"]["ok"], true);
 
     let mut tcp = TcpStream::connect(("127.0.0.1", daemon.tcp_port)).expect("connect TCP");
     let response = tcp_rpc(&mut tcp, &daemon.token);

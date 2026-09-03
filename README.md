@@ -110,8 +110,8 @@ Full threat model, invariants, and the operator hardening checklist:
 | --- | --- | --- | --- | --- | --- |
 | systemd | Linux, WSL | Dedicated user + hardened systemd unit; browser worker as a separate user via socket activation | UNIX socket, `SO_PEERCRED` | askpass at unlock | Implemented |
 | Windows service | Windows | Virtual service account `NT SERVICE\tegatad` (browser shares the service account) | Named pipe + SID; loopback TCP + token for the WSL client | DPAPI | Implemented |
-| Container | Containerized agents | Separate container, no shared volume | Socket + token | Secret mount | Not implemented |
-| Remote host | Any | Separate host or VM | mTLS / Tailscale identity | Server-side | Not implemented |
+| Container | Containerized agent on a Linux host | Daemon on the host; `tegata-bridge` in the container | TCP + named token | Host-side | Planned ([#6](https://github.com/WakaTaira/tegata/issues/6)) |
+| Remote host | Any | Separate host or VM | mTLS / tailnet identity | Server-side | Not planned ([#7](https://github.com/WakaTaira/tegata/issues/7)) |
 
 The Windows service boundary is the recommended configuration for a WSL agent:
 the daemon runs as a Windows service account, and a WSL process — which reaches
@@ -250,13 +250,18 @@ bundles for non-Nix deployments, published from tags on the
 Planned, tracked in the
 [issue tracker](https://github.com/WakaTaira/tegata/issues):
 
+- **Named tokens and shared sessions** — one browser per credential and caller,
+  leased to several agents on the same machine, with an owner on every session
 - **Container boundary** ([#6](https://github.com/WakaTaira/tegata/issues/6)) —
-  the daemon in its own container, no shared volume, for containerized agents
-- **Remote-host boundary** ([#7](https://github.com/WakaTaira/tegata/issues/7)) —
-  the daemon on a separate host or VM, authenticated by mTLS or tailnet identity
-- **OAuth device-flow executor**
-  ([#8](https://github.com/WakaTaira/tegata/issues/8)) — device-code grants
-  completed on the isolated side, alongside the form executor
+  the daemon on the host, reached from a containerized agent through
+  `tegata-bridge` and a named token
+- **CDP isolation** — the browser in its own network namespace, reachable only
+  through the daemon's authenticated relay
+- **OAuth device-flow approval**
+  ([#8](https://github.com/WakaTaira/tegata/issues/8)) — the daemon logs in
+  and approves a device-code grant the agent's own tool started
+- **Injection proxy** ([#14](https://github.com/WakaTaira/tegata/issues/14)) —
+  API calls with the operator's identity for agents that must not hold a token
 - **Windows approval hook**
   ([#11](https://github.com/WakaTaira/tegata/issues/11)) — the human-in-the-loop
   hook for the Windows service, which currently refuses `approve_cmd`

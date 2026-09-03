@@ -220,11 +220,20 @@ The daemon reads one TOML file, given with `--config`. It must be owned by the
 daemon's user and mode 0600.
 
 ```toml
-socket_path    = "/run/tegata/tegatad.sock"
 executor_socket = "/run/tegata-executor/executor.sock"
 state_dir      = "/var/lib/tegata"
 audit_log_path = "/var/lib/tegata/audit.log"
-allowed_uids   = [1000]
+
+[[listen]]
+kind          = "unix"
+path          = "/run/tegata/tegatad.sock"
+allowed_uids  = [1000]
+operator_uids = [1000]
+
+[[listen]]
+kind = "tcp"
+bind = "127.0.0.1"
+port = 21575
 
 session_ttl_secs = 300
 
@@ -242,16 +251,42 @@ session_ttl_secs = 900
 
 | Key | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `socket_path` | string | yes | Path of the UNIX socket the daemon listens on |
 | `state_dir` | string | yes | Directory the daemon owns; holds per-provider CLI state |
 | `audit_log_path` | string | yes | Where the audit log is appended, created mode 0600 |
 | `audit_log_max_bytes` | integer | no | Rotate to `<path>.1` past this size, at most once per daemon process. Unset means no rotation |
-| `allowed_uids` | list of integer | yes | uids permitted to connect. An empty list admits nobody |
+| `operator_uids` | list of integer | no | uids permitted to use admin RPCs in addition to root |
+| `max_pending_connections` | integer | no | Maximum unauthenticated concurrent TCP connections; default `8` |
 | `session_ttl_secs` | integer | no | Browser session lifetime; default `300` |
 | `approve_cmd` | string | no | Command that must approve each `login`. Unset means no approval gate |
 | `approve_timeout_secs` | integer | no | How long to wait for that command; default `60` |
 | `executor_entry` | string | no | Path to the executor's `index.js`. May also come from `TEGATA_EXECUTOR_ENTRY` |
 | `executor_socket` | string | no | Path to the UNIX domain socket. When set, the daemon communicates with an executor in another process over this socket; when `None`, the daemon spawns the executor as before |
+
+Each `[[listen]]` entry selects a transport at runtime. A UNIX entry requires
+`kind = "unix"`, `path`, and its uid lists; a TCP entry requires an explicit
+`bind` and `port`; `bind = "auto"` is Windows-only. `0.0.0.0` and `::` are
+refused. Container-oriented binds are covered in a later `setup-container.md`
+release.
+
+The legacy `socket_path` and `allowed_uids` keys remain accepted and are normalized
+to the same `[[listen]]` form. Writing legacy and `[[listen]]` settings together
+refuses startup.
+
+### Peer administration
+
+```sh
+tegatad peer issue --label <label>
+tegatad peer revoke <peer_id>
+tegatad peer list
+```
+
+`peer issue` prints the plaintext token exactly once. Named tokens are stored in
+`<state_dir>/peers.json` with mode 0600. A TCP token identifies its caller as
+`principal = "peer:<peer_id>"`; audit records retain `peer_id` and `peer_label`.
+Audit records also include `principal` (`uid:<n>` or `peer:<id>`), and `login`
+records include `shared` for a shared browser lease. The existing `tegatad token
+issue` command is an alias for `peer issue --label default` and is deprecated; it
+will be removed in the next release.
 
 ### `[[providers]]`
 
@@ -558,7 +593,7 @@ sampled for the whole login window — leaves no canary anywhere that user can
 observe or read.
 
 For a quick liveness check against a running daemon, the `status` method answers
-`{"ok": true}`:
+`{"ok": true, "browsers": n, "leases": n}`:
 
 ```sh
 printf '{"jsonrpc":"2.0","id":1,"method":"status"}\n' | nc -U /run/tegata/tegatad.sock

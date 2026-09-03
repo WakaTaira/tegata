@@ -118,12 +118,20 @@ running as `SYSTEM`.
 ### Issue a client token
 
 ```
-tegatad.exe token issue
+tegatad.exe peer issue --label <label>
+tegatad.exe peer revoke <peer_id>
+tegatad.exe peer list
 ```
 
-Elevated only. The plaintext token is printed to standard output exactly once; the
-daemon keeps only its hash. Copy it to the client and store it mode 0600. Running
-the command again replaces the stored hash and invalidates the previous token.
+Elevated only. `peer issue` prints the plaintext token to standard output exactly
+once; the daemon keeps only its hash. Copy it to the client and store it mode 0600.
+The existing `tegatad.exe token issue` command is an alias for
+`peer issue --label default` and is deprecated; it will be removed in the next
+release.
+
+On upgrade, an existing `state\token_hash` is imported at startup into
+`peers.json` as `peer_id = "legacy"`; the old file is renamed to
+`token_hash.imported`. Existing bridge tokens continue to work.
 
 ### Seal the master password
 
@@ -146,7 +154,10 @@ an opt-in for a deployment that provides its own helper.
 | Command | Requires elevation | Purpose |
 | --- | --- | --- |
 | `tegatad.exe status` | no | Liveness check over the named pipe |
-| `tegatad.exe token issue` | yes | Issue a client token |
+| `tegatad.exe peer issue --label <label>` | yes | Issue a named client token |
+| `tegatad.exe peer revoke <peer_id>` | yes | Revoke a named client token |
+| `tegatad.exe peer list` | yes | List named client tokens |
+| `tegatad.exe token issue` | yes | Deprecated alias for `peer issue --label default`; removed in the next release |
 | `tegatad.exe seal` | yes | Seal the master password |
 | `tegatad.exe service install --config <path>` | yes | Register and provision |
 | `tegatad.exe service uninstall [--name <name>]` | yes | Remove the service and its firewall rule |
@@ -208,7 +219,7 @@ silently ignored — see [setup-linux.md](setup-linux.md#the-approval-hook).
 | `tcp_bind` | `auto` | IPv4 bind address, or `auto` for the WSL adapter |
 | `allowed_sids` | `[]` | SIDs permitted to call the ordinary RPC surface over the pipe |
 | `operator_sid` | unset | SID granted permission to start and stop the service |
-| `token_hash_path` | `<state_dir>\token_hash` | Where the client token hash is stored |
+| `token_hash_path` | `<state_dir>\token_hash` | Legacy import only; the old hash is moved to `token_hash.imported` |
 | `sealed_blob_path` | `<state_dir>\sealed.blob` | Where the sealed master password is stored |
 | `browsers_path` | unset | Passed to the executor as `PLAYWRIGHT_BROWSERS_PATH` |
 | `bw_path` | `bw` | Bitwarden CLI executable |
@@ -217,6 +228,13 @@ silently ignored — see [setup-linux.md](setup-linux.md#the-approval-hook).
 An empty `allowed_sids` refuses every ordinary RPC over the pipe — which is the
 right setting when only the WSL client, authenticating with a token over TCP,
 should be able to reach the daemon.
+
+Named-pipe callers use principal `sid:<SID>`. TCP callers authenticated by a
+named token use a `peer:<peer_id>` principal, so named-pipe and TCP callers do not
+share browsers; leases are shared only by callers with the same principal.
+
+Windows also accepts the `[[listen]]` form with `kind = "pipe"` or `kind = "tcp"`;
+the legacy keys above remain the examples for this document.
 
 Set `tcp_port = 0` for a Windows-only deployment with no WSL client. The pipe then
 becomes the only way in, and no firewall rule is added.
@@ -314,9 +332,10 @@ broker opens a tunnel for the session after a successful `login` and rewrites th
 endpoint to its WSL-local port, so the agent receives something it can connect to
 without knowing a tunnel exists.
 
-The daemon accepts a tunnel only for the CDP port of the named active session and
-refuses anything else with `FORBIDDEN`. It is a session handoff, not a port
-forwarder.
+The daemon accepts a tunnel only for the CDP port of the named active session. A
+session belonging to another principal or an absent session returns `NOT_FOUND`; a
+port that does not match the caller's session returns `FORBIDDEN`. It is a session
+handoff, not a port forwarder.
 
 ### NixOS bridge module
 

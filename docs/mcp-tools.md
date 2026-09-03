@@ -65,13 +65,14 @@ unexpected daemon response cannot smuggle text out through the error path.
 | `TOTP_NOT_EXPOSABLE` | The credential is not marked `totp_exposable`, or has no seed |
 | `APPROVAL_DENIED` | A configured approval hook refused this login |
 | `APPROVAL_TIMEOUT` | The approval hook did not answer within its timeout |
+| `NOT_FOUND` | The session does not exist or belongs to another principal; its existence is not disclosed |
 | `INTERNAL` | Anything else, including a refused response that failed the leak scan |
 
 `INVALID_CREDENTIAL` covers both "no such credential" and "the site said no" on
 purpose: distinguishing them would tell an agent which identifiers are real.
 
-Two further codes exist at the transport level on Windows and never reach the MCP
-layer: `UNAUTHORIZED` (bad or missing token, or a SID not on the allowlist) and
+Two further codes exist at the transport level and never reach the MCP layer:
+`UNAUTHORIZED` (bad or missing token, or a SID not on the allowlist) and
 `FORBIDDEN` (a tunnel request for a port that is not the named session's CDP
 port). The administrative RPCs add `ADMIN_REQUIRED` and `ADMIN_SEAL_UNAVAILABLE`.
 
@@ -142,19 +143,28 @@ returns a connection to the resulting browser.
 | `steps` | array | no | Explicit login steps; omitted means auto-detect |
 | `success_selector` | string | no | A selector that appears only when login succeeded |
 | `failure_selector` | string | no | A selector that appears only when login failed |
+| `exclusive` | boolean | no | Defaults to `false`; `true` creates a dedicated browser that other calls cannot share |
 
 **Output**
 
 ```json
 {
   "session_id": "3f2b1c9e-...",
-  "channel": { "kind": "cdp", "endpoint": "ws://127.0.0.1:41263/devtools/browser/..." }
+  "channel": { "kind": "cdp", "endpoint": "ws://127.0.0.1:41263/devtools/browser/..." },
+  "target_id": "page-target-id"
 }
 ```
 
 Connect a Playwright client to that endpoint with `chromium.connectOverCDP` and
 drive the authenticated browser directly. Keep the `session_id`; it is what
-`logout` takes.
+`logout` takes. `target_id` is the CDP target id of the lease's tab and is advisory.
+
+When a live, non-exclusive browser exists for the same principal (the UNIX socket
+uid, named token, or Windows SID), namespace, and `cred_id`, `login` issues a new
+lease with a new `session_id` and returns the same endpoint. `logout` returns only
+the caller's lease; the browser closes when its last lease ends. TTL is fixed per
+lease at issuance and a fresh `login` is required to extend it. `lock_vault` keeps
+its existing behavior and drops all browsers and leases in the namespace.
 
 ### Steps and the placeholder contract
 
@@ -220,8 +230,12 @@ control, not part of the call.
 
 ### Session lifetime
 
-Each session carries a TTL, 300 seconds by default, configurable with
-`session_ttl_secs`. The whole login must also complete within 90 seconds.
+Each lease carries a TTL, 300 seconds by default, configurable with
+`session_ttl_secs`, fixed when issued. The whole login must also complete within
+90 seconds. If startup fails for the same key, subsequent `login` calls wait for
+backoff periods of 2 seconds, 5 seconds, then 15 seconds; calls during backoff
+return `RATE_LIMITED`. More than 3 reauthentication attempts for the same key in
+10 minutes also returns `RATE_LIMITED`.
 
 ## `logout`
 
@@ -233,8 +247,9 @@ Each session carries a TTL, 300 seconds by default, configurable with
 
 **Output**: `{"ok": true}`
 
-Destroys the session and shuts down its browser. `{"ok": true}` is also the answer
-for a `session_id` that is already gone, so logout is safe to call twice.
+Returns the caller's lease and shuts down the browser when it was the last lease.
+An absent session or a session held by another principal returns `NOT_FOUND`, so
+the daemon does not disclose whether the session exists.
 
 Call it when finished. The CDP endpoint stops being connectable and the browser
 takes its cookies with it.
@@ -321,15 +336,17 @@ end before returning it. The agent receives an endpoint it can connect to direct
 and does not need to know a tunnel exists.
 
 The tunnel is not general-purpose. The daemon accepts a tunnel request only for the
-CDP port belonging to the named active session; any other port is refused with
-`FORBIDDEN`. It is a session handoff mechanism, not a port forwarder.
+CDP port belonging to the named active session. A session belonging to another
+principal or an absent session is refused with `NOT_FOUND`; a port that does not
+match the caller's session is refused with `FORBIDDEN`. It is a session handoff
+mechanism, not a port forwarder.
 
 ## Talking to the daemon without MCP
 
 The daemon speaks newline-delimited JSON-RPC 2.0 — one request object per line, one
 response object per line. The MCP broker is a thin adapter over exactly the calls
-documented above, plus `status`, which returns `{"ok": true}` and is useful as a
-liveness check.
+documented above, plus `status`, which returns `{"ok": true, "browsers": n,
+"leases": n}` and is useful as a liveness check.
 
 Method names and parameters are identical to the tool names and inputs. A method
 outside the allowlist is answered with a standard JSON-RPC method-not-found error;

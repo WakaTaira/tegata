@@ -57,7 +57,7 @@ fn refuses_executor_socket_running_as_the_daemons_user() {
             .expect("read hello request");
         assert_eq!(request, "{\"op\":\"hello\"}\n");
         let uid = unsafe { libc::geteuid() };
-        write!(stream, "{{\"ok\":true,\"uid\":{uid},\"pid\":1}}\n").expect("write hello response");
+        writeln!(stream, "{{\"ok\":true,\"uid\":{uid},\"pid\":1}}").expect("write hello response");
     });
     let config_path = write_config(&directory, &executor_socket);
 
@@ -82,7 +82,7 @@ fn refuses_executor_socket_that_reports_not_ok() {
             .read_line(&mut request)
             .expect("read hello request");
         assert_eq!(request, "{\"op\":\"hello\"}\n");
-        write!(stream, "{{\"ok\":false,\"uid\":null,\"pid\":1}}\n").expect("write hello response");
+        writeln!(stream, "{{\"ok\":false,\"uid\":null,\"pid\":1}}").expect("write hello response");
     });
     let config_path = write_config(&directory, &executor_socket);
 
@@ -107,7 +107,7 @@ fn refuses_executor_socket_running_as_root() {
             .read_line(&mut request)
             .expect("read hello request");
         assert_eq!(request, "{\"op\":\"hello\"}\n");
-        write!(stream, "{{\"ok\":true,\"uid\":0,\"pid\":1}}\n").expect("write hello response");
+        writeln!(stream, "{{\"ok\":true,\"uid\":0,\"pid\":1}}").expect("write hello response");
     });
     let config_path = write_config(&directory, &executor_socket);
 

@@ -19,6 +19,8 @@ use std::os::windows::io::AsRawHandle;
 use std::path::Path;
 use std::pin::Pin;
 use std::ptr::null_mut;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -559,6 +561,7 @@ impl PlatformTransport {
         token_hash_path: &Path,
         cdp_port_resolver: CdpPortResolver,
         peer_authenticator: PeerAuthenticator,
+        pending_connections: Arc<AtomicUsize>,
         max_pending_connections: usize,
     ) -> io::Result<Self> {
         let (sender, receiver) = mpsc::channel(listeners.len().max(1) * 16);
@@ -588,6 +591,7 @@ impl PlatformTransport {
                         token_hash_path,
                         cdp_port_resolver.clone(),
                         peer_authenticator.clone(),
+                        pending_connections.clone(),
                         max_pending_connections,
                     )
                     .await?;

@@ -9,6 +9,8 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use serde::Deserialize;
 use tokio::net::{UnixListener, UnixStream};
@@ -93,6 +95,7 @@ impl PlatformTransport {
         token_hash_path: &std::path::Path,
         cdp_port_resolver: CdpPortResolver,
         peer_authenticator: PeerAuthenticator,
+        pending_connections: Arc<AtomicUsize>,
         max_pending_connections: usize,
     ) -> io::Result<Self> {
         let (sender, receiver) = tokio::sync::mpsc::channel(listeners.len().max(1) * 16);
@@ -133,6 +136,7 @@ impl PlatformTransport {
                         token_hash_path,
                         cdp_port_resolver.clone(),
                         peer_authenticator.clone(),
+                        pending_connections.clone(),
                         max_pending_connections,
                     )
                     .await?;

@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -29,6 +29,10 @@ impl Drop for Daemon {
 }
 
 fn start_daemon(legacy_token: &str) -> Daemon {
+    start_daemon_with_existing_legacy(legacy_token, false)
+}
+
+fn start_daemon_with_existing_legacy(legacy_token: &str, existing_legacy: bool) -> Daemon {
     let directory = std::env::temp_dir().join(format!("tegatad-peers-{}", Uuid::new_v4()));
     std::fs::create_dir(&directory).expect("create test directory");
     let state_dir = directory.join("state");
@@ -40,6 +44,20 @@ fn start_daemon(legacy_token: &str) -> Daemon {
         .collect::<String>();
     std::fs::write(state_dir.join("token_hash"), format!("{token_hash}\n"))
         .expect("write legacy token hash");
+    if existing_legacy {
+        std::fs::write(
+            state_dir.join("peers.json"),
+            serde_json::to_vec(&vec![json!({
+                "peer_id": "legacy",
+                "label": "legacy",
+                "token_sha256": token_hash,
+                "issued_at": "unix:0",
+                "revoked_at": null,
+            })])
+            .expect("serialize existing legacy peer"),
+        )
+        .expect("write existing peers");
+    }
     let tcp_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve TCP port");
     let tcp_port = tcp_listener.local_addr().expect("read TCP port").port();
     drop(tcp_listener);
@@ -196,4 +214,83 @@ fn named_peers_are_issued_revoked_listed_and_import_legacy_tokens() {
             .iter()
             .any(|peer| peer["peer_id"] == default_id && peer["label"] == "default")
     );
+}
+
+#[test]
+fn revoked_peer_connections_are_rejected_after_authentication() {
+    let daemon = start_daemon("legacy-peer-test-token");
+    let issued = call_unix(
+        &daemon.socket_path,
+        "admin_peer_issue",
+        json!({ "label": "persistent" }),
+    )
+    .expect("issue peer");
+    let peer_id = issued["result"]["peer_id"].as_str().expect("peer id");
+    let token = issued["result"]["token"].as_str().expect("peer token");
+    let mut connection = BufReader::new(
+        std::net::TcpStream::connect(("127.0.0.1", daemon.tcp_port)).expect("connect TCP"),
+    );
+    writeln!(connection.get_mut(), "{}", json!({ "v": 1, "auth": token })).expect("write preamble");
+    writeln!(
+        connection.get_mut(),
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "status",
+            "params": {},
+        })
+    )
+    .expect("write initial request");
+    let mut initial = String::new();
+    connection
+        .read_line(&mut initial)
+        .expect("read initial response");
+    assert_eq!(
+        serde_json::from_str::<Value>(&initial).expect("parse initial response")["result"]["ok"],
+        true
+    );
+
+    let revoked = call_unix(
+        &daemon.socket_path,
+        "admin_peer_revoke",
+        json!({ "peer_id": peer_id }),
+    )
+    .expect("revoke peer");
+    assert_eq!(revoked["result"]["ok"], true);
+    writeln!(
+        connection.get_mut(),
+        "{}",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "status",
+            "params": {},
+        })
+    )
+    .expect("write request after revoke");
+    let mut refused = String::new();
+    connection
+        .read_line(&mut refused)
+        .expect("read refusal after revoke");
+    assert_eq!(refused.trim_end(), r#"{"ok":false,"error":"UNAUTHORIZED"}"#);
+    connection
+        .get_mut()
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("set read timeout");
+    let mut rest = Vec::new();
+    let _ = connection.read_to_end(&mut rest);
+    assert!(rest.is_empty());
+}
+
+#[test]
+fn legacy_hash_is_renamed_when_legacy_peer_already_exists() {
+    let daemon = start_daemon_with_existing_legacy("legacy-peer-test-token", true);
+    let peers: Vec<Value> = serde_json::from_slice(
+        &std::fs::read(daemon.state_dir.join("peers.json")).expect("read peers.json"),
+    )
+    .expect("parse peers.json");
+    assert_eq!(peers.len(), 1);
+    assert!(daemon.state_dir.join("token_hash.imported").exists());
+    assert!(!daemon.state_dir.join("token_hash").exists());
 }

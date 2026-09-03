@@ -197,6 +197,13 @@ pub(crate) fn install_service(config_path: &Path) -> Result<(), Box<dyn std::err
     let config_path = std::path::absolute(config_path)?;
     let config_text = std::fs::read_to_string(&config_path)?;
     let config: Config = toml::from_str(&config_text)?;
+    let tcp_port = super::normalize_listeners(&config_text, &config)?
+        .iter()
+        .find_map(|listener| match listener {
+            crate::transport::ListenConfig::Tcp { port, .. } => Some(*port),
+            _ => None,
+        })
+        .unwrap_or(0);
     validate_service_name(&config.transport.service_name).map_err(io::Error::other)?;
     let root = install_root(&config_path)?;
     let name = config.transport.service_name.clone();
@@ -223,7 +230,7 @@ pub(crate) fn install_service(config_path: &Path) -> Result<(), Box<dyn std::err
         &service_info,
         ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
     )?;
-    configure_firewall(&name, config.transport.tcp_port)?;
+    configure_firewall(&name, tcp_port)?;
     prepare_program_data(&config_path, &config, &root)?;
     if let Some(operator_sid) = config.transport.operator_sid.as_deref() {
         grant_service_control(&name, operator_sid)?;

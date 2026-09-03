@@ -72,6 +72,8 @@ pub(crate) enum PeerIdentity {
     },
     /// TCP client that presented a valid preamble token.
     Peer { peer_id: String, label: String },
+    /// リース失効など、デーモンが起点となる活動を表す身元です。
+    System,
 }
 
 impl PeerIdentity {
@@ -81,6 +83,7 @@ impl PeerIdentity {
             Self::Uid(_) => true,
             Self::Sid { normal_allowed, .. } => *normal_allowed,
             Self::Peer { .. } => true,
+            Self::System => false,
         }
     }
 
@@ -93,6 +96,7 @@ impl PeerIdentity {
                 ..
             } => *elevated && *administrator,
             Self::Peer { .. } => false,
+            Self::System => false,
         }
     }
 
@@ -101,6 +105,7 @@ impl PeerIdentity {
             Self::Uid(uid) => format!("uid:{uid}"),
             Self::Sid { sid, .. } => format!("sid:{sid}"),
             Self::Peer { peer_id, .. } => format!("peer:{peer_id}"),
+            Self::System => "system".to_owned(),
         }
     }
 }
@@ -126,6 +131,9 @@ impl serde::Serialize for PeerIdentity {
                 map.serialize_entry("peer_token", &true)?;
                 map.serialize_entry("peer_id", peer_id)?;
                 map.serialize_entry("peer_label", label)?;
+            }
+            Self::System => {
+                map.serialize_entry("peer_system", &true)?;
             }
         }
         map.serialize_entry("principal", &self.principal())?;

@@ -29,9 +29,14 @@ rl.on("line", (line) => {
   const request = JSON.parse(line);
   if (request.op === "login") {
     process.stdout.write(
-      JSON.stringify({ ok: true, endpoint: "ws://127.0.0.1:38999/devtools/browser/test", target_id: "test-target" }) + "\n",
+      JSON.stringify({ id: request.id, ok: true, endpoint: "ws://127.0.0.1:38999/devtools/browser/test", target_id: "test-target" }) + "\n",
     );
+  } else if (request.op === "lease") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true, target_id: "lease-target" }) + "\n");
+  } else if (request.op === "release") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true }) + "\n");
   } else if (request.op === "shutdown") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true }) + "\n");
     process.exit(0);
   }
 });
@@ -47,8 +52,9 @@ const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
   if (request.op === "login") {
-    process.stdout.write(JSON.stringify({ ok: false, error: "INVALID_CREDENTIAL" }) + "\n");
+    process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: "INVALID_CREDENTIAL" }) + "\n");
   } else if (request.op === "shutdown") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true }) + "\n");
     process.exit(0);
   }
 });
@@ -69,11 +75,28 @@ impl Daemon {
     /// Starts the daemon with a fake node executor written into the test
     /// directory; the executor records its PID in `executor.js.pid`.
     fn start_with_executor(script: &str) -> Self {
-        Self::start_inner(Some(script))
+        Self::start_inner_with_options(Some(script), false, None)
+    }
+
+    fn start_with_executor_and_approval(script: &str) -> Self {
+        Self::start_inner_with_options(Some(script), true, None)
+    }
+
+    fn start_with_executor_and_ttl(script: &str, ttl_secs: u64) -> Self {
+        Self::start_inner_with_options(Some(script), false, Some(ttl_secs))
     }
 
     #[allow(clippy::zombie_processes)]
     fn start_inner(executor_script: Option<&str>) -> Self {
+        Self::start_inner_with_options(executor_script, false, None)
+    }
+
+    #[allow(clippy::zombie_processes)]
+    fn start_inner_with_options(
+        executor_script: Option<&str>,
+        require_approval: bool,
+        session_ttl_secs: Option<u64>,
+    ) -> Self {
         let directory = std::env::temp_dir().join(format!("tegatad-test-{}", Uuid::new_v4()));
         std::fs::create_dir(&directory).expect("create test directory");
         let state_dir = directory.join("state");
@@ -88,13 +111,25 @@ impl Daemon {
                 format!("executor_entry = {script_path:?}\n")
             })
             .unwrap_or_default();
+        let approval_line = if require_approval {
+            let approval_path = directory.join("approval.once");
+            let command = format!("test ! -e {:?} && touch {:?}", approval_path, approval_path);
+            format!("approve_cmd = {command:?}\n")
+        } else {
+            String::new()
+        };
+        let ttl_line = session_ttl_secs
+            .map(|value| format!("session_ttl_secs = {value}\n"))
+            .unwrap_or_default();
         let config = format!(
-            "socket_path = {:?}\nstate_dir = {:?}\naudit_log_path = {:?}\nallowed_uids = [{}]\n{}\n[[providers]]\nnamespace = \"mock\"\ntype = \"mock\"\n\n[[providers.entries]]\nid = \"site\"\nname = \"Integration Site\"\nuri = \"http://127.0.0.1\"\nkind = \"login\"\nusername = {:?}\npassword = {:?}\ntotp_seed = {:?}\ntotp_exposable = true\n\n[[providers.entries]]\nid = \"site-no-totp\"\nname = \"Integration Site Without TOTP\"\nuri = \"http://127.0.0.1\"\nkind = \"login\"\nusername = {:?}\npassword = {:?}\n",
+            "socket_path = {:?}\nstate_dir = {:?}\naudit_log_path = {:?}\nallowed_uids = [{}]\n{}{}{}\n[[providers]]\nnamespace = \"mock\"\ntype = \"mock\"\n\n[[providers.entries]]\nid = \"site\"\nname = \"Integration Site\"\nuri = \"http://127.0.0.1\"\nkind = \"login\"\nusername = {:?}\npassword = {:?}\ntotp_seed = {:?}\ntotp_exposable = true\n\n[[providers.entries]]\nid = \"site-no-totp\"\nname = \"Integration Site Without TOTP\"\nuri = \"http://127.0.0.1\"\nkind = \"login\"\nusername = {:?}\npassword = {:?}\n",
             socket_path,
             state_dir,
             state_dir.join("audit.log"),
             uid,
             executor_line,
+            approval_line,
+            ttl_line,
             USERNAME,
             PASSWORD,
             TOTP_SEED,
@@ -155,6 +190,68 @@ fn status_returns_ok() {
     assert_eq!(response["result"]["ok"], json!(true));
     assert_eq!(response["result"]["browsers"], json!(0));
     assert_eq!(response["result"]["leases"], json!(0));
+}
+
+#[test]
+fn shared_login_requires_approval_for_each_lease() {
+    let daemon = Daemon::start_with_executor_and_approval(IDLING_EXECUTOR);
+    let params = json!({ "cred_id": "mock:site", "target_url": "http://127.0.0.1" });
+    let first = rpc(&daemon.socket_path, "login", params.clone());
+    assert!(first["result"]["session_id"].is_string());
+
+    let second = rpc(&daemon.socket_path, "login", params);
+    error_message(&second, "APPROVAL_DENIED");
+
+    let status = rpc(&daemon.socket_path, "status", json!({}));
+    assert_eq!(status["result"]["leases"], json!(1));
+}
+
+#[test]
+fn system_session_audits_have_system_principal() {
+    let daemon = Daemon::start_with_executor_and_ttl(IDLING_EXECUTOR, 1);
+    let login = rpc(
+        &daemon.socket_path,
+        "login",
+        json!({ "cred_id": "mock:site", "target_url": "http://127.0.0.1" }),
+    );
+    assert!(login["result"]["session_id"].is_string());
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut expired = false;
+    while Instant::now() < deadline {
+        let audit =
+            std::fs::read_to_string(daemon.directory.join("state/audit.log")).unwrap_or_default();
+        expired = audit.lines().any(|line| {
+            let record: Value = serde_json::from_str(line).expect("parse audit record");
+            record["method"] == "session_expired" && record["principal"] == "system"
+        });
+        if expired {
+            break;
+        }
+        sleep(Duration::from_millis(50));
+    }
+    assert!(expired, "session_expired audit lacks system principal");
+    drop(daemon);
+
+    let daemon = Daemon::start_with_executor(IDLING_EXECUTOR);
+    let login = rpc(
+        &daemon.socket_path,
+        "login",
+        json!({ "cred_id": "mock:site", "target_url": "http://127.0.0.1" }),
+    );
+    let session_id = login["result"]["session_id"].clone();
+    assert!(session_id.is_string());
+    let locked = rpc(
+        &daemon.socket_path,
+        "lock_vault",
+        json!({ "namespace": "mock" }),
+    );
+    assert_eq!(locked["result"]["ok"], true);
+    let audit =
+        std::fs::read_to_string(daemon.directory.join("state/audit.log")).expect("read audit log");
+    assert!(audit.lines().any(|line| {
+        let record: Value = serde_json::from_str(line).expect("parse audit record");
+        record["method"] == "session_terminated" && record["principal"] == "system"
+    }));
 }
 
 #[test]

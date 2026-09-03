@@ -56,27 +56,27 @@ impl PeerStore {
             parse_token_digest(peer.token_sha256.as_bytes())?;
         }
 
-        let imported = if !peers.iter().any(|peer| peer.peer_id == "legacy")
-            && legacy_token_hash_path.exists()
-        {
-            let hash = std::fs::read(legacy_token_hash_path)?;
-            let digest = parse_token_digest(&hash)?;
-            peers.push(PeerRecord {
-                peer_id: "legacy".to_owned(),
-                label: "legacy".to_owned(),
-                token_sha256: digest_to_hex(&digest),
-                issued_at: current_timestamp(),
-                revoked_at: None,
-            });
-            true
-        } else {
-            false
-        };
+        let legacy_token_hash_exists = legacy_token_hash_path.exists();
+        let imported =
+            if !peers.iter().any(|peer| peer.peer_id == "legacy") && legacy_token_hash_exists {
+                let hash = std::fs::read(legacy_token_hash_path)?;
+                let digest = parse_token_digest(&hash)?;
+                peers.push(PeerRecord {
+                    peer_id: "legacy".to_owned(),
+                    label: "legacy".to_owned(),
+                    token_sha256: digest_to_hex(&digest),
+                    issued_at: current_timestamp(),
+                    revoked_at: None,
+                });
+                true
+            } else {
+                false
+            };
 
         let contents = serde_json::to_vec(&peers)
             .map_err(|error| io::Error::other(format!("could not serialize peers: {error}")))?;
         secure_fs::write_private_file_atomic(path, &contents)?;
-        if imported {
+        if imported || legacy_token_hash_exists {
             let imported_path =
                 PathBuf::from(format!("{}.imported", legacy_token_hash_path.display()));
             std::fs::rename(legacy_token_hash_path, imported_path)?;
@@ -86,6 +86,20 @@ impl PeerStore {
             peers,
         })))
     }
+}
+
+pub(crate) fn is_active(store: &SharedPeerStore, peer_id: &str) -> bool {
+    store
+        .read()
+        .ok()
+        .and_then(|store| {
+            store
+                .peers
+                .iter()
+                .find(|peer| peer.peer_id == peer_id)
+                .map(|peer| peer.revoked_at.is_none())
+        })
+        .unwrap_or(false)
 }
 
 pub(crate) fn authenticator(store: &SharedPeerStore) -> PeerAuthenticator {

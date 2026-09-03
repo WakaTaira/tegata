@@ -14,13 +14,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use leakscan::scan_bytes;
-use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 #[cfg(unix)]
@@ -34,7 +33,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWrite
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, interval, sleep, timeout};
+use tokio::time::{Instant, interval, timeout};
 use uuid::Uuid;
 
 #[cfg(windows)]
@@ -59,9 +58,8 @@ const JSON_RPC_VERSION: &str = "2.0";
 const METHOD_NOT_FOUND: i32 = -32601;
 const CLASSIFICATION_ERROR: i32 = -32000;
 const EXECUTOR_TIMEOUT: Duration = Duration::from_secs(90);
-const EXECUTOR_OPERATION_TIMEOUT: Duration = Duration::from_secs(1);
+const EXECUTOR_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const EXECUTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
-const EXECUTOR_LEASE_READY_DELAY: Duration = Duration::from_millis(100);
 const PASSWORD_FILE_DIR: &str = ".bw-passwords";
 
 type ReadySender = Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<Result<(), String>>>>>;
@@ -254,6 +252,7 @@ pub(crate) struct ExecutorConnection {
     executor: Mutex<ExecutorHandle>,
     responses: Mutex<mpsc::UnboundedReceiver<io::Result<String>>>,
     operation: Mutex<()>,
+    next_id: AtomicU64,
 }
 
 struct DaemonState {
@@ -273,7 +272,6 @@ struct DaemonState {
     browsers_path: Option<PathBuf>,
     cdp_ports: Arc<std::sync::RwLock<HashMap<String, (String, u16)>>>,
     session_ttl: Duration,
-    provider_ttls: HashMap<String, Duration>,
     #[cfg(unix)]
     approve_cmd: Option<String>,
     #[cfg(unix)]
@@ -336,11 +334,7 @@ impl Serialize for AuditPeer<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Peer(peer) => peer.serialize(serializer),
-            Self::System => {
-                let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry("peer_system", &true)?;
-                map.end()
-            }
+            Self::System => PeerIdentity::System.serialize(serializer),
         }
     }
 }
@@ -674,6 +668,7 @@ async fn run_daemon(
     #[cfg(unix)]
     let token_hash_path = PathBuf::from(&config.state_dir).join("token_hash");
     let max_pending_connections = config.max_pending_connections;
+    let pending_connections = Arc::new(AtomicUsize::new(0));
     tokio::fs::create_dir_all(&config.state_dir).await?;
     let peers_path = PathBuf::from(&config.state_dir).join("peers.json");
     let peers = peers::PeerStore::load_or_import(&peers_path, &token_hash_path)?;
@@ -692,6 +687,7 @@ async fn run_daemon(
         &token_hash_path,
         resolver,
         peers::authenticator(&peers),
+        pending_connections,
         max_pending_connections,
     )
     .await?;
@@ -856,25 +852,6 @@ where
     Ok(())
 }
 
-fn provider_ttl_secs(kind: &ProviderConfigKind) -> Option<u64> {
-    match kind {
-        #[cfg(feature = "mock-provider")]
-        ProviderConfigKind::Mock { .. } => None,
-        ProviderConfigKind::BitwardenCli {
-            session_ttl_secs, ..
-        }
-        | ProviderConfigKind::AgeFile {
-            session_ttl_secs, ..
-        } => *session_ttl_secs,
-        #[cfg(unix)]
-        ProviderConfigKind::Pass {
-            session_ttl_secs, ..
-        } => *session_ttl_secs,
-        #[cfg(windows)]
-        ProviderConfigKind::Pass { .. } => None,
-    }
-}
-
 fn build_state(config: Config, peers: peers::SharedPeerStore) -> Result<DaemonState, io::Error> {
     #[cfg(windows)]
     let (_, sealed_blob_path) = resolve_windows_paths(&config);
@@ -900,15 +877,11 @@ fn build_state(config: Config, peers: peers::SharedPeerStore) -> Result<DaemonSt
     let bw_path = resolve_bw_path(&config);
     let session_ttl = Duration::from_secs(config.session_ttl_secs.unwrap_or(300));
     let state_dir = PathBuf::from(&config.state_dir);
-    let mut provider_ttls = HashMap::new();
     let providers = config
         .providers
         .into_iter()
         .map(|provider| -> Result<Provider, io::Error> {
             let namespace = provider.namespace;
-            if let Some(ttl) = provider_ttl_secs(&provider.kind) {
-                provider_ttls.insert(namespace.clone(), Duration::from_secs(ttl));
-            }
             let provider: Arc<Mutex<dyn CredentialProvider + Send>> = match provider.kind {
                 #[cfg(feature = "mock-provider")]
                 ProviderConfigKind::Mock { entries } => Arc::new(Mutex::new(
@@ -988,7 +961,6 @@ fn build_state(config: Config, peers: peers::SharedPeerStore) -> Result<DaemonSt
         browsers_path,
         cdp_ports: Arc::new(std::sync::RwLock::new(HashMap::new())),
         session_ttl,
-        provider_ttls,
         #[cfg(unix)]
         approve_cmd,
         #[cfg(unix)]
@@ -1230,6 +1202,16 @@ async fn serve_connection<S>(
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut lines = BufReader::new(read_half).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        if let PeerIdentity::Peer { peer_id, .. } = &peer {
+            let peer_store = state.lock().await.peers.clone();
+            if !peers::is_active(&peer_store, peer_id) {
+                let _ = write_half
+                    .write_all(b"{\"ok\":false,\"error\":\"UNAUTHORIZED\"}\n")
+                    .await;
+                let _ = write_half.flush().await;
+                break;
+            }
+        }
         let parsed = serde_json::from_str::<RpcRequest>(&line);
         let (request, response, outcome, fields) = match parsed {
             Ok(request) => {
@@ -1661,19 +1643,13 @@ async fn join_browser(
             browser_id,
             browser.executor.clone(),
             browser.endpoint.clone(),
-            daemon
-                .provider_ttls
-                .get(&key.namespace)
-                .copied()
-                .unwrap_or(daemon.session_ttl),
+            daemon.session_ttl,
         )
     };
     let target_id = match executor_lease(&executor).await {
         Ok(target_id) => target_id,
         Err(error) => return Some(Err(error)),
     };
-    // Executor は lease 応答後も CDP guard の target 初期化を継続するため、直後の release との競合を避けます。
-    sleep(EXECUTOR_LEASE_READY_DELAY).await;
     let session_id = Uuid::new_v4().to_string();
     let lease = sessions::Lease {
         principal: principal.to_owned(),
@@ -1718,13 +1694,19 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
     let namespace = namespace.to_owned();
     let principal = peer.principal();
     let key = sessions::BrowserKey::new(principal.clone(), namespace, params.cred_id.clone());
-    if !request_params.exclusive
-        && let Some(result) = join_browser(&state, &key, &principal).await
-    {
-        return match result {
-            Ok(result) => success(request.id.clone(), result).with_audit_shared(true),
-            Err(error) => classified(request.id.clone(), error),
+    #[cfg(unix)]
+    if state.lock().await.approve_cmd.is_some() {
+        let credential_state = match credential_state(&state, &params.cred_id).await {
+            Ok(Some(locked)) => locked,
+            Ok(None) => return classified(request.id.clone(), ErrorCode::InvalidCredential),
+            Err(error) => return classified(request.id.clone(), error),
         };
+        if credential_state {
+            return classified(request.id.clone(), ErrorCode::VaultLocked);
+        }
+        if let Err(error) = approve_login(&state, &params, peer).await {
+            return classified(request.id.clone(), error);
+        }
     }
     let start_gate = {
         let mut daemon = state.lock().await;
@@ -1751,20 +1733,6 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
             return classified(request.id.clone(), ErrorCode::RateLimited);
         }
     }
-    #[cfg(unix)]
-    if state.lock().await.approve_cmd.is_some() {
-        let credential_state = match credential_state(&state, &params.cred_id).await {
-            Ok(Some(locked)) => locked,
-            Ok(None) => return classified(request.id.clone(), ErrorCode::InvalidCredential),
-            Err(error) => return classified(request.id.clone(), error),
-        };
-        if credential_state {
-            return classified(request.id.clone(), ErrorCode::VaultLocked);
-        }
-        if let Err(error) = approve_login(&state, &params, peer).await {
-            return classified(request.id.clone(), error);
-        }
-    }
     let (credential, executor_entry, executor_socket, node_path, browsers_path, ttl) = {
         let credential = match resolve_credential(&state, &params.cred_id).await {
             Ok(Some(credential)) => credential,
@@ -1781,11 +1749,7 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
             daemon.executor_socket.clone(),
             daemon.node_path.clone(),
             daemon.browsers_path.clone(),
-            daemon
-                .provider_ttls
-                .get(&key.namespace)
-                .copied()
-                .unwrap_or(daemon.session_ttl),
+            daemon.session_ttl,
         )
     };
     {
@@ -1838,6 +1802,7 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
         executor: Mutex::new(executor),
         responses: Mutex::new(response_receiver),
         operation: Mutex::new(()),
+        next_id: AtomicU64::new(2),
     });
     let browser_id = Uuid::new_v4().to_string();
     let response_target_id = target_id.clone();
@@ -2396,6 +2361,7 @@ async fn start_executor(
         });
         let request = ExecutorLoginRequest {
             op: "login",
+            id: 1,
             target_url: params.target_url.clone(),
             steps: params.steps.clone(),
             success_selector: params.success_selector.clone(),
@@ -2421,6 +2387,9 @@ async fn start_executor(
         }
         let response: ExecutorResponse =
             serde_json::from_str(&response_line).map_err(|_| ErrorCode::Internal)?;
+        if response.id != Some(1) {
+            return Err(ErrorCode::Internal);
+        }
         if response.ok {
             let endpoint = response.endpoint.ok_or(ErrorCode::Internal)?;
             let target_id = response.target_id.ok_or(ErrorCode::Internal)?;
@@ -2465,13 +2434,19 @@ fn parse_error_code(value: &str) -> ErrorCode {
     }
 }
 
-async fn executor_request(
+async fn executor_request<T, F>(
     connection: &Arc<ExecutorConnection>,
-    mut request: Vec<u8>,
-) -> Result<Value, ErrorCode> {
-    let _operation = timeout(EXECUTOR_OPERATION_TIMEOUT, connection.operation.lock())
+    request: F,
+) -> Result<Value, ErrorCode>
+where
+    T: Serialize,
+    F: FnOnce(u64) -> T,
+{
+    let operation = timeout(EXECUTOR_OPERATION_TIMEOUT, connection.operation.lock())
         .await
         .map_err(|_| ErrorCode::Internal)?;
+    let id = connection.next_id.fetch_add(1, Ordering::Relaxed);
+    let mut request = serde_json::to_vec(&request(id)).map_err(|_| ErrorCode::Internal)?;
     request.push(b'\n');
     let mut executor = timeout(EXECUTOR_OPERATION_TIMEOUT, connection.executor.lock())
         .await
@@ -2489,13 +2464,19 @@ async fn executor_request(
         .map_err(|_| ErrorCode::Internal)?
         .ok_or(ErrorCode::Internal)?
         .map_err(|_| ErrorCode::Internal)?;
-    serde_json::from_str(&response).map_err(|_| ErrorCode::Internal)
+    let response: Value = serde_json::from_str(&response).map_err(|_| ErrorCode::Internal)?;
+    if response.get("id").and_then(Value::as_u64) != Some(id) {
+        drop(responses);
+        drop(operation);
+        kill_executor(connection).await;
+        return Err(ErrorCode::Internal);
+    }
+    Ok(response)
 }
 
 async fn executor_lease(connection: &Arc<ExecutorConnection>) -> Result<String, ErrorCode> {
-    let request = serde_json::to_vec(&ExecutorLeaseRequest { op: "lease" })
-        .map_err(|_| ErrorCode::Internal)?;
-    let response = executor_request(connection, request).await?;
+    let response =
+        executor_request(connection, |id| ExecutorLeaseRequest { op: "lease", id }).await?;
     let response: tegata_core::wire::ExecutorLeaseResponse =
         serde_json::from_value(response).map_err(|_| ErrorCode::Internal)?;
     if response.ok {
@@ -2513,12 +2494,12 @@ async fn executor_release(
     connection: &Arc<ExecutorConnection>,
     target_id: String,
 ) -> Result<(), ErrorCode> {
-    let request = serde_json::to_vec(&ExecutorReleaseRequest {
+    let response = executor_request(connection, |id| ExecutorReleaseRequest {
         op: "release",
+        id,
         target_id,
     })
-    .map_err(|_| ErrorCode::Internal)?;
-    let response = executor_request(connection, request).await?;
+    .await?;
     let response: tegata_core::wire::ExecutorLeaseResponse =
         serde_json::from_value(response).map_err(|_| ErrorCode::Internal)?;
     response.ok.then_some(()).ok_or_else(|| {
@@ -2531,7 +2512,7 @@ async fn executor_release(
 }
 
 async fn shutdown_executor(connection: Arc<ExecutorConnection>) {
-    let Ok(_operation) = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, connection.operation.lock()).await
+    let Ok(operation) = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, connection.operation.lock()).await
     else {
         kill_executor(&connection).await;
         return;
@@ -2541,31 +2522,40 @@ async fn shutdown_executor(connection: Arc<ExecutorConnection>) {
         kill_executor(&connection).await;
         return;
     };
-    let write_result = timeout(
-        EXECUTOR_SHUTDOWN_TIMEOUT,
-        executor.write_line(b"{\"op\":\"shutdown\"}\n"),
-    )
-    .await;
+    let id = connection.next_id.fetch_add(1, Ordering::Relaxed);
+    let mut request = match serde_json::to_vec(&json!({ "op": "shutdown", "id": id })) {
+        Ok(request) => request,
+        Err(_) => {
+            kill_executor_handle(&mut executor).await;
+            return;
+        }
+    };
+    request.push(b'\n');
+    let write_result = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, executor.write_line(&request)).await;
     if !matches!(write_result, Ok(Ok(()))) {
         kill_executor_handle(&mut executor).await;
         return;
     }
-    if wait_or_kill_executor(&mut executor).await {
-        return;
+    let _ = wait_or_kill_executor(&mut executor).await;
+    drop(executor);
+    if !shutdown_response_matches(&connection, id).await {
+        drop(operation);
+        kill_executor(&connection).await;
     }
-    #[cfg(unix)]
-    {
-        drop(executor);
-        let Ok(mut responses) =
-            timeout(EXECUTOR_SHUTDOWN_TIMEOUT, connection.responses.lock()).await
-        else {
-            return;
-        };
-        let _ = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, async {
-            while responses.recv().await.is_some() {}
-        })
-        .await;
-    }
+}
+
+async fn shutdown_response_matches(connection: &Arc<ExecutorConnection>, id: u64) -> bool {
+    let Ok(mut responses) = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, connection.responses.lock()).await
+    else {
+        return false;
+    };
+    let Ok(Some(Ok(response))) = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, responses.recv()).await else {
+        return false;
+    };
+    serde_json::from_str::<Value>(&response)
+        .ok()
+        .and_then(|response| response.get("id").and_then(Value::as_u64))
+        == Some(id)
 }
 
 async fn wait_or_kill_executor(executor: &mut ExecutorHandle) -> bool {

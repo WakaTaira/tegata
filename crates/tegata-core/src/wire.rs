@@ -67,6 +67,7 @@ pub struct ExecutorHelloResponse {
 #[derive(Serialize)]
 pub struct ExecutorLoginRequest {
     pub op: &'static str,
+    pub id: u64,
     pub target_url: String,
     pub steps: Option<Vec<LoginStep>>,
     pub success_selector: Option<String>,
@@ -86,6 +87,7 @@ pub struct ExecutorSecret {
 /// a classification code.
 #[derive(Deserialize)]
 pub struct ExecutorResponse {
+    pub id: Option<u64>,
     pub ok: bool,
     pub endpoint: Option<String>,
     pub error: Option<String>,
@@ -96,18 +98,21 @@ pub struct ExecutorResponse {
 #[derive(Serialize)]
 pub struct ExecutorLeaseRequest {
     pub op: &'static str,
+    pub id: u64,
 }
 
 /// Executor のタブを閉じるメッセージ。
 #[derive(Serialize)]
 pub struct ExecutorReleaseRequest {
     pub op: &'static str,
+    pub id: u64,
     pub target_id: String,
 }
 
 /// Executor のリース操作に対する応答。
 #[derive(Deserialize)]
 pub struct ExecutorLeaseResponse {
+    pub id: Option<u64>,
     pub ok: bool,
     pub target_id: Option<String>,
     pub error: Option<String>,

@@ -40,6 +40,7 @@ impl TcpTransport {
         _token_hash_path: &Path,
         cdp_port_resolver: CdpPortResolver,
         peer_authenticator: PeerAuthenticator,
+        pending_connections: Arc<AtomicUsize>,
         max_pending_connections: usize,
     ) -> io::Result<Self> {
         let listener = bind_tcp_listener(address).await?;
@@ -48,7 +49,7 @@ impl TcpTransport {
             listener,
             cdp_port_resolver,
             peer_authenticator,
-            pending_connections: Arc::new(AtomicUsize::new(0)),
+            pending_connections,
             max_pending_connections,
             accepted_sender,
             accepted,
@@ -69,6 +70,7 @@ impl TcpTransport {
             Path::new("test-token-hash"),
             cdp_port_resolver,
             peer_authenticator,
+            Arc::new(AtomicUsize::new(0)),
             8,
         )
         .await

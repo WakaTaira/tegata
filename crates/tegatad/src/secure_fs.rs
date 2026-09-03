@@ -7,9 +7,69 @@
 //! directory as an installer.
 
 use std::io;
+use std::io::Write;
 use std::path::Path;
 
 use tokio::fs::File;
+use uuid::Uuid;
+
+pub(crate) fn write_private_file_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "private file has no name"))?
+        .to_string_lossy();
+    let temporary = path.with_file_name(format!(".{file_name}.tmp-{}", Uuid::new_v4()));
+    let result = (|| {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        #[cfg(windows)]
+        restrict_path(&temporary, false, &daemon_principals())?;
+        #[cfg(not(windows))]
+        std::fs::rename(&temporary, path)?;
+        #[cfg(windows)]
+        replace_file(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MoveFileExW};
+
+    let destination_path = destination.to_owned();
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let result = unsafe {
+        // SAFETY: 両パスは NUL 終端であり、呼び出し中は有効です。
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING,
+        )
+    };
+    if result == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    restrict_path(&destination_path, false, &daemon_principals())
+}
 
 /// Creates a file readable only by the account that runs the daemon, failing
 /// if the path already exists.

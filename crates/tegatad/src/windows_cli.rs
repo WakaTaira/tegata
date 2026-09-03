@@ -15,6 +15,10 @@ pub(crate) enum WindowsCommand {
         #[command(subcommand)]
         command: TokenCommand,
     },
+    Peer {
+        #[command(subcommand)]
+        command: PeerCommand,
+    },
     Seal {
         #[arg(long, default_value = "tegatad")]
         pipe: String,
@@ -28,6 +32,25 @@ pub(crate) enum WindowsCommand {
 #[derive(clap::Subcommand)]
 pub(crate) enum TokenCommand {
     Issue {
+        #[arg(long, default_value = "tegatad")]
+        pipe: String,
+    },
+}
+
+#[derive(clap::Subcommand)]
+pub(crate) enum PeerCommand {
+    Issue {
+        #[arg(long)]
+        label: String,
+        #[arg(long, default_value = "tegatad")]
+        pipe: String,
+    },
+    Revoke {
+        peer_id: String,
+        #[arg(long, default_value = "tegatad")]
+        pipe: String,
+    },
+    List {
         #[arg(long, default_value = "tegatad")]
         pipe: String,
     },
@@ -59,6 +82,28 @@ pub(crate) fn run_windows_cli(
                 .ok_or("admin_token_issue returned no token")?;
             println!("{token}");
         }
+        "admin_peer_issue" => {
+            let result = response
+                .get("result")
+                .ok_or("admin_peer_issue returned no result")?;
+            let token = result
+                .get("token")
+                .and_then(Value::as_str)
+                .ok_or("admin_peer_issue returned no token")?;
+            let peer_id = result
+                .get("peer_id")
+                .and_then(Value::as_str)
+                .ok_or("admin_peer_issue returned no peer_id")?;
+            println!("{token}");
+            eprintln!("{peer_id}");
+        }
+        "admin_peer_list" => {
+            let result = response
+                .get("result")
+                .ok_or("admin_peer_list returned no result")?;
+            println!("{}", serde_json::to_string(result)?);
+        }
+        "admin_peer_revoke" => {}
         "admin_seal" => {}
         _ => {}
     }

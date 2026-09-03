@@ -25,7 +25,6 @@ pub(crate) type PeerAuthenticator =
 
 pub(crate) struct TcpTransport {
     listener: TcpListener,
-    token_hash_path: Box<Path>,
     cdp_port_resolver: CdpPortResolver,
     peer_authenticator: PeerAuthenticator,
     pending_connections: Arc<AtomicUsize>,
@@ -37,7 +36,7 @@ pub(crate) struct TcpTransport {
 impl TcpTransport {
     pub(crate) async fn bind(
         address: SocketAddr,
-        token_hash_path: &Path,
+        _token_hash_path: &Path,
         cdp_port_resolver: CdpPortResolver,
         peer_authenticator: PeerAuthenticator,
         max_pending_connections: usize,
@@ -46,7 +45,6 @@ impl TcpTransport {
         let (accepted_sender, accepted) = mpsc::channel(max_pending_connections.max(1));
         Ok(Self {
             listener,
-            token_hash_path: token_hash_path.into(),
             cdp_port_resolver,
             peer_authenticator,
             pending_connections: Arc::new(AtomicUsize::new(0)),
@@ -58,34 +56,21 @@ impl TcpTransport {
 
     #[cfg(test)]
     async fn bind_for_test(token: &str, cdp_port_resolver: CdpPortResolver) -> io::Result<Self> {
-        let path =
-            std::env::temp_dir().join(format!("tegatad-token-hash-{}", uuid::Uuid::new_v4()));
-        let digest = Sha256::digest(token.as_bytes());
-        let hash = digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        std::fs::write(&path, format!("{hash}\n"))?;
+        let token = token.to_owned();
+        let peer_authenticator: PeerAuthenticator = Arc::new(move |candidate, _| {
+            (candidate == token.as_str()).then(|| super::PeerIdentity::Peer {
+                peer_id: "test".to_owned(),
+                label: "test".to_owned(),
+            })
+        });
         Self::bind(
             SocketAddr::from(([127, 0, 0, 1], 0)),
-            &path,
+            Path::new("test-token-hash"),
             cdp_port_resolver,
-            legacy_peer_authenticator(),
+            peer_authenticator,
             8,
         )
         .await
-    }
-
-    #[cfg(test)]
-    async fn replace_token_hash(&self, token: &str) {
-        let digest = Sha256::digest(token.as_bytes());
-        let hash = digest
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        tokio::fs::write(&self.token_hash_path, format!("{hash}\n"))
-            .await
-            .expect("replace token hash");
     }
 
     #[cfg(test)]
@@ -106,7 +91,6 @@ impl TcpTransport {
                         let _ = stream.shutdown().await;
                         continue;
                     }
-                    let token_hash_path = self.token_hash_path.to_owned();
                     let cdp_port_resolver = self.cdp_port_resolver.clone();
                     let peer_authenticator = self.peer_authenticator.clone();
                     let pending_connections = self.pending_connections.clone();
@@ -114,7 +98,6 @@ impl TcpTransport {
                     tokio::spawn(async move {
                         let accepted = handle_connection(
                             stream,
-                            &token_hash_path,
                             &cdp_port_resolver,
                             &peer_authenticator,
                             &pending_connections,
@@ -136,7 +119,6 @@ impl TcpTransport {
 
 async fn handle_connection(
     mut stream: TcpStream,
-    token_hash_path: &Path,
     cdp_port_resolver: &CdpPortResolver,
     peer_authenticator: &PeerAuthenticator,
     pending_connections: &AtomicUsize,
@@ -152,14 +134,7 @@ async fn handle_connection(
     };
     pending_connections.fetch_sub(1, Ordering::AcqRel);
 
-    let token_digest = match load_token_digest(token_hash_path).await {
-        Ok(token_digest) => token_digest,
-        Err(_) => {
-            log_authentication_failure();
-            refuse_connection(&mut stream, PreambleError::Unauthorized).await;
-            return Ok(super::Accepted::Consumed);
-        }
-    };
+    let token_digest: [u8; 32] = Sha256::digest(preamble.auth.as_bytes()).into();
     let peer = if preamble.v == PREAMBLE_VERSION {
         (peer_authenticator)(&preamble.auth, &token_digest)
     } else {
@@ -206,53 +181,8 @@ fn reserve_pending_connection(pending: &AtomicUsize, limit: usize) -> bool {
         .is_ok()
 }
 
-pub(crate) fn legacy_peer_authenticator() -> PeerAuthenticator {
-    Arc::new(|token, expected| {
-        constant_time_digest_matches(token, expected).then(|| super::PeerIdentity::Peer {
-            peer_id: "legacy".to_owned(),
-            label: "legacy".to_owned(),
-        })
-    })
-}
-
 pub(crate) async fn bind_tcp_listener(address: SocketAddr) -> io::Result<TcpListener> {
     TcpListener::bind(address).await
-}
-
-async fn load_token_digest(path: &Path) -> io::Result<[u8; 32]> {
-    let contents = tokio::fs::read(path).await?;
-    parse_token_digest(&contents)
-}
-
-fn parse_token_digest(contents: &[u8]) -> io::Result<[u8; 32]> {
-    let contents = match contents.strip_suffix(b"\n") {
-        Some(contents) => contents.strip_suffix(b"\r").unwrap_or(contents),
-        None => contents,
-    };
-    if contents.len() != 64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "token hash must contain one 64-character lowercase SHA-256 hex line",
-        ));
-    }
-    let mut digest = [0_u8; 32];
-    for (index, pair) in contents.chunks_exact(2).enumerate() {
-        let high = decode_hex_digit(pair[0])?;
-        let low = decode_hex_digit(pair[1])?;
-        digest[index] = (high << 4) | low;
-    }
-    Ok(digest)
-}
-
-fn decode_hex_digit(digit: u8) -> io::Result<u8> {
-    match digit {
-        b'0'..=b'9' => Ok(digit - b'0'),
-        b'a'..=b'f' => Ok(digit - b'a' + 10),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "token hash must contain one 64-character lowercase SHA-256 hex line",
-        )),
-    }
 }
 
 async fn read_preamble<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Preamble> {
@@ -313,26 +243,8 @@ async fn write_response<S: AsyncWrite + Unpin>(
     stream.flush().await
 }
 
-fn constant_time_digest_matches(token: &str, expected: &[u8; 32]) -> bool {
-    let actual = Sha256::digest(token.as_bytes());
-    actual
-        .iter()
-        .zip(expected)
-        .fold(0_u8, |difference, (actual, expected)| {
-            difference | (actual ^ expected)
-        })
-        == 0
-}
-
 fn log_authentication_failure() {
     eprintln!("tegatad: TCP preamble authentication failed");
-}
-
-#[cfg(test)]
-impl Drop for TcpTransport {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.token_hash_path);
-    }
 }
 
 #[cfg(test)]
@@ -345,7 +257,7 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     use super::super::Accepted;
-    use super::{CdpPortResolver, TcpTransport, parse_token_digest};
+    use super::{CdpPortResolver, TcpTransport};
 
     const TOKEN: &str = "test-token";
     const UNAUTHORIZED: &[u8] = b"{\"ok\":false,\"error\":\"UNAUTHORIZED\"}\n";
@@ -505,61 +417,5 @@ mod tests {
             ));
             read_response(&mut client, UNAUTHORIZED).await;
         }
-    }
-
-    #[test]
-    fn token_hash_parser_requires_lowercase_sha256_hex() {
-        assert!(parse_token_digest(b"00").is_err());
-        assert!(parse_token_digest(&[b'A'; 64]).is_err());
-        assert!(parse_token_digest(&[b'0'; 64]).is_ok());
-    }
-
-    #[tokio::test]
-    async fn token_hash_rotation_takes_effect_without_rebinding() {
-        let mut transport = transport(Arc::new(|_| None)).await;
-        let mut client = tokio::net::TcpStream::connect(transport.local_addr().unwrap())
-            .await
-            .unwrap();
-        client
-            .write_all(b"{\"v\":1,\"auth\":\"test-token\"}\n")
-            .await
-            .unwrap();
-        assert!(matches!(
-            transport.accept().await.unwrap(),
-            Accepted::Rpc { .. }
-        ));
-
-        transport.replace_token_hash("rotated-token").await;
-        let mut client = tokio::net::TcpStream::connect(transport.local_addr().unwrap())
-            .await
-            .unwrap();
-        client
-            .write_all(b"{\"v\":1,\"auth\":\"rotated-token\"}\n")
-            .await
-            .unwrap();
-        assert!(matches!(
-            transport.accept().await.unwrap(),
-            Accepted::Rpc { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn missing_token_hash_is_unauthorized() {
-        let mut transport = transport(Arc::new(|_| None)).await;
-        tokio::fs::remove_file(&transport.token_hash_path)
-            .await
-            .unwrap();
-        let mut client = tokio::net::TcpStream::connect(transport.local_addr().unwrap())
-            .await
-            .unwrap();
-        client
-            .write_all(b"{\"v\":1,\"auth\":\"test-token\"}\n")
-            .await
-            .unwrap();
-        assert!(matches!(
-            transport.accept().await.unwrap(),
-            Accepted::Consumed
-        ));
-        read_response(&mut client, UNAUTHORIZED).await;
     }
 }

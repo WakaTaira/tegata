@@ -1,5 +1,6 @@
 #[cfg(windows)]
 mod dpapi;
+mod peers;
 mod provider;
 mod secure_fs;
 mod transport;
@@ -35,9 +36,7 @@ use tokio::time::{Instant, interval, timeout};
 use uuid::Uuid;
 
 #[cfg(windows)]
-use sha2::{Digest, Sha256};
-#[cfg(windows)]
-use tegata_core::wire::{AdminSealParams, AdminTokenIssueResult};
+use tegata_core::wire::AdminSealParams;
 #[cfg(windows)]
 use zeroize::Zeroize;
 
@@ -51,7 +50,7 @@ use crate::provider::{
 use crate::provider::{PassProvider, PassProviderConfig};
 use crate::transport::{
     Accepted, CdpPortResolver, ListenConfig, PeerIdentity, PlatformConfig, PlatformTransport,
-    Transport, legacy_peer_authenticator,
+    Transport,
 };
 
 const JSON_RPC_VERSION: &str = "2.0";
@@ -271,8 +270,7 @@ struct DaemonState {
     approve_cmd: Option<String>,
     #[cfg(unix)]
     approve_timeout: Duration,
-    #[cfg(windows)]
-    token_hash_path: PathBuf,
+    peers: peers::SharedPeerStore,
     #[cfg(windows)]
     sealed_blob_path: PathBuf,
 }
@@ -291,6 +289,7 @@ enum ErrorCode {
     ApprovalDenied,
     ApprovalTimeout,
     Internal,
+    NotFound,
     #[cfg(windows)]
     Unauthorized,
     AdminRequired,
@@ -310,6 +309,7 @@ impl ErrorCode {
             Self::ApprovalDenied => "APPROVAL_DENIED",
             Self::ApprovalTimeout => "APPROVAL_TIMEOUT",
             Self::Internal => "INTERNAL",
+            Self::NotFound => "NOT_FOUND",
             #[cfg(windows)]
             Self::Unauthorized => "UNAUTHORIZED",
             Self::AdminRequired => "ADMIN_REQUIRED",
@@ -373,6 +373,51 @@ struct Args {
     #[cfg(windows)]
     #[command(subcommand)]
     command: Option<windows_cli::WindowsCommand>,
+    #[cfg(unix)]
+    #[command(subcommand)]
+    command: Option<UnixCommand>,
+}
+
+#[cfg(unix)]
+#[derive(clap::Subcommand)]
+enum UnixCommand {
+    Peer {
+        #[command(subcommand)]
+        command: UnixPeerCommand,
+    },
+    Token {
+        #[command(subcommand)]
+        command: UnixTokenCommand,
+    },
+}
+
+#[cfg(unix)]
+#[derive(clap::Subcommand)]
+enum UnixPeerCommand {
+    Issue {
+        #[arg(long)]
+        label: String,
+        #[arg(long, default_value = "/run/tegata/tegatad.sock")]
+        socket: PathBuf,
+    },
+    Revoke {
+        peer_id: String,
+        #[arg(long, default_value = "/run/tegata/tegatad.sock")]
+        socket: PathBuf,
+    },
+    List {
+        #[arg(long, default_value = "/run/tegata/tegatad.sock")]
+        socket: PathBuf,
+    },
+}
+
+#[cfg(unix)]
+#[derive(clap::Subcommand)]
+enum UnixTokenCommand {
+    Issue {
+        #[arg(long, default_value = "/run/tegata/tegatad.sock")]
+        socket: PathBuf,
+    },
 }
 
 fn main() {
@@ -394,6 +439,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 windows_cli::WindowsCommand::Token { command } => match command {
                     windows_cli::TokenCommand::Issue { pipe } => {
                         windows_cli::run_windows_cli(&pipe, "admin_token_issue", json!({}))
+                    }
+                },
+                windows_cli::WindowsCommand::Peer { command } => match command {
+                    windows_cli::PeerCommand::Issue { label, pipe } => {
+                        windows_cli::run_windows_cli(
+                            &pipe,
+                            "admin_peer_issue",
+                            json!({ "label": label }),
+                        )
+                    }
+                    windows_cli::PeerCommand::Revoke { peer_id, pipe } => {
+                        windows_cli::run_windows_cli(
+                            &pipe,
+                            "admin_peer_revoke",
+                            json!({ "peer_id": peer_id }),
+                        )
+                    }
+                    windows_cli::PeerCommand::List { pipe } => {
+                        windows_cli::run_windows_cli(&pipe, "admin_peer_list", json!({}))
                     }
                 },
                 windows_cli::WindowsCommand::Seal { pipe } => {
@@ -428,9 +492,86 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(unix)]
     {
+        if let Some(command) = args.command {
+            return run_unix_command(command);
+        }
         let config = args.config.ok_or("--config is required")?;
         run_daemon_runtime(&config, false, None)
     }
+}
+
+#[cfg(unix)]
+fn run_unix_command(command: UnixCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        UnixCommand::Peer { command } => match command {
+            UnixPeerCommand::Issue { label, socket } => {
+                let response =
+                    call_unix_rpc(&socket, "admin_peer_issue", json!({ "label": label }))?;
+                let result = response
+                    .get("result")
+                    .ok_or("admin_peer_issue returned no result")?;
+                let token = result
+                    .get("token")
+                    .and_then(Value::as_str)
+                    .ok_or("admin_peer_issue returned no token")?;
+                let peer_id = result
+                    .get("peer_id")
+                    .and_then(Value::as_str)
+                    .ok_or("admin_peer_issue returned no peer_id")?;
+                println!("{token}");
+                eprintln!("{peer_id}");
+            }
+            UnixPeerCommand::Revoke { peer_id, socket } => {
+                let _ = call_unix_rpc(&socket, "admin_peer_revoke", json!({ "peer_id": peer_id }))?;
+            }
+            UnixPeerCommand::List { socket } => {
+                let response = call_unix_rpc(&socket, "admin_peer_list", json!({}))?;
+                let result = response
+                    .get("result")
+                    .ok_or("admin_peer_list returned no result")?;
+                println!("{}", serde_json::to_string(result)?);
+            }
+        },
+        UnixCommand::Token { command } => match command {
+            UnixTokenCommand::Issue { socket } => {
+                let response = call_unix_rpc(&socket, "admin_token_issue", json!({}))?;
+                let token = response
+                    .get("result")
+                    .and_then(|result| result.get("token"))
+                    .and_then(Value::as_str)
+                    .ok_or("admin_token_issue returned no token")?;
+                println!("{token}");
+            }
+        },
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn call_unix_rpc(socket_path: &Path, method: &str, params: Value) -> io::Result<Value> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(socket_path)?;
+    let request = json!({
+        "jsonrpc": JSON_RPC_VERSION,
+        "id": 1,
+        "method": method,
+        "params": params,
+    });
+    writeln!(stream, "{request}")?;
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response)?;
+    let response: Value = serde_json::from_str(&response)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if let Some(message) = response
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+    {
+        return Err(io::Error::other(message.to_owned()));
+    }
+    Ok(response)
 }
 
 fn run_daemon_runtime(
@@ -507,7 +648,9 @@ async fn run_daemon(
     let token_hash_path = PathBuf::from(&config.state_dir).join("token_hash");
     let max_pending_connections = config.max_pending_connections;
     tokio::fs::create_dir_all(&config.state_dir).await?;
-    let state = Arc::new(Mutex::new(build_state(config)?));
+    let peers_path = PathBuf::from(&config.state_dir).join("peers.json");
+    let peers = peers::PeerStore::load_or_import(&peers_path, &token_hash_path)?;
+    let state = Arc::new(Mutex::new(build_state(config, peers.clone())?));
     let cdp_ports = state.lock().await.cdp_ports.clone();
     let resolver: CdpPortResolver = Arc::new(move |session_id| {
         cdp_ports
@@ -519,7 +662,7 @@ async fn run_daemon(
         &listeners,
         &token_hash_path,
         resolver,
-        legacy_peer_authenticator(),
+        peers::authenticator(&peers),
         max_pending_connections,
     )
     .await?;
@@ -684,9 +827,9 @@ where
     Ok(())
 }
 
-fn build_state(config: Config) -> Result<DaemonState, io::Error> {
+fn build_state(config: Config, peers: peers::SharedPeerStore) -> Result<DaemonState, io::Error> {
     #[cfg(windows)]
-    let (token_hash_path, sealed_blob_path) = resolve_windows_paths(&config);
+    let (_, sealed_blob_path) = resolve_windows_paths(&config);
     #[cfg(windows)]
     let unlock_mode = config.unlock_mode;
     #[cfg(feature = "mock-provider")]
@@ -795,8 +938,7 @@ fn build_state(config: Config) -> Result<DaemonState, io::Error> {
         approve_cmd,
         #[cfg(unix)]
         approve_timeout,
-        #[cfg(windows)]
-        token_hash_path,
+        peers,
         #[cfg(windows)]
         sealed_blob_path,
     })
@@ -1183,16 +1325,15 @@ async fn handle_request(
         if !peer.allows_admin_rpc(operator_uids) {
             return classified(request.id.clone(), ErrorCode::AdminRequired);
         }
-        #[cfg(windows)]
-        {
-            return match request.method.as_str() {
-                "admin_seal" => admin_seal(request, state).await,
-                "admin_token_issue" => admin_token_issue(request, state).await,
-                _ => classified(request.id.clone(), ErrorCode::Internal),
-            };
-        }
-        #[cfg(not(windows))]
-        return classified(request.id.clone(), ErrorCode::Internal);
+        return match request.method.as_str() {
+            "admin_peer_issue" => admin_peer_issue(request, state).await,
+            "admin_peer_revoke" => admin_peer_revoke(request, state).await,
+            "admin_peer_list" => admin_peer_list(request, state).await,
+            "admin_token_issue" => admin_token_issue(request, state).await,
+            #[cfg(windows)]
+            "admin_seal" => admin_seal(request, state).await,
+            _ => classified(request.id.clone(), ErrorCode::Internal),
+        };
     }
     #[cfg(windows)]
     if !peer.allows_normal_rpc() {
@@ -1220,23 +1361,83 @@ async fn handle_request(
     }
 }
 
-#[cfg(windows)]
 async fn admin_token_issue(request: &RpcRequest, state: SharedState) -> HandledRequest {
-    let token = Uuid::new_v4().simple().to_string();
-    let digest = Sha256::digest(token.as_bytes());
-    let hash = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let path = state.lock().await.token_hash_path.clone();
-    if tokio::fs::write(path, format!("{hash}\n")).await.is_err() {
+    issue_peer_with_label(request, state, "default".to_owned()).await
+}
+
+#[derive(Deserialize)]
+struct AdminPeerIssueParams {
+    label: String,
+}
+
+#[derive(Deserialize)]
+struct AdminPeerRevokeParams {
+    peer_id: String,
+}
+
+async fn issue_peer_with_label(
+    request: &RpcRequest,
+    state: SharedState,
+    label: String,
+) -> HandledRequest {
+    if label.is_empty() {
         return classified(request.id.clone(), ErrorCode::Internal);
     }
-    let result = match serde_json::to_value(AdminTokenIssueResult { token }) {
-        Ok(result) => result,
+    let peers = state.lock().await.peers.clone();
+    let issued = match peers::issue(&peers, &label) {
+        Ok(issued) => issued,
         Err(_) => return classified(request.id.clone(), ErrorCode::Internal),
     };
-    success(request.id.clone(), result)
+    success(
+        request.id.clone(),
+        json!({ "peer_id": issued.peer_id, "token": issued.token }),
+    )
+}
+
+async fn admin_peer_issue(request: &RpcRequest, state: SharedState) -> HandledRequest {
+    let params = match parse_params::<AdminPeerIssueParams>(&request.params) {
+        Ok(params) => params,
+        Err(error) => return classified(request.id.clone(), error),
+    };
+    if params.label.is_empty() {
+        return classified(request.id.clone(), ErrorCode::Internal);
+    }
+    issue_peer_with_label(request, state, params.label).await
+}
+
+async fn admin_peer_revoke(request: &RpcRequest, state: SharedState) -> HandledRequest {
+    let params = match parse_params::<AdminPeerRevokeParams>(&request.params) {
+        Ok(params) => params,
+        Err(error) => return classified(request.id.clone(), error),
+    };
+    let peers = state.lock().await.peers.clone();
+    match peers::revoke(&peers, &params.peer_id) {
+        Ok(true) => success(request.id.clone(), json!({ "ok": true })),
+        Ok(false) => classified(request.id.clone(), ErrorCode::NotFound),
+        Err(_) => classified(request.id.clone(), ErrorCode::Internal),
+    }
+}
+
+async fn admin_peer_list(request: &RpcRequest, state: SharedState) -> HandledRequest {
+    let peers = state.lock().await.peers.clone();
+    let peers = match peers::list(&peers) {
+        Ok(peers) => peers,
+        Err(_) => return classified(request.id.clone(), ErrorCode::Internal),
+    };
+    success(
+        request.id.clone(),
+        json!(
+            peers
+                .into_iter()
+                .map(|peer| json!({
+                    "peer_id": peer.peer_id,
+                    "label": peer.label,
+                    "issued_at": peer.issued_at,
+                    "revoked_at": peer.revoked_at,
+                }))
+                .collect::<Vec<_>>()
+        ),
+    )
 }
 
 #[cfg(windows)]
@@ -1863,6 +2064,7 @@ fn parse_error_code(value: &str) -> ErrorCode {
         "APPROVAL_DENIED" => ErrorCode::ApprovalDenied,
         "APPROVAL_TIMEOUT" => ErrorCode::ApprovalTimeout,
         "INTERNAL" => ErrorCode::Internal,
+        "NOT_FOUND" => ErrorCode::NotFound,
         _ => ErrorCode::Internal,
     }
 }

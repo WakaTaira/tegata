@@ -22,7 +22,7 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Serializer};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub(crate) use tcp::{CdpPortResolver, PeerAuthenticator, TcpTransport, legacy_peer_authenticator};
+pub(crate) use tcp::{CdpPortResolver, PeerAuthenticator, TcpTransport};
 
 #[cfg(unix)]
 pub(crate) use unix::{PlatformConfig, PlatformTransport};

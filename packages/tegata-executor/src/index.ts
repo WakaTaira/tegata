@@ -33,7 +33,16 @@ type LoginRequest = {
   };
 };
 
-type Request = LoginRequest | { op: "hello" } | { op: "shutdown" };
+type LeaseRequest = { op: "lease" };
+
+type ReleaseRequest = { op: "release"; target_id: string };
+
+type Request =
+  | LoginRequest
+  | LeaseRequest
+  | ReleaseRequest
+  | { op: "hello" }
+  | { op: "shutdown" };
 
 type ErrorCode =
   | "INVALID_CREDENTIAL"
@@ -53,6 +62,7 @@ class MfaRequiredError extends Error {}
 let activeBrowser: Browser | undefined;
 let activeGuard: CdpGuard | undefined;
 let activeTempDir: string | undefined;
+let activeBrowserContextId: string | undefined;
 let shuttingDown = false;
 
 type CdpMessage = {
@@ -69,6 +79,10 @@ type CdpGuard = {
   failure: Promise<never>;
   browserPid: number | undefined;
   assertOpen: () => void;
+  send: (
+    method: string,
+    params: Record<string, unknown>,
+  ) => Promise<Record<string, unknown> | undefined>;
 };
 
 type PendingCdpCommand = {
@@ -99,14 +113,19 @@ function isSecretPlaceholder(value: unknown): value is FillStep["value"] {
 
 function parseRequest(line: string): Request {
   const value: unknown = JSON.parse(line);
-  if (
-    !isRecord(value) ||
-    (value.op !== "hello" && value.op !== "login" && value.op !== "shutdown")
-  ) {
+  if (!isRecord(value) || typeof value.op !== "string") {
     throw new Error("invalid request");
   }
   if (value.op === "hello") return { op: "hello" };
   if (value.op === "shutdown") return { op: "shutdown" };
+  if (value.op === "lease") return { op: "lease" };
+  if (value.op === "release") {
+    if (typeof value.target_id !== "string") {
+      throw new Error("invalid release request");
+    }
+    return { op: "release", target_id: value.target_id };
+  }
+  if (value.op !== "login") throw new Error("invalid request");
 
   const secret = value.secret;
   if (
@@ -365,6 +384,7 @@ async function openGuard(endpoint: string): Promise<CdpGuard> {
     assertOpen: () => {
       if (failureError !== undefined) throw failureError;
     },
+    send: (method, params) => send(method, params),
   };
 }
 
@@ -560,7 +580,9 @@ async function waitForLoginResult(
   if (result !== "success") throw new Error("login result timed out");
 }
 
-async function executeLogin(request: LoginRequest): Promise<string> {
+async function executeLogin(
+  request: LoginRequest,
+): Promise<{ endpoint: string; targetId: string }> {
   const port = await reservePort();
   const dir = await mkdtemp(path.join(os.tmpdir(), "tegata-browser-"));
   activeTempDir = dir;
@@ -590,9 +612,25 @@ async function executeLogin(request: LoginRequest): Promise<string> {
       request.failure_selector,
     ),
   );
+  const pageSession = await withGuard(guard, () =>
+    page.context().newCDPSession(page),
+  );
+  const targetInfoResult = await withGuard(guard, () =>
+    pageSession.send("Target.getTargetInfo"),
+  );
+  await pageSession.detach().catch(() => undefined);
+  const targetInfo = targetInfoResult.targetInfo;
+  if (
+    !isRecord(targetInfo) ||
+    typeof targetInfo.targetId !== "string" ||
+    typeof targetInfo.browserContextId !== "string"
+  ) {
+    throw new Error("CDP target information was not returned");
+  }
+  activeBrowserContextId = targetInfo.browserContextId;
   monitorGuardFailure(guard);
   guard.assertOpen();
-  return endpoint;
+  return { endpoint, targetId: targetInfo.targetId };
 }
 
 function writeResponse(value: unknown): void {
@@ -648,8 +686,61 @@ async function cleanupResources(): Promise<void> {
   }
   const dir = activeTempDir;
   activeTempDir = undefined;
+  activeBrowserContextId = undefined;
   if (dir !== undefined) {
     await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+async function handleLease(): Promise<void> {
+  const guard = activeGuard;
+  const browserContextId = activeBrowserContextId;
+  if (
+    activeBrowser === undefined ||
+    guard === undefined ||
+    browserContextId === undefined
+  ) {
+    writeResponse({ ok: false, error: "INTERNAL" satisfies ErrorCode });
+    return;
+  }
+
+  try {
+    const result = await withGuard(guard, () =>
+      guard.send("Target.createTarget", {
+        url: "about:blank",
+        browserContextId,
+      }),
+    );
+    const targetId = result?.targetId;
+    if (typeof targetId !== "string") {
+      throw new Error("CDP target was not created");
+    }
+    writeResponse({ ok: true, target_id: targetId });
+  } catch {
+    writeResponse({ ok: false, error: "INTERNAL" satisfies ErrorCode });
+  }
+}
+
+async function handleRelease(request: ReleaseRequest): Promise<void> {
+  const guard = activeGuard;
+  if (activeBrowser === undefined || guard === undefined) {
+    writeResponse({ ok: false, error: "INTERNAL" satisfies ErrorCode });
+    return;
+  }
+
+  try {
+    await withGuard(guard, () =>
+      guard.send("Target.closeTarget", { targetId: request.target_id }),
+    );
+    writeResponse({ ok: true });
+  } catch {
+    try {
+      guard.assertOpen();
+    } catch {
+      writeResponse({ ok: false, error: "INTERNAL" satisfies ErrorCode });
+      return;
+    }
+    writeResponse({ ok: true });
   }
 }
 
@@ -660,8 +751,8 @@ async function handleLogin(request: LoginRequest): Promise<void> {
   }
 
   try {
-    const endpoint = await executeLogin(request);
-    writeResponse({ ok: true, endpoint });
+    const { endpoint, targetId } = await executeLogin(request);
+    writeResponse({ ok: true, endpoint, target_id: targetId });
   } catch (error) {
     const errorCode: ErrorCode =
       error instanceof SelectorNotFoundError
@@ -715,6 +806,14 @@ async function main(): Promise<void> {
       if (request.op === "shutdown") {
         await shutdown();
         return;
+      }
+      if (request.op === "lease") {
+        await handleLease();
+        continue;
+      }
+      if (request.op === "release") {
+        await handleRelease(request);
+        continue;
       }
       await handleLogin(request);
     } catch {

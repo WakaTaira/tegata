@@ -89,6 +89,28 @@ pub struct ExecutorResponse {
     pub ok: bool,
     pub endpoint: Option<String>,
     pub error: Option<String>,
+    pub target_id: Option<String>,
+}
+
+/// Executor に新しいリース用タブを要求するメッセージ。
+#[derive(Serialize)]
+pub struct ExecutorLeaseRequest {
+    pub op: &'static str,
+}
+
+/// Executor のタブを閉じるメッセージ。
+#[derive(Serialize)]
+pub struct ExecutorReleaseRequest {
+    pub op: &'static str,
+    pub target_id: String,
+}
+
+/// Executor のリース操作に対する応答。
+#[derive(Deserialize)]
+pub struct ExecutorLeaseResponse {
+    pub ok: bool,
+    pub target_id: Option<String>,
+    pub error: Option<String>,
 }
 
 /// Preamble version understood by this build.

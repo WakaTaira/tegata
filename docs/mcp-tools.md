@@ -71,10 +71,12 @@ unexpected daemon response cannot smuggle text out through the error path.
 `INVALID_CREDENTIAL` covers both "no such credential" and "the site said no" on
 purpose: distinguishing them would tell an agent which identifiers are real.
 
-Two further codes exist at the transport level and never reach the MCP layer:
+Three further codes exist at the transport level and never reach the MCP layer:
 `UNAUTHORIZED` (bad or missing token, or a SID not on the allowlist) and
 `FORBIDDEN` (a tunnel request for a port that is not the named session's CDP
-port). The administrative RPCs add `ADMIN_REQUIRED` and `ADMIN_SEAL_UNAVAILABLE`.
+port) and `NOT_FOUND` (a CDP tunnel preamble whose session does not exist or does
+not belong to the calling principal; the session's existence is not disclosed).
+The administrative RPCs add `ADMIN_REQUIRED` and `ADMIN_SEAL_UNAVAILABLE`.
 
 ---
 

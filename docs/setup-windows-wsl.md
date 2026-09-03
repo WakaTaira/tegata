@@ -131,7 +131,9 @@ release.
 
 On upgrade, an existing `state\token_hash` is imported at startup into
 `peers.json` as `peer_id = "legacy"`; the old file is renamed to
-`token_hash.imported`. Existing bridge tokens continue to work.
+`token_hash.imported`. Existing bridge tokens continue to work. `token issue` and
+`peer issue` add a peer without invalidating existing tokens; revoke a token with
+`peer revoke <peer_id>`.
 
 ### Seal the master password
 
@@ -379,8 +381,9 @@ gateway address is what the bridge resolved; a mirrored-networking distro needs
 `--daemon-addr 127.0.0.1`. Confirm `tcp_port` is not `0`.
 
 **`UNAUTHORIZED` from the bridge.** The token file does not match the stored hash.
-Re-issue with `tegatad.exe token issue` and copy the new value; issuing invalidates
-the previous token.
+Issue a new peer with `tegatad.exe token issue` or `tegatad.exe peer issue`; this
+adds a peer and leaves existing tokens valid. Invalidate a token with
+`tegatad.exe peer revoke <peer_id>`.
 
 **`token issue` or `seal` succeeds from inside WSL without elevation.** The
 distro was started from an elevated context, so every interop process carries

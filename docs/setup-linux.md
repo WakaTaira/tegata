@@ -223,6 +223,7 @@ daemon's user and mode 0600.
 executor_socket = "/run/tegata-executor/executor.sock"
 state_dir      = "/var/lib/tegata"
 audit_log_path = "/var/lib/tegata/audit.log"
+session_ttl_secs = 300
 
 [[listen]]
 kind          = "unix"
@@ -234,8 +235,6 @@ operator_uids = [1000]
 kind = "tcp"
 bind = "127.0.0.1"
 port = 21575
-
-session_ttl_secs = 300
 
 [[providers]]
 namespace      = "vw"
@@ -254,7 +253,6 @@ session_ttl_secs = 900
 | `state_dir` | string | yes | Directory the daemon owns; holds per-provider CLI state |
 | `audit_log_path` | string | yes | Where the audit log is appended, created mode 0600 |
 | `audit_log_max_bytes` | integer | no | Rotate to `<path>.1` past this size, at most once per daemon process. Unset means no rotation |
-| `operator_uids` | list of integer | no | uids permitted to use admin RPCs in addition to root |
 | `max_pending_connections` | integer | no | Maximum unauthenticated concurrent TCP connections; default `8` |
 | `session_ttl_secs` | integer | no | Browser session lifetime; default `300` |
 | `approve_cmd` | string | no | Command that must approve each `login`. Unset means no approval gate |
@@ -263,10 +261,20 @@ session_ttl_secs = 900
 | `executor_socket` | string | no | Path to the UNIX domain socket. When set, the daemon communicates with an executor in another process over this socket; when `None`, the daemon spawns the executor as before |
 
 Each `[[listen]]` entry selects a transport at runtime. A UNIX entry requires
-`kind = "unix"`, `path`, and its uid lists; a TCP entry requires an explicit
-`bind` and `port`; `bind = "auto"` is Windows-only. `0.0.0.0` and `::` are
-refused. Container-oriented binds are covered in a later `setup-container.md`
-release.
+`kind = "unix"`, `path`, `allowed_uids`, and `operator_uids`; `operator_uids`
+permits those uids to use admin RPCs in addition to root. A TCP entry requires
+an explicit `bind` and `port`; `bind = "auto"` is Windows-only. `0.0.0.0` and
+`::` are refused. Container-oriented binds are covered in a later
+`setup-container.md` release.
+
+The TCP token is sent in plaintext as the first line of the connection. Bind
+only to loopback (`127.0.0.1`) or to an address of a host-internal bridge for
+containers, which is covered in a later release; never bind to an on-path or
+routable interface. TLS/mTLS is not provided.
+
+Top-level keys such as `session_ttl_secs` must appear before the first
+`[[listen]]` table. In TOML, placing them after it makes them belong to the
+immediately preceding table and they are silently ignored.
 
 The legacy `socket_path` and `allowed_uids` keys remain accepted and are normalized
 to the same `[[listen]]` form. Writing legacy and `[[listen]]` settings together

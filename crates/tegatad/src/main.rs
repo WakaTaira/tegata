@@ -613,17 +613,19 @@ async fn run_daemon(
     let config_text = tokio::fs::read_to_string(config_path).await?;
     let config: Config = toml::from_str(&config_text)?;
     let listeners = normalize_listeners(&config_text, &config)?;
-    remove_legacy_password_dir(Path::new(&config.state_dir)).await;
-    #[cfg(windows)]
-    if config.approve_cmd.is_some() {
-        return Err("approve_cmd is only supported on Unix".into());
-    }
     #[cfg(unix)]
     if let Some(path) = config.executor_socket.as_deref() {
         let uid = validate_executor_socket(path).await?;
         eprintln!("executor: socket {path} (uid {uid})");
     } else {
         eprintln!("executor: spawned by the daemon (browser is not isolated)");
+    }
+    #[cfg(unix)]
+    secure_fs::ensure_private_dir(Path::new(&config.state_dir))?;
+    remove_legacy_password_dir(Path::new(&config.state_dir)).await;
+    #[cfg(windows)]
+    if config.approve_cmd.is_some() {
+        return Err("approve_cmd is only supported on Unix".into());
     }
     #[cfg(windows)]
     if let Some(message) = config.providers.iter().find_map(|provider| {
@@ -667,6 +669,7 @@ async fn run_daemon(
     let token_hash_path = PathBuf::from(&config.state_dir).join("token_hash");
     let max_pending_connections = config.max_pending_connections;
     let pending_connections = Arc::new(AtomicUsize::new(0));
+    #[cfg(windows)]
     tokio::fs::create_dir_all(&config.state_dir).await?;
     let peers_path = PathBuf::from(&config.state_dir).join("peers.json");
     let peers = peers::PeerStore::load_or_import(&peers_path, &token_hash_path)?;

@@ -37,6 +37,8 @@ fn start_daemon_with_existing_legacy(legacy_token: &str, existing_legacy: bool) 
     std::fs::create_dir(&directory).expect("create test directory");
     let state_dir = directory.join("state");
     std::fs::create_dir(&state_dir).expect("create state directory");
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("set state directory permissions");
     let socket_path = directory.join("tegatad.sock");
     let token_hash = Sha256::digest(legacy_token.as_bytes())
         .iter()
@@ -124,6 +126,8 @@ fn start_daemon_with_unix_permissions(allowed_uids: &[u32], operator_uids: &[u32
     std::fs::create_dir(&directory).expect("create test directory");
     let state_dir = directory.join("state");
     std::fs::create_dir(&state_dir).expect("create state directory");
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("set state directory permissions");
     let socket_path = directory.join("tegatad.sock");
     let allowed_uids = allowed_uids
         .iter()

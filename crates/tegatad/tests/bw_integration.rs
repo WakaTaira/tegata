@@ -120,6 +120,8 @@ impl TestStack {
             .expect("set askpass permissions");
         let state_dir = directory.join("state");
         std::fs::create_dir_all(&state_dir).expect("create daemon state directory");
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("set state directory permissions");
         let socket_path = directory.join("tegatad.sock");
         let config_path = directory.join("config.toml");
         let uid = unsafe { libc::geteuid() };

@@ -8,10 +8,66 @@
 
 use std::io;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use tokio::fs::File;
 use uuid::Uuid;
+
+#[cfg(unix)]
+pub(crate) fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => validate_state_dir(path, &metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut builder = std::fs::DirBuilder::new();
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            match builder.create(path) {
+                Ok(()) => {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+                    let metadata = std::fs::symlink_metadata(path)?;
+                    validate_state_dir(path, &metadata)
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    let metadata = std::fs::symlink_metadata(path)?;
+                    validate_state_dir(path, &metadata)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn validate_state_dir(path: &Path, metadata: &std::fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::other(format!(
+            "state_dir {} must not be a symlink",
+            path.display()
+        )));
+    }
+    let expected_uid = unsafe { libc::geteuid() };
+    let mode = metadata.permissions().mode() & 0o777;
+    let uid = metadata.uid();
+    if !metadata.is_dir() || mode != 0o700 || uid != expected_uid {
+        return Err(io::Error::other(format!(
+            "state_dir {} must be a directory with mode 0700 owned by uid {} (found mode {:04o}, uid {})",
+            path.display(),
+            expected_uid,
+            mode,
+            uid,
+        )));
+    }
+    Ok(())
+}
 
 pub(crate) fn write_private_file_atomic(path: &Path, contents: &[u8]) -> io::Result<()> {
     let file_name = path

@@ -2,6 +2,7 @@
 //! only exist on UNIX targets.
 #![cfg(unix)]
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
@@ -101,6 +102,8 @@ impl Daemon {
         std::fs::create_dir(&directory).expect("create test directory");
         let state_dir = directory.join("state");
         std::fs::create_dir(&state_dir).expect("create state directory");
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("set state directory permissions");
         let socket_path = directory.join("tegatad.sock");
         let config_path = directory.join("config.toml");
         let uid = unsafe { libc::geteuid() };

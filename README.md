@@ -169,7 +169,7 @@ The agent-facing surface is five tools. Nothing else crosses the boundary.
 | Tool | Input | Output |
 | --- | --- | --- |
 | `list_credentials` | `{namespace?}` | Catalog entries: `id`, `name`, `uri`, `kind`, `source`, `status`. No values. |
-| `login` | `{cred_id, target_url, steps?, success_selector?, failure_selector?}` | `{session_id, channel: {kind: "cdp", endpoint}}` |
+| `login` | `{cred_id, target_url, steps?, success_selector?, failure_selector?, exclusive?: boolean (dedicated browser)}` | `{session_id, target_id, channel: {kind: "cdp", endpoint}}` |
 | `logout` | `{session_id}` | `{ok}` — destroys the session and its browser |
 | `get_totp` | `{cred_id}` | `{code, expires_in}` — opt-in entries only, rate-limited |
 | `lock_vault` | `{namespace?}` | `{ok}` — locks one provider, or all of them |
@@ -235,6 +235,7 @@ they are meant to be read as the specification of what the boundary guarantees.
 - [Security](docs/security.md) — threat model, invariants, unlock and TOTP design
 - [MCP tools](docs/mcp-tools.md) — the full agent-facing contract
 - [Linux setup](docs/setup-linux.md) — NixOS module and `config.toml` reference
+- [Container setup](docs/setup-container.md) — Docker bridge network, named token, `tegata-bridge` in the container
 - [Windows / WSL setup](docs/setup-windows-wsl.md) — service, token, seal, bridge
 - [Security policy](SECURITY.md) — how to report a vulnerability privately
 

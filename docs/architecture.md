@@ -192,7 +192,8 @@ The file is created mode 0600, and
 
 ## The transport layer
 
-Each target compiles exactly one transport, chosen at build time. Authentication
+Transports are selected at runtime from the `[[listen]]` tables in the config file:
+UNIX socket and TCP on Linux; named pipe and TCP on Windows. Authentication
 happens *inside* `accept`: a peer that fails it is refused there and reported as
 consumed, so an unauthenticated connection has no path to the RPC layer at all.
 
@@ -215,16 +216,18 @@ bits.
   client uses. Setting `tcp_port = 0` disables it entirely and leaves the pipe as
   the only way in.
 
-A preamble may also request a **tunnel**, naming a session and a port. The daemon
-accepts it only when that port is the CDP port of that active session, and refuses
-anything else with `FORBIDDEN`. It is a session handoff, not a port forwarder.
+A preamble may also request a **tunnel**, naming a session and a port. A session
+the caller does not own answers `NOT_FOUND`; a tunnel request for a session the
+caller does own, but with a mismatched port, answers `FORBIDDEN`. It is a session
+handoff, not a port forwarder.
 
 ## Sessions
 
-Each login gets its own executor process and its own browser, tagged with the
-namespace it came from. The daemon holds the child handle and an expiry, and a
-sweeper stops any session past its TTL — 300 seconds by default — auditing a
-`session_expired` event as it goes. `logout` does the same on demand and is
+One browser (one executor process) is shared per (principal, namespace, credential);
+each login is a lease with its own tab within that shared browser, and
+`exclusive: true` opts a login out of sharing with a dedicated browser. The daemon
+holds the child handle and an expiry, and a sweeper stops any session past its TTL
+— 300 seconds by default — auditing a `session_expired` event as it goes. `logout` does the same on demand and is
 idempotent, and `lock_vault` takes down every session belonging to the namespaces
 it locks. A daemon asked to stop — a service stop request, `SIGTERM`, or
 `SIGINT` — reaps every live executor on its way out, and the executor treats its

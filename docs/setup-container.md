@@ -52,16 +52,21 @@ The default for `services.tegata.listen.tcp` is `null`, so no TCP port exists
 unless it is configured. `operatorUids` defaults to `[]`; root and these uids can
 call peer administration RPCs from the UNIX socket.
 
-Allow inbound traffic on the bridge and this port only. On NixOS:
+Allow inbound traffic to the bridge gateway address and this port only. On NixOS:
 
 ```nix
-networking.firewall.interfaces.tegata0.allowedTCPPorts = [ 21575 ];
+networking.firewall.extraCommands = ''
+  iptables -A nixos-fw -i tegata0 -d 172.30.0.1 -p tcp --dport 21575 -j nixos-fw-accept
+'';
 ```
 
-On another Linux host, an equivalent iptables rule is:
+`networking.firewall.interfaces.tegata0.allowedTCPPorts = [ 21575 ];` is
+equivalent as long as the bridge has only the gateway address.
+
+On another Linux host, allow inbound traffic to the bridge gateway address with:
 
 ```sh
-sudo iptables -I INPUT -i tegata0 -p tcp --dport 21575 -j ACCEPT
+sudo iptables -I INPUT -i tegata0 -d 172.30.0.1 -p tcp --dport 21575 -j ACCEPT
 ```
 
 Do not open port `21575` on other interfaces.
@@ -78,6 +83,7 @@ The plaintext token is displayed once. Store it in a host file readable only by
 the operator, for example:
 
 ```sh
+sudo install -d -m 0700 /etc/tegata
 sudo install -m 0600 /dev/null /etc/tegata/agent-token
 sudo sh -c 'umask 077; printf "%s\n" "TOKEN_FROM_peer_issue" > /etc/tegata/agent-token'
 ```
@@ -102,7 +108,16 @@ checkout, or copy the result of the Nix `packages.tegata-bridge` package:
 cargo build --release -p tegata-bridge
 ```
 
-Inside the agent container, start the bridge with the named token:
+Inside the agent container, create the socket's parent directory as the same uid
+that will run the bridge:
+
+```sh
+install -d -m 0700 /run/tegata-bridge
+```
+
+The bridge does not create the parent directory of its `--socket` path.
+
+Start the bridge with the named token:
 
 ```sh
 tegata-bridge \
@@ -123,8 +138,8 @@ TEGATA_SOCKET=/run/tegata-bridge/bridge.sock TEGATA_BRIDGE=1 \
 Use the `tegata-mcp` Nix package, or run `node packages/tegata-mcp/dist/index.js`
 when using a checkout.
 
-The MCP `status`, `login`, and `logout` operations are the same as for a host
-agent. `login` returns an endpoint such as
+The MCP tools (`list_credentials`, `login`, `logout`, `get_totp`, `lock_vault`)
+behave exactly as for a host agent. `login` returns an endpoint such as
 `ws://127.0.0.1:<port>/...`; that `127.0.0.1` is inside the container and
 identifies the bridge's CDP tunnel.
 

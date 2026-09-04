@@ -160,6 +160,50 @@
             assert evaluated.config.systemd.services.tegata-bridge.serviceConfig.ExecStart
               == "${tegataPackages.tegata-bridge}/bin/tegata-bridge --socket /run/tegata-bridge/bridge.sock --token-file /run/tegata-bridge/token";
             pkgs.runCommand "tegata-bridge-eval" {} "touch $out";
+
+        tegata-module-eval =
+          let
+            evaluated = nixpkgs.lib.nixosSystem {
+              inherit system;
+              modules = [
+                self.nixosModules.tegata
+                {
+                  services.tegata = {
+                    enable = true;
+                    allowedUsers = [ "agent" ];
+                    listen.tcp = {
+                      bind = "172.30.0.1";
+                      port = 21575;
+                    };
+                    operatorUids = [ 1000 ];
+                  };
+                }
+              ];
+            };
+            evaluatedDefault = nixpkgs.lib.nixosSystem {
+              inherit system;
+              modules = [
+                self.nixosModules.tegata
+                {
+                  services.tegata = {
+                    enable = true;
+                    allowedUsers = [ "agent" ];
+                  };
+                }
+              ];
+            };
+            configText = evaluated.config.systemd.services.tegata.preStart;
+            defaultConfigText = evaluatedDefault.config.systemd.services.tegata.preStart;
+            containsLine = text: line: builtins.elem line (builtins.split "\n" text);
+          in
+            assert containsLine configText "kind = \"unix\"";
+            assert containsLine configText "kind = \"tcp\"";
+            assert containsLine configText "bind = \"172.30.0.1\"";
+            assert containsLine configText "port = 21575";
+            assert containsLine configText "operator_uids = [1000]";
+            assert builtins.replaceStrings [ "socket_path" ] [ "" ] configText == configText;
+            assert !(containsLine defaultConfigText "kind = \"tcp\"");
+            pkgs.runCommand "tegata-module-eval" {} "touch $out";
       };
     };
 }

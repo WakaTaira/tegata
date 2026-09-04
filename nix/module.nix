@@ -31,7 +31,6 @@ let
       + lib.concatStringsSep "" (map renderEntry provider.entries);
 
   baseConfig = {
-    socket_path = "/run/tegata/tegatad.sock";
     executor_socket = "/run/tegata-executor/executor.sock";
     state_dir = "/var/lib/tegata";
     audit_log_path = "/var/lib/tegata/audit.log";
@@ -47,9 +46,26 @@ let
     audit_log_max_bytes = cfg.auditLogMaxBytes;
   };
 
+  unixListenConfig = ''
+    [[listen]]
+    kind = "unix"
+    path = "/run/tegata/tegatad.sock"
+    allowed_uids = [__TEGATA_ALLOWED_UIDS__]
+    operator_uids = ${tomlValue cfg.operatorUids}
+  '';
+
+  tcpListenConfig = lib.optionalString (cfg.listen.tcp != null) ''
+    [[listen]]
+    kind = "tcp"
+    bind = ${tomlValue cfg.listen.tcp.bind}
+    port = ${tomlValue cfg.listen.tcp.port}
+  '';
+
   configTemplate = ''
     ${renderAssignments baseConfig}
-    allowed_uids = [__TEGATA_ALLOWED_UIDS__]
+
+    ${unixListenConfig}
+    ${tcpListenConfig}
 
     ${lib.concatStringsSep "\n\n" (map renderProvider cfg.providers)}
   '';
@@ -70,6 +86,31 @@ in
       type = lib.types.listOf lib.types.str;
       default = [];
       description = "Users allowed to connect to the tegatad socket.";
+    };
+
+    listen = {
+      tcp = lib.mkOption {
+        type = lib.types.nullOr (lib.types.submodule {
+          options = {
+            bind = lib.mkOption {
+              type = lib.types.str;
+              description = "Address on which the daemon's TCP listener binds.";
+            };
+            port = lib.mkOption {
+              type = lib.types.port;
+              description = "Port on which the daemon's TCP listener binds.";
+            };
+          };
+        });
+        default = null;
+        description = "Bind the daemon's TCP front (named-token peers such as the container bridge) to this address and port; null = no TCP listener.";
+      };
+    };
+
+    operatorUids = lib.mkOption {
+      type = lib.types.listOf lib.types.int;
+      default = [];
+      description = "UIDs allowed to call the administrative RPCs (peer issue/revoke/list) over the UNIX socket, in addition to root.";
     };
 
     providers = lib.mkOption {
@@ -159,6 +200,14 @@ in
   };
 
   config = lib.mkIf cfg.enable {
+    assertions = [
+      {
+        assertion = cfg.listen.tcp == null
+          || !(builtins.elem cfg.listen.tcp.bind [ "0.0.0.0" "::" "auto" ]);
+        message = "services.tegata.listen.tcp.bind must be a specific address, not 0.0.0.0, ::, or auto.";
+      }
+    ];
+
     users.groups.tegata = {};
     users.groups.tegata-browser = {};
     users.users.tegata = {

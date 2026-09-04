@@ -56,6 +56,15 @@ written in terms of user names and enforced in terms of uids.
 | `services.tegata.auditLogMaxBytes` | null or unsigned | `null` | Rotate the audit log past this size |
 | `services.tegata.approveCmd` | null or string | `null` | Approval command gating each login |
 | `services.tegata.approveTimeoutSecs` | null or unsigned | `null` (60s) | Approval command timeout |
+| `services.tegata.listen.tcp` | null or submodule | `null` | Optional TCP listener for a container bridge |
+| `services.tegata.operatorUids` | list of unsigned | `[]` | Uids permitted to call peer administration RPCs over the UNIX socket |
+
+For a container bridge, configure the listener and administrative uids explicitly:
+
+```nix
+services.tegata.listen.tcp = { bind = "172.30.0.1"; port = 21575; };
+services.tegata.operatorUids = [ 1000 ];
+```
 
 Provider submodule fields: `namespace`, `type`, `server_url`, `email`,
 `askpass_cmd`, `totp_exposable`, `session_ttl_secs`, and `entries` (used only by
@@ -68,8 +77,8 @@ certificate; the daemon passes its environment on to bw. The boundary test in
 `nix/vm-test.nix` does exactly this for its throwaway vault.
 
 The bridge module `nixosModules.tegata-bridge` is documented in
-[setup-windows-wsl.md](setup-windows-wsl.md#nixos-bridge-module); it is only useful
-when the daemon is a Windows service.
+[setup-windows-wsl.md](setup-windows-wsl.md#nixos-bridge-module); it is useful for
+Windows service and container configurations.
 
 ### Playwright browsers
 
@@ -134,6 +143,11 @@ ReadWritePaths=/var/lib/tegata /run/tegata
 [Install]
 WantedBy=multi-user.target
 ```
+
+The daemon checks at startup that `state_dir` (normally `/var/lib/tegata`) is a
+non-symlink directory, mode 0700, and owned by the daemon uid; a violation is
+reported on stderr and causes exit 1. For a manual installation, create it with
+`install -d -m 0700 -o tegata -g tegata /var/lib/tegata`.
 
 With a matching socket unit listening on `/run/tegata/tegatad.sock`, the daemon
 inherits the socket through socket activation. Without one, it binds the path
@@ -264,13 +278,13 @@ Each `[[listen]]` entry selects a transport at runtime. A UNIX entry requires
 `kind = "unix"`, `path`, `allowed_uids`, and `operator_uids`; `operator_uids`
 permits those uids to use admin RPCs in addition to root. A TCP entry requires
 an explicit `bind` and `port`; `bind = "auto"` is Windows-only. `0.0.0.0` and
-`::` are refused. Container-oriented binds are covered in a later
-`setup-container.md` release.
+`::` are refused. For a container bridge, use a host-internal bridge gateway
+address as the explicit bind; see [setup-container.md](setup-container.md).
 
 The TCP token is sent in plaintext as the first line of the connection. Bind
 only to loopback (`127.0.0.1`) or to an address of a host-internal bridge for
-containers, which is covered in a later release; never bind to an on-path or
-routable interface. TLS/mTLS is not provided.
+containers; never bind to an on-path or routable interface. TLS/mTLS is not
+provided.
 
 Top-level keys such as `session_ttl_secs` must appear before the first
 `[[listen]]` table. In TOML, placing them after it makes them belong to the

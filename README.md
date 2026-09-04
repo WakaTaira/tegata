@@ -110,7 +110,7 @@ Full threat model, invariants, and the operator hardening checklist:
 | --- | --- | --- | --- | --- | --- |
 | systemd | Linux, WSL | Dedicated user + hardened systemd unit; browser worker as a separate user via socket activation | UNIX socket, `SO_PEERCRED` | askpass at unlock | Implemented |
 | Windows service | Windows | Virtual service account `NT SERVICE\tegatad` (browser shares the service account) | Named pipe + SID; loopback TCP + token for the WSL client | DPAPI | Implemented |
-| Container | Containerized agent on a Linux host | Daemon on the host; `tegata-bridge` in the container | TCP + named token | Host-side | Planned ([#6](https://github.com/WakaTaira/tegata/issues/6)) |
+| Container | Containerized agent on a Linux host | Daemon on the host; `tegata-bridge` in the container | TCP + named token | Host-side | Implemented (rootful Docker) |
 | Remote host | Any | Separate host or VM | mTLS / tailnet identity | Server-side | Not planned ([#7](https://github.com/WakaTaira/tegata/issues/7)) |
 
 The Windows service boundary is the recommended configuration for a WSL agent:
@@ -159,6 +159,7 @@ Everything else — other platforms and vault backends, the approval hook,
 deployment without Nix — is in the setup guides:
 
 - **Linux / NixOS** — [docs/setup-linux.md](docs/setup-linux.md)
+- **Containerized agent (Docker)** — [docs/setup-container.md](docs/setup-container.md)
 - **Windows service + WSL client** — [docs/setup-windows-wsl.md](docs/setup-windows-wsl.md)
 
 ## MCP tools

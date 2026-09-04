@@ -25,7 +25,7 @@ byte stream and is identical on Linux and Windows.
 | --- | --- | --- | --- | --- |
 | systemd | Linux, WSL | Dedicated user, hardened unit, socket activation | UNIX socket + `SO_PEERCRED` | askpass at unlock |
 | Windows service | Windows | Virtual account `NT SERVICE\tegatad` | Named pipe + SID; loopback TCP + token | DPAPI |
-| Container | *not implemented* | Separate container, no shared volume | Socket + token | Secret mount |
+| Container | Linux host + rootful Docker | Daemon on the host; `tegata-bridge` in the container over a private bridge network | TCP + named token | Host-side (daemon) |
 | Remote host | *not implemented* | Separate host or VM | mTLS / Tailscale identity | Server-side |
 
 ### CredentialProvider — where values come from
@@ -250,6 +250,16 @@ shape to the Linux deployment, and keeps the token in a file the broker never
 reads. With `TEGATA_BRIDGE=1` the broker additionally asks for a tunnel after each
 login and rewrites the returned CDP endpoint to its WSL-local port, so the agent
 connects to something reachable without knowing why.
+
+## The container boundary
+
+The host daemon binds its TCP listener to the gateway IP of a dedicated
+user-defined Docker bridge. The agent container runs `tegata-bridge` with a named
+token; the bridge forwards authenticated RPC to the daemon and tunnels the CDP
+connection back to the container. The only container-to-host path is the bridge
+gateway IP, and the daemon does not listen on other host interfaces for this
+boundary. Chromium's CDP port exists only on the host loopback, so the container
+receives the bridge tunnel rather than direct access to the browser port.
 
 ## Where things live
 

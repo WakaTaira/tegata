@@ -85,6 +85,19 @@ systemd boundary, but only if interop is disabled or `.exe` execution is denied.
 Otherwise the agent launches `powershell.exe` and reads back into the distro as
 root, and the boundary is gone.
 
+**Container.** This boundary assumes that the daemon and agent are on the same
+Linux host and that installation is available to the host administrator. The
+agent container receives only a named token and a CDP tunnel; credential values
+remain with the host daemon. A peer that possesses a token can act as that peer
+on the bridge network, because tokens are plaintext and the connection has no TLS
+in this release. A container using `--network host`, rootless Docker, or Podman is not
+covered. An agent with a host privilege-escalation path — including passwordless
+sudo, membership in the `docker` group, or Windows administrator elevation — is
+not covered; a `docker`-group user is effectively host root, so running the agent
+with that membership is not a boundary. Phase 4a ownership restrictions apply
+to container peers as well: sessions owned by another principal return
+`NOT_FOUND`.
+
 ### 3. Only a thin, allowlisted RPC crosses the boundary
 
 Six methods exist: `status`, `list_credentials`, `login`, `logout`, `get_totp`,

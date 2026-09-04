@@ -53,6 +53,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Check that docker is available
+        run: docker info
+
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v14
 

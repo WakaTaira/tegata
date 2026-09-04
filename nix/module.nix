@@ -108,7 +108,7 @@ in
     };
 
     operatorUids = lib.mkOption {
-      type = lib.types.listOf lib.types.int;
+      type = lib.types.listOf lib.types.ints.unsigned;
       default = [];
       description = "UIDs allowed to call the administrative RPCs (peer issue/revoke/list) over the UNIX socket, in addition to root.";
     };

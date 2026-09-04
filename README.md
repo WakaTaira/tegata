@@ -245,18 +245,17 @@ Implemented today: the systemd and Windows service boundaries; three credential
 backends behind the provider trait — Bitwarden CLI, age-encrypted file, and GNU
 pass — usable together; the Playwright form executor; the five MCP tools;
 human-in-the-loop login approval; an audit log covering both agent calls and
-the daemon's own session and vault events; and prebuilt release binaries and
-bundles for non-Nix deployments, published from tags on the
+the daemon's own session and vault events; named tokens and shared sessions —
+one browser per credential and caller, leased to several agents on the same
+machine, with an owner on every session; the container boundary — the daemon on
+the host, reached from a containerized agent through `tegata-bridge` and a named
+token; and prebuilt release binaries and bundles for non-Nix deployments,
+published from tags on the
 [releases page](https://github.com/WakaTaira/tegata/releases).
 
 Planned, tracked in the
 [issue tracker](https://github.com/WakaTaira/tegata/issues):
 
-- **Named tokens and shared sessions** — one browser per credential and caller,
-  leased to several agents on the same machine, with an owner on every session
-- **Container boundary** ([#6](https://github.com/WakaTaira/tegata/issues/6)) —
-  the daemon on the host, reached from a containerized agent through
-  `tegata-bridge` and a named token
 - **CDP isolation** — the browser in its own network namespace, reachable only
   through the daemon's authenticated relay
 - **OAuth device-flow approval**

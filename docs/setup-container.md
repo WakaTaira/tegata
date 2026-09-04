@@ -71,26 +71,29 @@ sudo iptables -I INPUT -i tegata0 -d 172.30.0.1 -p tcp --dport 21575 -j ACCEPT
 
 Do not open port `21575` on other interfaces.
 
-## Issue a named token
+The gateway address exists only after Docker has restored the `tegata` network,
+so the daemon must start after Docker. On NixOS:
 
-Issue the token on the host through the daemon's UNIX socket:
-
-```sh
-sudo tegatad peer issue --label agent --socket /run/tegata/tegatad.sock
+```nix
+systemd.services.tegata.after = [ "docker.service" ];
 ```
 
-The plaintext token is displayed once. Store it in a host file readable only by
-the operator, for example:
+Elsewhere, add `After=docker.service` to the daemon's unit.
+
+## Issue a named token
+
+Issue the token on the host through the daemon's UNIX socket. `peer issue`
+prints the token on stdout and the peer id on stderr, so redirecting stdout into
+a file readable only by the operator stores exactly the token:
 
 ```sh
 sudo install -d -m 0700 /etc/tegata
-sudo install -m 0600 /dev/null /etc/tegata/agent-token
-sudo sh -c 'umask 077; printf "%s\n" "TOKEN_FROM_peer_issue" > /etc/tegata/agent-token'
+sudo sh -c 'umask 077; tegatad peer issue --label agent --socket /run/tegata/tegatad.sock > /etc/tegata/agent-token'
 ```
 
-Replace the placeholder with the token from `peer issue`. Do not put the token in
-an environment variable. To manage the named token, use the daemon's peer
-administration commands:
+The token is shown only this once; the peer id printed beside it is what
+`peer revoke` takes. Do not put the token in an environment variable. To manage
+the named token, use the daemon's peer administration commands:
 
 ```sh
 sudo tegatad peer revoke <peer_id> --socket /run/tegata/tegatad.sock

@@ -1,13 +1,15 @@
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 
 use uuid::Uuid;
+
+mod common;
+use common::create_private_dir;
 
 fn test_directory() -> PathBuf {
     let directory =
@@ -19,9 +21,7 @@ fn test_directory() -> PathBuf {
 fn write_config(directory: &Path, executor_socket: &Path) -> PathBuf {
     let config_path = directory.join("config.toml");
     let state_dir = directory.join("state");
-    std::fs::create_dir(&state_dir).expect("create state directory");
-    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))
-        .expect("set state directory permissions");
+    create_private_dir(&state_dir);
     let daemon_socket = directory.join("tegatad.sock");
     let uid = unsafe { libc::geteuid() };
     let config = format!(

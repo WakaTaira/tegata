@@ -2,7 +2,6 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpStream};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -12,6 +11,9 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+mod common;
+use common::create_private_dir;
 
 struct Daemon {
     child: Child,
@@ -33,9 +35,7 @@ fn start_daemon(max_pending_connections: Option<usize>) -> Daemon {
     let directory = std::env::temp_dir().join(format!("tegatad-listen-{}", Uuid::new_v4()));
     std::fs::create_dir(&directory).expect("create test directory");
     let state_dir = directory.join("state");
-    std::fs::create_dir(&state_dir).expect("create state directory");
-    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))
-        .expect("set state directory permissions");
+    create_private_dir(&state_dir);
     let socket_path = directory.join("tegatad.sock");
     let token = "listen-test-token";
     let token_hash = Sha256::digest(token.as_bytes())

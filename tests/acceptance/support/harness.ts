@@ -57,6 +57,10 @@ export function bins() {
     fixtureEntry:
       process.env.TARGET_FIXTURE_ENTRY ??
       path.join(REPO_ROOT, "packages/target-fixture/dist/index.js"),
+    /** Phase 4b: the Linux `tegata-bridge` binary run inside agent containers. */
+    bridge:
+      process.env.TEGATA_BRIDGE_BIN ??
+      path.join(REPO_ROOT, "target/debug/tegata-bridge"),
   };
 }
 
@@ -256,7 +260,7 @@ export async function startDaemon(entries: MockEntry[]): Promise<Daemon> {
   const daemonDir = fs.mkdtempSync(path.join(os.tmpdir(), "tegatad-"));
   const socketPath = path.join(daemonDir, "tegatad.sock");
   const stateDir = path.join(daemonDir, "state");
-  fs.mkdirSync(stateDir);
+  fs.mkdirSync(stateDir, { mode: 0o700 });
   const configPath = path.join(daemonDir, "config.toml");
   fs.writeFileSync(
     configPath,
@@ -319,15 +323,20 @@ export interface McpSession {
  * Connect an MCP client to the tegata-mcp server (stdio transport). The
  * server finds the daemon through env TEGATA_SOCKET. Every result is passed
  * to `observe` so the guard scans the complete agent-visible surface.
+ *
+ * `spawnAs` (Phase 4b) replaces the `node <entry>` command line, e.g. with a
+ * `docker exec -i ...` that runs the same server inside an agent container;
+ * the environment of that process is then whatever the wrapper passes on.
  */
 export async function connectMcp(
   socketPath: string,
   observe?: (label: string, value: unknown) => void,
   extraEnv?: Record<string, string>,
+  spawnAs?: { command: string; args: string[] },
 ): Promise<McpSession> {
   const transport = new StdioClientTransport({
-    command: "node",
-    args: [bins().mcpEntry],
+    command: spawnAs?.command ?? "node",
+    args: spawnAs?.args ?? [bins().mcpEntry],
     env: { ...process.env, TEGATA_SOCKET: socketPath, ...extraEnv } as Record<
       string,
       string

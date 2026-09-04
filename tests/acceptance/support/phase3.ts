@@ -159,7 +159,7 @@ export async function startPhase3Daemon(
   const daemonDir = fs.mkdtempSync(path.join(os.tmpdir(), "tegatad-p3-"));
   const socketPath = path.join(daemonDir, "tegatad.sock");
   const stateDir = path.join(daemonDir, "state");
-  fs.mkdirSync(stateDir);
+  fs.mkdirSync(stateDir, { mode: 0o700 });
   const auditLogPath = path.join(stateDir, "audit.log");
   const configPath = path.join(daemonDir, "config.toml");
   fs.writeFileSync(

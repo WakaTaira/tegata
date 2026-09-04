@@ -56,8 +56,13 @@ export interface Phase4ConfigOptions {
   auditLogPath: string;
   allowedUids: number[];
   operatorUids?: number[];
-  /** When set, a `kind = "tcp"` listener bound to 127.0.0.1 is rendered. */
+  /** When set, a `kind = "tcp"` listener bound to `tcpBind` is rendered. */
   tcpPort?: number;
+  /**
+   * Address of the TCP listener (default 127.0.0.1). Phase 4b binds the
+   * gateway address of a docker bridge; unspecified addresses are refused.
+   */
+  tcpBind?: string;
   sessionTtlSecs?: number;
   maxPendingConnections?: number;
   entries: MockEntry[];
@@ -87,7 +92,7 @@ export function renderPhase4Config(opts: Phase4ConfigOptions): string {
       "",
       "[[listen]]",
       `kind = "tcp"`,
-      `bind = "127.0.0.1"`,
+      `bind = ${tomlString(opts.tcpBind ?? "127.0.0.1")}`,
       `port = ${opts.tcpPort}`,
     );
   }
@@ -111,12 +116,12 @@ export function renderPhase4Config(opts: Phase4ConfigOptions): string {
   return `${lines.join("\n")}\n`;
 }
 
-/** Reserve a free loopback TCP port (listen on 0, read it back, close). */
-export async function freeTcpPort(): Promise<number> {
+/** Reserve a free TCP port on `host` (listen on 0, read it back, close). */
+export async function freeTcpPort(host = "127.0.0.1"): Promise<number> {
   const server = net.createServer();
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => resolve());
+    server.listen(0, host, () => resolve());
   });
   const address = server.address();
   if (address === null || typeof address === "string")
@@ -133,6 +138,8 @@ export interface Phase4Daemon {
   auditLogPath: string;
   /** Present when the daemon was started with a TCP listener. */
   tcpPort?: number;
+  /** Address the TCP listener is bound to (present with `tcpPort`). */
+  tcpBind?: string;
   pid: number;
   stop(): Promise<void>;
 }
@@ -141,6 +148,8 @@ export interface Phase4DaemonOptions {
   entries: MockEntry[];
   operatorUids?: number[];
   tcp?: boolean;
+  /** Address for the TCP listener (default 127.0.0.1); needs `tcp: true`. */
+  tcpBind?: string;
   sessionTtlSecs?: number;
   maxPendingConnections?: number;
 }
@@ -154,7 +163,8 @@ export async function startPhase4Daemon(
   const stateDir = path.join(daemonDir, "state");
   fs.mkdirSync(stateDir, { mode: 0o700 });
   const auditLogPath = path.join(stateDir, "audit.log");
-  const tcpPort = opts.tcp ? await freeTcpPort() : undefined;
+  const tcpBind = opts.tcpBind ?? "127.0.0.1";
+  const tcpPort = opts.tcp ? await freeTcpPort(tcpBind) : undefined;
   const configPath = path.join(daemonDir, "config.toml");
   fs.writeFileSync(
     configPath,
@@ -165,6 +175,7 @@ export async function startPhase4Daemon(
       allowedUids: [os.userInfo().uid],
       operatorUids: opts.operatorUids,
       tcpPort,
+      tcpBind,
       sessionTtlSecs: opts.sessionTtlSecs,
       maxPendingConnections: opts.maxPendingConnections,
       entries: opts.entries,
@@ -207,6 +218,7 @@ export async function startPhase4Daemon(
     daemonDir,
     auditLogPath,
     tcpPort,
+    tcpBind: opts.tcp ? tcpBind : undefined,
     pid: child.pid,
     stop: async () => {
       if (child.exitCode === null && child.signalCode === null) {
@@ -247,12 +259,18 @@ export interface CountingFixture {
   stop(): Promise<void>;
 }
 
+/** `<title>` of the counting fixture's login form. */
+export const LOGIN_PAGE_TITLE = "tegata fixture: login";
+/** `<title>` of the counting fixture's page after a successful login. */
+export const LOGGED_IN_PAGE_TITLE = "tegata fixture: logged in";
+
 function loginForm(error: boolean): string {
   const errorMessage = error
     ? '<div id="login-error">invalid credentials</div>'
     : "";
   return `<!doctype html>
 <html lang="en">
+<head><title>${LOGIN_PAGE_TITLE}</title></head>
 <body>
 ${errorMessage}
 <form method="POST" action="/login">
@@ -264,8 +282,7 @@ ${errorMessage}
 </html>`;
 }
 
-const LOGGED_IN_PAGE =
-  '<!doctype html><html lang="en"><body><div id="welcome">login-ok</div></body></html>';
+const LOGGED_IN_PAGE = `<!doctype html><html lang="en"><head><title>${LOGGED_IN_PAGE_TITLE}</title></head><body><div id="welcome">login-ok</div></body></html>`;
 
 /**
  * In-process replica of the target fixture's login site that counts
@@ -695,4 +712,50 @@ export async function peerLogin(
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+export interface DaemonExit {
+  /** Exit code; null when the daemon was still running at the deadline. */
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stderr: string;
+}
+
+/**
+ * Start tegatad with `configPath` and wait for it to exit on its own (Phase
+ * 4b startup guards). A daemon that is still running after `timeoutMs` is
+ * killed and reported with `code: null`; refusal tests read that as "the
+ * daemon started although it must not have".
+ */
+export async function runDaemonUntilExit(
+  configPath: string,
+  cwd: string,
+  timeoutMs = 10_000,
+): Promise<DaemonExit> {
+  const child = spawn(bins().tegatad, ["--config", configPath], {
+    stdio: ["ignore", "ignore", "pipe"],
+    cwd,
+  });
+  let stderr = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+  const exited = once(child, "exit").then(
+    ([code, signal]) =>
+      ({ code, signal }) as {
+        code: number | null;
+        signal: NodeJS.Signals | null;
+      },
+  );
+  const outcome = await Promise.race([
+    exited,
+    sleep(timeoutMs).then(() => undefined),
+  ]);
+  if (outcome === undefined) {
+    child.kill("SIGKILL");
+    await exited.catch(() => {});
+    return { code: null, signal: null, stderr };
+  }
+  return { ...outcome, stderr };
 }

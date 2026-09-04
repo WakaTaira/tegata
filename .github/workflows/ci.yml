@@ -46,3 +46,24 @@ jobs:
 
       - name: Run unit tests
         run: cargo test --workspace --features tegatad/mock-provider --locked
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v14
+
+      - name: Enable Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@v13
+
+      - name: Build the daemon and the bridge
+        run: nix build .#tegatad .#tegata-bridge
+
+      - name: Install npm dependencies
+        run: nix develop -c npm ci
+
+      - name: Run container acceptance tests
+        run: nix develop -c npm run test:container

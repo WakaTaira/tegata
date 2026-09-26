@@ -392,10 +392,15 @@ fn configure_firewall(name: &str, tcp_port: u16) -> Result<(), Box<dyn std::erro
         return Ok(());
     }
     let rule_name = firewall_rule_name(name);
-    run_powershell(&format!(
-        "New-NetFirewallRule -DisplayName '{}' -Direction Inbound -Action Allow -Protocol TCP -LocalPort {} -InterfaceAlias 'vEthernet (WSL*' -Profile Any",
+    remove_firewall_rule(name)?;
+    run_powershell(&firewall_rule_command(&rule_name, tcp_port))
+}
+
+fn firewall_rule_command(rule_name: &str, tcp_port: u16) -> String {
+    format!(
+        "New-NetFirewallRule -DisplayName '{}' -Direction Inbound -Action Allow -Protocol TCP -LocalPort {} -RemoteAddress LocalSubnet -Profile Any",
         rule_name, tcp_port
-    ))
+    )
 }
 
 fn remove_firewall_rule(name: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -483,7 +488,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        DISPATCHER_SERVICE_NAME, ServiceCommand, ServiceCommand::Uninstall, strip_verbatim_prefix,
+        DISPATCHER_SERVICE_NAME, ServiceCommand, ServiceCommand::Uninstall, firewall_rule_command,
+        strip_verbatim_prefix,
     };
 
     #[derive(clap::Parser)]
@@ -531,5 +537,15 @@ mod tests {
             strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\x")),
             PathBuf::from(r"\\server\share\x")
         );
+    }
+
+    #[test]
+    fn firewall_rule_command_uses_local_subnet_without_interface_alias() {
+        let command = firewall_rule_command("example WSL TCP", 3456);
+
+        assert!(command.contains("-RemoteAddress LocalSubnet"));
+        assert!(!command.contains("InterfaceAlias"));
+        assert!(command.contains("-LocalPort 3456"));
+        assert!(command.contains("-DisplayName 'example WSL TCP'"));
     }
 }

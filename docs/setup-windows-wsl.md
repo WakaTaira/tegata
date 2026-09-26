@@ -455,8 +455,9 @@ access to `browsers_path`. A revision mismatch fails immediately at launch.
 **The bridge cannot connect.** Confirm the firewall rule exists and the distro's
 gateway address is what the bridge resolved; a mirrored-networking distro needs
 `--daemon-addr 127.0.0.1`. Confirm `tcp_port` is not `0`. The rule uses
-`RemoteAddress LocalSubnet`, while the listener binds only the WSL gateway
-address (or `127.0.0.1` for mirrored networking).
+`RemoteAddress LocalSubnet`, while the listener binds only the address in
+`tcp_bind` (with `auto`, the WSL gateway address; `127.0.0.1` for mirrored
+networking).
 
 If a rule created by an older version stops matching after WSL restarts, a TCP
 connect attempt times out even though the rule is enabled. In an elevated

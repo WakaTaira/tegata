@@ -106,8 +106,7 @@ struct Config {
     audit_log_max_bytes: Option<u64>,
     approve_cmd: Option<String>,
     approve_timeout_secs: Option<u64>,
-    #[serde(default)]
-    approve_operator: bool,
+    approve_operator: Option<bool>,
     executor_entry: Option<String>,
     #[cfg(unix)]
     executor_socket: Option<String>,
@@ -387,28 +386,23 @@ struct AuditRecord<'a> {
     #[serde(flatten)]
     peer: AuditPeer<'a>,
     method: String,
-    cred_id: Option<String>,
-    target_url: Option<String>,
-    session_id: Option<String>,
-    namespace: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    shared: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    approval_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    allow: Option<bool>,
+    #[serde(flatten)]
+    fields: AuditFields,
     outcome: String,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default, Serialize)]
 struct AuditFields {
     cred_id: Option<String>,
     target_url: Option<String>,
     session_id: Option<String>,
     namespace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     shared: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     approval_id: Option<String>,
-    allow: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_allow: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -427,11 +421,18 @@ struct HandledRequest {
     response: RpcResponse,
     outcome: String,
     audit_shared: Option<bool>,
+    audit_approval: Option<(String, bool)>,
 }
 
 impl HandledRequest {
     fn with_audit_shared(mut self, shared: bool) -> Self {
         self.audit_shared = Some(shared);
+        self
+    }
+
+    #[cfg(windows)]
+    fn with_audit_approval(mut self, approval_id: String, allow: bool) -> Self {
+        self.audit_approval = Some((approval_id, allow));
         self
     }
 }
@@ -545,25 +546,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     password.zeroize();
                     result
                 }
-                windows_cli::WindowsCommand::Approval { command } => match command {
-                    windows_cli::ApprovalCommand::List { pipe } => {
-                        windows_cli::run_windows_cli(&pipe, "admin_approval_list", json!({}))
-                    }
-                    windows_cli::ApprovalCommand::Allow { id, pipe } => {
-                        windows_cli::run_windows_cli(
-                            &pipe,
-                            "admin_approval_decide",
-                            json!({ "id": id, "allow": true }),
-                        )
-                    }
-                    windows_cli::ApprovalCommand::Deny { id, pipe } => {
-                        windows_cli::run_windows_cli(
-                            &pipe,
-                            "admin_approval_decide",
-                            json!({ "id": id, "allow": false }),
-                        )
-                    }
-                },
+                windows_cli::WindowsCommand::Approval { command } => {
+                    let (pipe, id, allow) = match command {
+                        windows_cli::ApprovalCommand::List { pipe } => {
+                            return windows_cli::run_windows_cli(
+                                &pipe,
+                                "admin_approval_list",
+                                json!({}),
+                            );
+                        }
+                        windows_cli::ApprovalCommand::Allow { id, pipe } => (pipe, id, true),
+                        windows_cli::ApprovalCommand::Deny { id, pipe } => (pipe, id, false),
+                    };
+                    windows_cli::run_windows_cli(
+                        &pipe,
+                        "admin_approval_decide",
+                        json!({ "id": id, "allow": allow }),
+                    )
+                }
                 windows_cli::WindowsCommand::Service { command } => match command {
                     windows_service::ServiceCommand::Install { config } => {
                         windows_service::install_service(&config)
@@ -701,8 +701,8 @@ async fn run_daemon(
         return Err("approve_cmd is only supported on Unix".into());
     }
     #[cfg(unix)]
-    if config.approve_operator {
-        return Err("approve_operator is only supported on Windows, where the operator answers through the elevated administrative pipe RPC; on Unix, use approve_cmd".into());
+    if config.approve_operator.is_some() {
+        return Err("approve_operator is only supported on Windows".into());
     }
     #[cfg(windows)]
     if let Some(message) = config.providers.iter().find_map(|provider| {
@@ -954,7 +954,7 @@ async fn build_state(
     let approve_cmd = config.approve_cmd.clone();
     let approve_timeout = Duration::from_secs(config.approve_timeout_secs.unwrap_or(60));
     #[cfg(windows)]
-    let approve_operator = config.approve_operator;
+    let approve_operator = config.approve_operator.unwrap_or(false);
     let executor_entry = resolve_executor_entry(&config);
     #[cfg(unix)]
     let executor_socket = config.executor_socket.as_deref().map(PathBuf::from);
@@ -1220,13 +1220,9 @@ fn spawn_session_reaper(state: SharedState) {
                     AuditPeer::System,
                     "session_expired".to_owned(),
                     AuditFields {
-                        cred_id: None,
-                        target_url: None,
                         session_id: Some(session_id),
                         namespace: Some(namespace),
-                        shared: None,
-                        approval_id: None,
-                        allow: None,
+                        ..AuditFields::default()
                     },
                     "ok".to_owned(),
                 )
@@ -1272,13 +1268,8 @@ async fn audit_provider_autolock(state: &SharedState, namespace: String) {
         AuditPeer::System,
         "vault_autolocked".to_owned(),
         AuditFields {
-            cred_id: None,
-            target_url: None,
-            session_id: None,
             namespace: Some(namespace),
-            shared: None,
-            approval_id: None,
-            allow: None,
+            ..AuditFields::default()
         },
         "ok".to_owned(),
     )
@@ -1314,7 +1305,7 @@ async fn serve_connection<S>(
         let rpc_id = NEXT_RPC_ID.fetch_add(1, Ordering::Relaxed);
         let (request, response, outcome, fields) = match parsed {
             Ok(request) => {
-                let fields = request_audit_fields(&request);
+                let fields = audit_fields(&request.method, &request.params);
                 let handled = RPC_CONTEXT
                     .scope(
                         RpcContext {
@@ -1341,21 +1332,17 @@ async fn serve_connection<S>(
                         .map(ToOwned::to_owned);
                     fields.shared = handled.audit_shared;
                 }
+                if let Some((approval_id, allow)) = handled.audit_approval {
+                    fields.approval_id = Some(approval_id);
+                    fields.approval_allow = Some(allow);
+                }
                 (Some(request), handled.response, handled.outcome, fields)
             }
             Err(_) => (
                 None,
                 error_response(Value::Null, ErrorCode::Internal),
                 ErrorCode::Internal.as_str().to_owned(),
-                AuditFields {
-                    cred_id: None,
-                    target_url: None,
-                    session_id: None,
-                    namespace: None,
-                    shared: None,
-                    approval_id: None,
-                    allow: None,
-                },
+                AuditFields::default(),
             ),
         };
         let method = request
@@ -1466,13 +1453,7 @@ async fn append_audit(
             .unwrap_or_else(|_| "unix:0".to_owned()),
         peer,
         method,
-        cred_id: fields.cred_id,
-        target_url: fields.target_url,
-        session_id: fields.session_id,
-        namespace: fields.namespace,
-        shared: fields.shared,
-        approval_id: fields.approval_id,
-        allow: fields.allow,
+        fields,
         outcome,
     };
     let mut bytes = serde_json::to_vec(&record).map_err(AppendAuditError::Serialize)?;
@@ -1583,6 +1564,7 @@ async fn handle_request(
             },
             outcome: "method_not_found".to_owned(),
             audit_shared: None,
+            audit_approval: None,
         },
     }
 }
@@ -1720,10 +1702,12 @@ async fn admin_approval_decide(request: &RpcRequest, state: SharedState) -> Hand
         Err(error) => return classified(request.id.clone(), error),
     };
     let queue = state.lock().await.approvals.clone();
-    match queue.decide(&params.id, params.allow) {
+    let handled = match queue.decide(&params.id, params.allow) {
         Ok(()) => success(request.id.clone(), json!({ "ok": true })),
         Err(approvals::NotFound) => classified(request.id.clone(), ErrorCode::NotFound),
-    }
+    };
+    // どの保留にどう答えたかを監査で追えるよう、決定の内容を監査項目に載せる。
+    handled.with_audit_approval(params.id, params.allow)
 }
 
 #[cfg(windows)]
@@ -2559,13 +2543,9 @@ async fn terminate_peer_leases(state: SharedState, peer_id: &str) {
             AuditPeer::System,
             "session_terminated".to_owned(),
             AuditFields {
-                cred_id: None,
-                target_url: None,
                 session_id: Some(session_id),
                 namespace: Some(namespace),
-                shared: None,
-                approval_id: None,
-                allow: None,
+                ..AuditFields::default()
             },
             "ok".to_owned(),
         )
@@ -2588,13 +2568,9 @@ async fn audit_system_session(
         AuditPeer::System,
         method.to_owned(),
         AuditFields {
-            cred_id: None,
-            target_url: None,
             session_id: Some(session_id),
             namespace: Some(namespace),
-            shared: None,
-            approval_id: None,
-            allow: None,
+            ..AuditFields::default()
         },
         "ok".to_owned(),
     )
@@ -3221,21 +3197,6 @@ fn optional_namespace(params: &Value) -> Result<Option<String>, ErrorCode> {
     }
 }
 
-/// 要求の監査項目を組み立てる。承認の決定は、どの保留にどう答えたかを
-/// 監査で追えるように `approval_id` と `allow` を加える。
-fn request_audit_fields(request: &RpcRequest) -> AuditFields {
-    let mut fields = audit_fields(&request.method, &request.params);
-    if request.method == "admin_approval_decide" {
-        fields.approval_id = request
-            .params
-            .get("id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        fields.allow = request.params.get("allow").and_then(Value::as_bool);
-    }
-    fields
-}
-
 /// 監査へ転記してよい params のキーを method ごとに限定する。
 /// method が解釈しないキーまで転記すると、呼び出し側が監査記録を偽装できるためである。
 fn audit_param_keys(method: &str) -> &'static [&'static str] {
@@ -3279,9 +3240,7 @@ fn audit_fields(method: &str, params: &Value) -> AuditFields {
         target_url,
         session_id: field("session_id"),
         namespace,
-        shared: None,
-        approval_id: None,
-        allow: None,
+        ..AuditFields::default()
     }
 }
 
@@ -3295,6 +3254,7 @@ fn success(id: Value, result: Value) -> HandledRequest {
         },
         outcome: "ok".to_owned(),
         audit_shared: None,
+        audit_approval: None,
     }
 }
 
@@ -3303,6 +3263,7 @@ fn classified(id: Value, error: ErrorCode) -> HandledRequest {
         response: error_response(id, error),
         outcome: error.as_str().to_owned(),
         audit_shared: None,
+        audit_approval: None,
     }
 }
 
@@ -3320,7 +3281,7 @@ fn error_response(id: Value, error: ErrorCode) -> RpcResponse {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{AuditPeer, AuditRecord, PeerIdentity};
+    use super::{AuditFields, AuditPeer, AuditRecord, PeerIdentity};
 
     #[test]
     fn audit_record_names_the_peer_by_its_transport_identity() {
@@ -3329,13 +3290,7 @@ mod tests {
             ts: "unix:1".to_owned(),
             peer: AuditPeer::Peer(&peer),
             method: "status".to_owned(),
-            cred_id: None,
-            target_url: None,
-            session_id: None,
-            namespace: None,
-            shared: None,
-            approval_id: None,
-            allow: None,
+            fields: AuditFields::default(),
             outcome: "ok".to_owned(),
         };
         assert_eq!(

@@ -4,6 +4,7 @@
 //! タイムアウトまで待機する。キュー自体はプラットフォームに依存しない。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,10 @@ use tokio::sync::oneshot;
 
 /// 操作者が読み上げて入力できる長さに収めるため、保留 id は 6 桁の 10 進数とする。
 const ID_SPACE: u128 = 1_000_000;
+
+/// 保留ごとに一意な識別子の発番元である。id は決定後に再利用されうるため、
+/// 取り除く対象が自分の登録したエントリであることをこの値で確かめる。
+static NEXT_TOKEN: AtomicU64 = AtomicU64::new(0);
 
 /// 承認を求める要求の内容である。
 pub(crate) struct ApprovalRequest {
@@ -43,6 +48,7 @@ pub(crate) enum ApprovalError {
 pub(crate) struct NotFound;
 
 struct Entry {
+    token: u64,
     request: ApprovalRequest,
     created_at: Instant,
     decision: oneshot::Sender<bool>,
@@ -59,6 +65,7 @@ pub(crate) struct ApprovalQueue {
 /// 途中で打ち切られても保留が残らない。
 pub(crate) struct Pending {
     id: String,
+    token: u64,
     entries: Entries,
     decision: Option<oneshot::Receiver<bool>>,
 }
@@ -79,6 +86,7 @@ impl ApprovalQueue {
         mut next_id: impl FnMut() -> u128,
     ) -> Pending {
         let (sender, receiver) = oneshot::channel();
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
         let mut entries = lock(&self.entries);
         let id = loop {
             let candidate = format!("{:06}", next_id() % ID_SPACE);
@@ -89,6 +97,7 @@ impl ApprovalQueue {
         entries.insert(
             id.clone(),
             Entry {
+                token,
                 request,
                 created_at: Instant::now(),
                 decision: sender,
@@ -96,6 +105,7 @@ impl ApprovalQueue {
         );
         Pending {
             id,
+            token,
             entries: self.entries.clone(),
             decision: Some(receiver),
         }
@@ -139,8 +149,7 @@ impl Pending {
             // 送信側が決定なしに失われた場合は承認されていないものとして扱う。
             Ok(Err(_)) => Err(ApprovalError::Denied),
             Err(_) => {
-                let removed = lock(&self.entries).remove(&self.id).is_some();
-                if removed {
+                if self.remove_own() {
                     return Err(ApprovalError::Timeout);
                 }
                 // 取り除く前に決定が確定していた場合は、その決定に従う。
@@ -152,11 +161,24 @@ impl Pending {
             }
         }
     }
+
+    /// 自分が登録したエントリがまだ残っていれば取り除き、取り除いたかを返す。
+    /// 決定済みの id に後から登録された別の保留は取り除かない。
+    fn remove_own(&self) -> bool {
+        let mut entries = lock(&self.entries);
+        let own = entries
+            .get(&self.id)
+            .is_some_and(|entry| entry.token == self.token);
+        if own {
+            entries.remove(&self.id);
+        }
+        own
+    }
 }
 
 impl Drop for Pending {
     fn drop(&mut self) {
-        lock(&self.entries).remove(&self.id);
+        self.remove_own();
     }
 }
 
@@ -176,6 +198,8 @@ fn random_id() -> u128 {
 }
 
 fn lock(entries: &Entries) -> std::sync::MutexGuard<'_, HashMap<String, Entry>> {
+    // 表の更新は挿入・削除の単一操作のみで途中状態を残さないため、
+    // 他のスレッドのパニックで汚染されても中身をそのまま使う。
     entries
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -276,6 +300,36 @@ mod tests {
 
         assert!(queue.list().is_empty());
         assert_eq!(queue.decide(&id, true), Err(NotFound));
+    }
+
+    #[test]
+    fn dropping_a_decided_pending_keeps_a_new_entry_with_the_same_id() {
+        let queue = ApprovalQueue::new();
+        let first = queue.register_with(request("mock:a"), || 42);
+        queue.decide("000042", true).expect("decide first approval");
+        let second = queue.register_with(request("mock:b"), || 42);
+        assert_eq!(second.id(), "000042");
+
+        drop(first);
+
+        let listed = queue.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].cred_id, "mock:b");
+        assert_eq!(queue.decide("000042", false), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn waiting_on_a_decided_pending_keeps_a_new_entry_with_the_same_id() {
+        let queue = ApprovalQueue::new();
+        let first = queue.register_with(request("mock:a"), || 42);
+        queue.decide("000042", true).expect("decide first approval");
+        let _second = queue.register_with(request("mock:b"), || 42);
+
+        assert_eq!(first.wait(Duration::ZERO).await, Ok(()));
+
+        let listed = queue.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].cred_id, "mock:b");
     }
 
     #[test]

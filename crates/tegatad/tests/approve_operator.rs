@@ -1,10 +1,13 @@
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt;
+mod common;
+
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use uuid::Uuid;
+
+use common::create_private_dir;
 
 fn test_directory() -> PathBuf {
     let directory =
@@ -13,26 +16,21 @@ fn test_directory() -> PathBuf {
     directory
 }
 
-/// Given: a Unix configuration that sets `approve_operator = true`
-/// When: the daemon starts
-/// Then: it exits unsuccessfully and explains that the option is Windows-only
-#[test]
-fn refuses_approve_operator_on_unix() {
+fn assert_refused_on_unix(approve_operator: bool) {
     let directory = test_directory();
     let state_dir = directory.join("state");
-    std::fs::create_dir(&state_dir).expect("create state directory");
-    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))
-        .expect("set state directory permissions");
+    create_private_dir(&state_dir);
     let config_path = directory.join("config.toml");
     let uid = unsafe { libc::geteuid() };
     std::fs::write(
         &config_path,
         format!(
-            "state_dir = {:?}\naudit_log_path = {:?}\nsocket_path = {:?}\nallowed_uids = [{}]\napprove_operator = true\n",
+            "state_dir = {:?}\naudit_log_path = {:?}\nsocket_path = {:?}\nallowed_uids = [{}]\napprove_operator = {}\n",
             state_dir,
             state_dir.join("audit.log"),
             directory.join("tegatad.sock"),
             uid,
+            approve_operator,
         ),
     )
     .expect("write test config");
@@ -59,4 +57,20 @@ fn refuses_approve_operator_on_unix() {
         "stderr: {stderr}"
     );
     assert!(!socket_exists, "no socket is bound");
+}
+
+/// Given: a Unix configuration that sets `approve_operator = true`
+/// When: the daemon starts
+/// Then: it exits unsuccessfully and explains that the option is Windows-only
+#[test]
+fn refuses_approve_operator_on_unix() {
+    assert_refused_on_unix(true);
+}
+
+/// Given: a Unix configuration that sets `approve_operator = false` explicitly
+/// When: the daemon starts
+/// Then: it is refused the same way, because the key itself is Windows-only
+#[test]
+fn refuses_explicitly_disabled_approve_operator_on_unix() {
+    assert_refused_on_unix(false);
 }

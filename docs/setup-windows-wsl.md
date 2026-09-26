@@ -167,11 +167,15 @@ an opt-in for a deployment that provides its own helper.
 | `tegatad.exe peer list` | yes | List named client tokens |
 | `tegatad.exe token issue` | yes | Deprecated alias for `peer issue --label default`; removed in the next release |
 | `tegatad.exe seal` | yes | Seal the master password |
+| `tegatad.exe approval list` | yes | List pending login approvals |
+| `tegatad.exe approval allow <id>` | yes | Let a pending login proceed |
+| `tegatad.exe approval deny <id>` | yes | Refuse a pending login |
 | `tegatad.exe service install --config <path>` | yes | Register and provision |
 | `tegatad.exe service uninstall [--name <name>]` | yes | Remove the service and its firewall rule |
 | `tegatad.exe --config <path> --foreground` | — | Run in the foreground for debugging |
 
-Each of the first three takes `--pipe <name>` if the pipe was renamed.
+Every command above except `service install`, `service uninstall`, and the
+foreground run takes `--pipe <name>` if the pipe was renamed.
 
 Elevation is not a convention here — the administrative RPCs are refused unless
 the calling pipe peer is both elevated, a member of the local administrators
@@ -214,6 +218,8 @@ browsers_path   = "C:\\ProgramData\\tegata-rig\\browsers"
 | `unlock_mode` | string | no | `sealed` (default) or `askpass` |
 | `session_ttl_secs` | integer | no | Browser session lifetime; default `300` |
 | `executor_entry` | string | no | Path to the executor's `index.js` |
+| `approve_operator` | boolean | no | Hold every `login` for an operator decision; default `false` — see [The approval hook](#the-approval-hook) |
+| `approve_timeout_secs` | integer | no | How long a pending approval waits for a decision; default `60` |
 
 `approve_cmd` remains UNIX-only. A Windows configuration containing it is refused
 at startup with an explicit error rather than silently ignored — see

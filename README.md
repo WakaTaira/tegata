@@ -245,7 +245,9 @@ they are meant to be read as the specification of what the boundary guarantees.
 Implemented today: the systemd and Windows service boundaries; three credential
 backends behind the provider trait — Bitwarden CLI, age-encrypted file, and GNU
 pass — usable together; the Playwright form executor; the six MCP tools;
-human-in-the-loop login approval; an audit log covering both agent calls and
+human-in-the-loop login approval — an external command on Linux, and on Windows
+an approval queue the operator answers from an elevated PowerShell with
+`tegatad approval allow/deny`; an audit log covering both agent calls and
 the daemon's own session and vault events; named tokens and shared sessions —
 one browser per credential and caller, leased to several agents on the same
 machine, with an owner on every session; the container boundary — the daemon on
@@ -263,9 +265,6 @@ Planned, tracked in the
   through the daemon's authenticated relay
 - **Injection proxy** ([#14](https://github.com/WakaTaira/tegata/issues/14)) —
   API calls with the operator's identity for agents that must not hold a token
-- **Windows approval hook**
-  ([#11](https://github.com/WakaTaira/tegata/issues/11)) — the human-in-the-loop
-  hook for the Windows service, which currently refuses `approve_cmd`
 
 Each feature is designed in a private brief before implementation; what lands
 publicly is the design's contract, as acceptance tests under `tests/acceptance/`.

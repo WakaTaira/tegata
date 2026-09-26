@@ -173,6 +173,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+export function headfulUserAgent(ua: string): string {
+  return ua.replaceAll("HeadlessChrome", "Chrome");
+}
+
 function isNullableString(value: unknown): value is string | null {
   return value === null || typeof value === "string";
 }
@@ -1005,7 +1009,22 @@ async function openBrowserPage() {
   const endpoint = await waitForEndpoint(port);
   const guard = await openGuard(endpoint);
   activeGuard = guard;
-  const page = await withGuard(guard, () => browser.newPage());
+  const browserSession = await withGuard(guard, () =>
+    browser.newBrowserCDPSession(),
+  );
+  let userAgent: string;
+  try {
+    const version = await withGuard(guard, () =>
+      browserSession.send("Browser.getVersion"),
+    );
+    if (typeof version.userAgent !== "string") {
+      throw new Error("browser user agent was not returned");
+    }
+    userAgent = headfulUserAgent(version.userAgent);
+  } finally {
+    await browserSession.detach().catch(() => undefined);
+  }
+  const page = await withGuard(guard, () => browser.newPage({ userAgent }));
   const pageSession = await withGuard(guard, () =>
     page.context().newCDPSession(page),
   );

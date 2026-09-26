@@ -270,8 +270,7 @@ fn authorize_device_audit_uses_verification_url_without_query_or_spoofed_target(
     );
     assert_eq!(response["result"], json!({ "ok": true }));
 
-    let audit =
-        std::fs::read_to_string(daemon.directory.join("state/audit.log")).expect("read audit log");
+    let audit = read_audit_log(&daemon, "authorize_device");
     let record = audit
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("parse audit record"))
@@ -299,8 +298,7 @@ fn authorize_device_audit_ignores_keys_the_method_does_not_accept() {
     );
     assert_eq!(response["result"], json!({ "ok": true }));
 
-    let audit =
-        std::fs::read_to_string(daemon.directory.join("state/audit.log")).expect("read audit log");
+    let audit = read_audit_log(&daemon, "authorize_device");
     let record = audit
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("parse audit record"))
@@ -330,8 +328,7 @@ fn failed_login_audit_ignores_a_caller_supplied_session_id() {
     );
     error_message(&response, "INVALID_CREDENTIAL");
 
-    let audit =
-        std::fs::read_to_string(daemon.directory.join("state/audit.log")).expect("read audit log");
+    let audit = read_audit_log(&daemon, "login");
     let record = audit
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("parse audit record"))
@@ -356,8 +353,7 @@ fn login_audit_derives_namespace_from_cred_id() {
     );
     error_message(&response, "INVALID_CREDENTIAL");
 
-    let audit =
-        std::fs::read_to_string(daemon.directory.join("state/audit.log")).expect("read audit log");
+    let audit = read_audit_log(&daemon, "login");
     let record = audit
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).expect("parse audit record"))
@@ -469,8 +465,7 @@ fn system_session_audits_have_system_principal() {
         json!({ "namespace": "mock" }),
     );
     assert_eq!(locked["result"]["ok"], true);
-    let audit =
-        std::fs::read_to_string(daemon.directory.join("state/audit.log")).expect("read audit log");
+    let audit = read_audit_log(&daemon, "session_terminated");
     assert!(audit.lines().any(|line| {
         let record: Value = serde_json::from_str(line).expect("parse audit record");
         record["method"] == "session_terminated" && record["principal"] == "system"
@@ -660,4 +655,21 @@ fn sigterm_reaps_live_session_executors() {
         wait_for_death(pid, Duration::from_secs(5)),
         "executor survived daemon shutdown"
     );
+}
+
+/// 監査行は RPC 応答の後に追記されるため、指定 method の行が現れるまで短時間待ってから読む。
+fn read_audit_log(daemon: &Daemon, method: &str) -> String {
+    let path = daemon.directory.join("state/audit.log");
+    let needle = format!("\"method\":\"{method}\"");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let audit = std::fs::read_to_string(&path).unwrap_or_default();
+        let complete = audit
+            .lines()
+            .any(|line| line.contains(&needle) && serde_json::from_str::<Value>(line).is_ok());
+        if complete || std::time::Instant::now() >= deadline {
+            return audit;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }

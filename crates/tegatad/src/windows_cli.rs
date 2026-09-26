@@ -23,6 +23,10 @@ pub(crate) enum WindowsCommand {
         #[arg(long, default_value = "tegatad")]
         pipe: String,
     },
+    Approval {
+        #[command(subcommand)]
+        command: ApprovalCommand,
+    },
     Service {
         #[command(subcommand)]
         command: super::windows_service::ServiceCommand,
@@ -51,6 +55,24 @@ pub(crate) enum PeerCommand {
         pipe: String,
     },
     List {
+        #[arg(long, default_value = "tegatad")]
+        pipe: String,
+    },
+}
+
+#[derive(clap::Subcommand)]
+pub(crate) enum ApprovalCommand {
+    List {
+        #[arg(long, default_value = "tegatad")]
+        pipe: String,
+    },
+    Allow {
+        id: String,
+        #[arg(long, default_value = "tegatad")]
+        pipe: String,
+    },
+    Deny {
+        id: String,
         #[arg(long, default_value = "tegatad")]
         pipe: String,
     },
@@ -103,7 +125,14 @@ pub(crate) fn run_windows_cli(
                 .ok_or("admin_peer_list returned no result")?;
             println!("{}", serde_json::to_string(result)?);
         }
+        "admin_approval_list" => {
+            let result = response
+                .get("result")
+                .ok_or("admin_approval_list returned no result")?;
+            println!("{}", serde_json::to_string(result)?);
+        }
         "admin_peer_revoke" => {}
+        "admin_approval_decide" => {}
         "admin_seal" => {}
         _ => {}
     }

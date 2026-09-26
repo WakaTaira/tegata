@@ -305,9 +305,37 @@ for *which* caller — and contains nothing worth stealing. The acceptance suite
 dumps the hook's environment and runs it through the leak guard to keep it that
 way.
 
-Approval is UNIX-only. A Windows configuration containing `approve_cmd` is
-rejected at startup with an explicit error rather than silently ignored, because a
-security control that quietly does nothing is worse than one that is absent.
+`approve_cmd` is UNIX-only. A Windows configuration containing it is rejected at
+startup with an explicit error rather than silently ignored, because a security
+control that quietly does nothing is worse than one that is absent.
+
+**Windows cannot use the same shape, and for a specific reason.** The browser
+worker on Windows shares the daemon's service account (see [Residual
+risks](#residual-risks)), and so would any command the daemon ran as an approval
+hook — an agent that can reach the same account can leave a file, a registry
+value, or a named event in a place `approve_cmd` would trust, because both sides
+run under the same SID. A signal an agent can forge is not a signal at all.
+
+What an agent cannot forge, on this host, is passage through the administrative
+RPC gate: elevated, a member of the local Administrators group, and not a WSL
+interop caller. That gate already exists to protect `peer issue`, `peer revoke`,
+and `seal`. `approve_operator = true` puts the approval decision behind the same
+gate instead of behind a command. Every `login` registers a pending approval —
+at the same point in the call, after the credential is confirmed to exist and
+before any value is resolved — and a human decides it from an elevated
+PowerShell with `tegatad.exe approval list` / `approval allow <id>` / `approval
+deny <id>`, which reach the daemon through `admin_approval_list` and
+`admin_approval_decide`. A WSL interop caller is refused those RPCs outright, so
+an agent running inside the distro cannot allow or deny its own pending request
+even if it discovers the six-digit id. Refusal and timeout carry the same
+`APPROVAL_DENIED` and `APPROVAL_TIMEOUT` outcomes as `approve_cmd`. See
+[setup-windows-wsl.md](setup-windows-wsl.md#the-approval-hook) for the operating
+procedure.
+
+There is no equivalent to `approve_cmd`'s external notification hook here: the
+operator must already be watching a pending list (or `TEGATA_LOG_FILE`) to see a
+request, rather than being paged by it. An out-of-band notification channel is
+future work.
 
 Consider a hook mandatory for any credential whose misuse you could not undo. It
 is the only mechanism in tegata that constrains *which* logins happen, as opposed

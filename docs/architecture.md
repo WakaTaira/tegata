@@ -98,7 +98,7 @@ acceptance suite asserts none appear.
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │ Agent                                                          │
-│   sees: a catalog of names, five tools, a CDP endpoint         │
+│   sees: a catalog of names, six tools, a CDP endpoint          │
 └────────────────────────────┬───────────────────────────────────┘
                              │ MCP over stdio
 ┌────────────────────────────▼───────────────────────────────────┐

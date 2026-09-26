@@ -4,6 +4,7 @@ import {
   classifyError,
   DeviceCodeRejectedError,
   formatResponse,
+  headfulUserAgent,
   InvalidCredentialError,
   MfaRequiredError,
   parseRequest,
@@ -11,6 +12,19 @@ import {
   SelectorNotFoundError,
   substituteSecrets,
 } from "../src/index.js";
+
+describe("headfulUserAgent", () => {
+  test("replaces HeadlessChrome without hardcoding the browser version", () => {
+    expect(headfulUserAgent("HeadlessChrome/150.0.0.0")).toBe(
+      "Chrome/150.0.0.0",
+    );
+  });
+
+  test("keeps a user agent without HeadlessChrome unchanged", () => {
+    const userAgent = "Mozilla/5.0 Chrome/150.0.0.0 Safari/537.36";
+    expect(headfulUserAgent(userAgent)).toBe(userAgent);
+  });
+});
 
 describe("authorize_device protocol", () => {
   test("parses the request and formats the response without a browser channel", () => {

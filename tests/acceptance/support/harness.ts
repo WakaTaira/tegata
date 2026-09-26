@@ -314,6 +314,8 @@ export interface McpResult {
   text: string;
   /** `JSON.parse(text)` when it parses, otherwise undefined. */
   json: unknown;
+  /** Structured MCP result, when the tool returns one. */
+  structured?: unknown;
 }
 
 export interface McpSession {
@@ -360,7 +362,14 @@ export async function connectMcp(
       } catch {
         json = undefined;
       }
-      return { isError: res.isError === true, text, json };
+      return {
+        isError: res.isError === true,
+        text,
+        json,
+        ...(res.structuredContent === undefined
+          ? {}
+          : { structured: res.structuredContent }),
+      };
     },
     close: () => client.close(),
   };

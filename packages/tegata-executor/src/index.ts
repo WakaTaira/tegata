@@ -95,7 +95,11 @@ type ErrorCode =
   | "DEVICE_CODE_REJECTED"
   | "INTERNAL";
 
-export class SelectorNotFoundError extends Error {}
+export class SelectorNotFoundError extends Error {
+  constructor(readonly stepIndex?: number) {
+    super();
+  }
+}
 
 export class InvalidCredentialError extends Error {}
 
@@ -121,6 +125,31 @@ export function classifyError(
       : error instanceof MfaRequiredError
         ? "MFA_REQUIRED"
         : "INTERNAL";
+}
+
+type ClassifiedExecutionError = {
+  code: ErrorCode;
+  step?: number;
+};
+
+function classifyExecutionError(
+  error: unknown,
+  stage: ExecutionStage,
+): ClassifiedExecutionError {
+  const code = classifyError(error, stage);
+  return code === "SELECTOR_NOT_FOUND" &&
+    error instanceof SelectorNotFoundError &&
+    error.stepIndex !== undefined
+    ? { code, step: error.stepIndex }
+    : { code };
+}
+
+function formatErrorResponse(error: ClassifiedExecutionError) {
+  return {
+    ok: false as const,
+    error: error.code,
+    ...(error.step === undefined ? {} : { step: error.step }),
+  };
 }
 
 let activeBrowser: Browser | undefined;
@@ -619,20 +648,25 @@ async function fill(
   page: Page,
   selector: string,
   value: string,
+  stepIndex?: number,
 ): Promise<void> {
   try {
     await page.fill(selector, value, { timeout: 10_000 });
   } catch (error) {
-    if (isTimeoutError(error)) throw new SelectorNotFoundError();
+    if (isTimeoutError(error)) throw new SelectorNotFoundError(stepIndex);
     throw error;
   }
 }
 
-async function click(page: Page, selector: string): Promise<void> {
+async function click(
+  page: Page,
+  selector: string,
+  stepIndex?: number,
+): Promise<void> {
   try {
     await page.click(selector, { timeout: 10_000 });
   } catch (error) {
-    if (isTimeoutError(error)) throw new SelectorNotFoundError();
+    if (isTimeoutError(error)) throw new SelectorNotFoundError(stepIndex);
     throw error;
   }
 }
@@ -681,15 +715,16 @@ export async function runSteps(
     ) {
       throw new MfaRequiredError();
     }
-    for (const step of steps) {
+    for (const [stepIndex, step] of steps.entries()) {
       await withRejectionCheck(page, failureSelector, () =>
         step.action === "fill"
           ? fill(
               page,
               step.selector,
               substituteSecrets(step.value, secret, userCode),
+              stepIndex,
             )
-          : click(page, step.selector),
+          : click(page, step.selector, stepIndex),
       );
       await throwIfRejected(page, failureSelector);
     }
@@ -1055,7 +1090,7 @@ async function executeLogin(
 
 async function executeAuthorizeDevice(
   request: AuthorizeDeviceRequest,
-): Promise<ErrorCode | undefined> {
+): Promise<ClassifiedExecutionError | undefined> {
   let stage: ExecutionStage = "login";
   try {
     const { page, pageSession } = await openBrowserPage();
@@ -1075,7 +1110,7 @@ async function executeAuthorizeDevice(
     }
     return undefined;
   } catch (error) {
-    return classifyError(error, stage);
+    return classifyExecutionError(error, stage);
   }
 }
 
@@ -1242,9 +1277,9 @@ async function handleLogin(request: LoginRequest): Promise<void> {
     const { endpoint, targetId } = await executeLogin(request);
     writeResponse({ ok: true, endpoint, target_id: targetId }, request.id);
   } catch (error) {
-    const errorCode = classifyError(error, "login");
+    const classified = classifyExecutionError(error, "login");
     await cleanupResources();
-    writeResponse({ ok: false, error: errorCode }, request.id);
+    writeResponse(formatErrorResponse(classified), request.id);
   }
 }
 
@@ -1259,10 +1294,10 @@ async function handleAuthorizeDevice(
     return;
   }
 
-  const errorCode = await executeAuthorizeDevice(request);
+  const classified = await executeAuthorizeDevice(request);
   await cleanupResources();
   writeResponse(
-    errorCode === undefined ? { ok: true } : { ok: false, error: errorCode },
+    classified === undefined ? { ok: true } : formatErrorResponse(classified),
     request.id,
   );
 }

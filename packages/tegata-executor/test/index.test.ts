@@ -145,6 +145,29 @@ describe("authorize_device protocol", () => {
     expect(actions).toEqual(["click:#submit", "click:#approve"]);
   });
 
+  test("keeps the zero-based index of a timed-out explicit step", async () => {
+    const page = {
+      click: async (selector: string) => {
+        if (selector !== "#missing") return;
+        const timeout = new Error("locator.click: Timeout 10000ms exceeded");
+        timeout.name = "TimeoutError";
+        throw timeout;
+      },
+    } as unknown as Parameters<typeof runSteps>[0];
+
+    const error = await runSteps(
+      page,
+      [
+        { action: "click", selector: "#submit" },
+        { action: "click", selector: "#missing" },
+      ],
+      { username: "alice", password: "secret", totp: null },
+    ).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(SelectorNotFoundError);
+    expect(error).toMatchObject({ stepIndex: 1 });
+  });
+
   test("classifies errors according to the execution stage", () => {
     expect(classifyError(new SelectorNotFoundError(), "login")).toBe(
       "SELECTOR_NOT_FOUND",

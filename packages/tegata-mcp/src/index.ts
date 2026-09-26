@@ -7,7 +7,7 @@ import { z } from "zod";
 
 type RpcResponse = {
   result?: unknown;
-  error?: { message?: unknown };
+  error?: { message?: unknown; data?: unknown };
 };
 
 // Keep in sync with crates/tegatad/src/main.rs and tests/acceptance/support/harness.ts.
@@ -25,8 +25,13 @@ const ERROR_CODES = [
   "APPROVAL_TIMEOUT",
   "PROVIDER_UNAVAILABLE",
   "INTERNAL",
+  "UNAUTHORIZED",
+  "FORBIDDEN",
+  "ADMIN_REQUIRED",
+  "ADMIN_SEAL_UNAVAILABLE",
 ] as const;
 type ErrorCode = (typeof ERROR_CODES)[number];
+const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
 
 const loginStep = z.union([
   z.object({
@@ -67,13 +72,26 @@ function internalError(): {
   };
 }
 
-function errorResult(message: string) {
-  const errorCode: ErrorCode = ERROR_CODES.includes(message as ErrorCode)
-    ? (message as ErrorCode)
-    : "INTERNAL";
+function errorResult(message: string, data?: unknown) {
+  const errorCode =
+    ERROR_CODES.includes(message as ErrorCode) ||
+    ERROR_CODE_PATTERN.test(message)
+      ? message
+      : "INTERNAL";
+  const step =
+    typeof data === "object" &&
+    data !== null &&
+    typeof (data as { step?: unknown }).step === "number" &&
+    Number.isInteger((data as { step: number }).step) &&
+    (data as { step: number }).step >= 0
+      ? (data as { step: number }).step
+      : undefined;
   return {
     isError: true as const,
     content: [{ type: "text" as const, text: errorCode }],
+    ...(step === undefined
+      ? {}
+      : { structuredContent: { error: errorCode, step } }),
   };
 }
 
@@ -127,7 +145,7 @@ async function forward(method: string, params: unknown) {
     const response = await callDaemon(method, params);
     if (response.error !== undefined) {
       if (typeof response.error.message !== "string") return internalError();
-      return errorResult(response.error.message);
+      return errorResult(response.error.message, response.error.data);
     }
     if (!("result" in response)) return internalError();
     return {
@@ -217,7 +235,12 @@ async function openBridgeTunnel(
   if (tunnelResponse.error !== undefined) {
     if (typeof tunnelResponse.error.message !== "string")
       return { failure: internalError() };
-    return { failure: errorResult(tunnelResponse.error.message) };
+    return {
+      failure: errorResult(
+        tunnelResponse.error.message,
+        tunnelResponse.error.data,
+      ),
+    };
   }
   if (
     typeof tunnelResponse.result !== "object" ||
@@ -237,7 +260,7 @@ export async function loginHandler(params: unknown) {
     const response = await callDaemon("login", params);
     if (response.error !== undefined) {
       if (typeof response.error.message !== "string") return internalError();
-      return errorResult(response.error.message);
+      return errorResult(response.error.message, response.error.data);
     }
     if (!("result" in response)) return internalError();
     if (process.env.TEGATA_BRIDGE !== "1")
@@ -292,7 +315,7 @@ export async function openApiProxyHandler(params: unknown) {
     const response = await callDaemon("open_api_proxy", params);
     if (response.error !== undefined) {
       if (typeof response.error.message !== "string") return internalError();
-      return errorResult(response.error.message);
+      return errorResult(response.error.message, response.error.data);
     }
     if (!("result" in response)) return internalError();
     if (process.env.TEGATA_BRIDGE !== "1")

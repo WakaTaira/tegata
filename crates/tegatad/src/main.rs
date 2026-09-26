@@ -473,6 +473,18 @@ impl ErrorCode {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ExecutorFailure {
+    code: ErrorCode,
+    step: Option<usize>,
+}
+
+impl From<ErrorCode> for ExecutorFailure {
+    fn from(code: ErrorCode) -> Self {
+        Self { code, step: None }
+    }
+}
+
 enum AuditPeer<'a> {
     Peer(&'a PeerIdentity),
     System,
@@ -1697,6 +1709,7 @@ async fn handle_request(
                 error: Some(RpcError {
                     code: METHOD_NOT_FOUND,
                     message: "method not found".to_owned(),
+                    data: None,
                 }),
             },
             outcome: "method_not_found".to_owned(),
@@ -2041,7 +2054,7 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
         }
         Err(error) => {
             start_guard.record_failure(Instant::now());
-            return classified(request.id.clone(), error);
+            return classified_with_step(request.id.clone(), error.code, error.step);
         }
     };
     let session_id = Uuid::new_v4().to_string();
@@ -2216,7 +2229,7 @@ async fn authorize_device(
     .await
     {
         Ok(()) => success(request.id.clone(), json!({ "ok": true })),
-        Err(error) => classified(request.id.clone(), error),
+        Err(error) => classified_with_step(request.id.clone(), error.code, error.step),
     }
 }
 
@@ -3088,16 +3101,17 @@ async fn exchange_first_request<T: Serialize>(
 
 /// executor 接続を 1 本開いて初回要求を送り、応答行を `parse_response` で解釈する。
 /// 接続を保持し続ける要求（login・api_proxy_start）に用い、失敗時は executor を停止する。
-async fn open_executor_with<T, R>(
+async fn open_executor_with<T, R, E>(
     entry: &Path,
     executor_socket: Option<&Path>,
     node_path: &Path,
     browsers_path: Option<&Path>,
     build_request: impl FnOnce() -> T,
-    parse_response: impl FnOnce(&str) -> Result<R, ErrorCode>,
-) -> Result<(R, ExecutorHandle), ErrorCode>
+    parse_response: impl FnOnce(&str) -> Result<R, E>,
+) -> Result<(R, ExecutorHandle), E>
 where
     T: Serialize,
+    E: From<ErrorCode>,
 {
     let mut executor = connect_executor(entry, executor_socket, node_path, browsers_path).await?;
     let result = async {
@@ -3131,7 +3145,7 @@ async fn start_executor(
     browsers_path: Option<&Path>,
     params: &LoginParams,
     credential: &ResolvedCredential,
-) -> Result<(String, String, ExecutorHandle), ErrorCode> {
+) -> Result<(String, String, ExecutorHandle), ExecutorFailure> {
     let build_request = || ExecutorLoginRequest {
         op: "login",
         id: 1,
@@ -3158,21 +3172,25 @@ async fn start_executor(
 }
 
 /// `login` への応答から CDP の endpoint と target_id を取り出す。
-fn parse_login_response(line: &str) -> Result<(String, String), ErrorCode> {
+fn parse_login_response(line: &str) -> Result<(String, String), ExecutorFailure> {
     let response: ExecutorResponse = serde_json::from_str(line).map_err(|_| ErrorCode::Internal)?;
     if response.id != Some(1) {
-        return Err(ErrorCode::Internal);
+        return Err(ErrorCode::Internal.into());
     }
     if response.ok {
         let endpoint = response.endpoint.ok_or(ErrorCode::Internal)?;
         let target_id = response.target_id.ok_or(ErrorCode::Internal)?;
         Ok((endpoint, target_id))
     } else {
-        Err(response
+        let code = response
             .error
             .as_deref()
             .map(parse_error_code)
-            .unwrap_or(ErrorCode::Internal))
+            .unwrap_or(ErrorCode::Internal);
+        Err(ExecutorFailure {
+            code,
+            step: selector_step(&response, code),
+        })
     }
 }
 
@@ -3184,7 +3202,7 @@ async fn authorize_device_with_executor(
     params: &AuthorizeDeviceParams,
     login_url: String,
     credential: &ResolvedCredential,
-) -> Result<(), ErrorCode> {
+) -> Result<(), ExecutorFailure> {
     let mut executor = connect_executor(entry, executor_socket, node_path, browsers_path).await?;
     let result = async {
         let request = ExecutorAuthorizeDeviceRequest {
@@ -3206,16 +3224,20 @@ async fn authorize_device_with_executor(
         let response: ExecutorResponse =
             serde_json::from_str(&response_line).map_err(|_| ErrorCode::Internal)?;
         if response.id != Some(1) {
-            return Err(ErrorCode::Internal);
+            return Err(ErrorCode::Internal.into());
         }
         if response.ok {
             Ok(())
         } else {
-            Err(response
+            let code = response
                 .error
                 .as_deref()
                 .map(parse_authorize_error_code)
-                .unwrap_or(ErrorCode::Internal))
+                .unwrap_or(ErrorCode::Internal);
+            Err(ExecutorFailure {
+                code,
+                step: selector_step(&response, code),
+            })
         }
     }
     .await;
@@ -3296,6 +3318,17 @@ fn cdp_port_from_endpoint(endpoint: &str) -> Option<u16> {
     let authority = endpoint.split_once("://")?.1.split('/').next()?;
     let port = authority.rsplit_once(':')?.1.parse().ok()?;
     (port != 0).then_some(port)
+}
+
+fn selector_step(response: &ExecutorResponse, code: ErrorCode) -> Option<usize> {
+    if !matches!(code, ErrorCode::SelectorNotFound) {
+        return None;
+    }
+    response
+        .step
+        .as_ref()
+        .and_then(Value::as_u64)
+        .and_then(|step| usize::try_from(step).ok())
 }
 
 fn parse_error_code(value: &str) -> ErrorCode {
@@ -3781,8 +3814,12 @@ fn success(id: Value, result: Value) -> HandledRequest {
 }
 
 fn classified(id: Value, error: ErrorCode) -> HandledRequest {
+    classified_with_step(id, error, None)
+}
+
+fn classified_with_step(id: Value, error: ErrorCode, step: Option<usize>) -> HandledRequest {
     HandledRequest {
-        response: error_response(id, error),
+        response: error_response_with_step(id, error, step),
         outcome: error.as_str().to_owned(),
         audit_shared: None,
         audit_approval: None,
@@ -3791,6 +3828,10 @@ fn classified(id: Value, error: ErrorCode) -> HandledRequest {
 }
 
 fn error_response(id: Value, error: ErrorCode) -> RpcResponse {
+    error_response_with_step(id, error, None)
+}
+
+fn error_response_with_step(id: Value, error: ErrorCode, step: Option<usize>) -> RpcResponse {
     RpcResponse {
         jsonrpc: JSON_RPC_VERSION,
         id,
@@ -3798,6 +3839,11 @@ fn error_response(id: Value, error: ErrorCode) -> RpcResponse {
         error: Some(RpcError {
             code: CLASSIFICATION_ERROR,
             message: error.as_str().to_owned(),
+            data: if matches!(error, ErrorCode::SelectorNotFound) {
+                step.map(|step| json!({ "step": step }))
+            } else {
+                None
+            },
         }),
     }
 }

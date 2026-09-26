@@ -367,6 +367,7 @@ async fn write_rpc_error(
         error: Some(RpcError {
             code: CLASSIFICATION_ERROR_CODE,
             message: message.to_owned(),
+            data: None,
         }),
     };
     write_json_line(writer, &response).await

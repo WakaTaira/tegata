@@ -15,7 +15,10 @@ afterEach(() => {
   else process.env.TEGATA_BRIDGE = originalBridge;
 });
 
-async function startFakeServer(bridgeError = false) {
+async function startFakeServer(
+  bridgeError = false,
+  loginError?: { message: string; data?: unknown },
+) {
   const socketPath = join(process.cwd(), `.tegata-mcp-${randomUUID()}.sock`);
   let loginCompleted = false;
   const server = createServer((socket) => {
@@ -37,11 +40,20 @@ async function startFakeServer(bridgeError = false) {
       }
       const response =
         request.method === "login"
-          ? {
-              jsonrpc: "2.0",
-              id: 1,
-              result: { session_id: "s1", channel: { kind: "cdp", endpoint } },
-            }
+          ? loginError === undefined
+            ? {
+                jsonrpc: "2.0",
+                id: 1,
+                result: {
+                  session_id: "s1",
+                  channel: { kind: "cdp", endpoint },
+                },
+              }
+            : {
+                jsonrpc: "2.0",
+                id: 1,
+                error: { code: -32000, ...loginError },
+              }
           : bridgeError
             ? {
                 jsonrpc: "2.0",
@@ -95,7 +107,53 @@ describe.sequential("login bridge", () => {
       const result = await loginHandler({});
       expect(result).toEqual({
         isError: true,
+        content: [{ type: "text", text: "FORBIDDEN" }],
+      });
+    } finally {
+      await stopFakeServer(fake.server);
+    }
+  });
+
+  test("preserves an unknown daemon error code that matches the code format", async () => {
+    const fake = await startFakeServer(false, { message: "NEW_DAEMON_CODE" });
+    delete process.env.TEGATA_BRIDGE;
+    try {
+      const result = await loginHandler({});
+      expect(result).toEqual({
+        isError: true,
+        content: [{ type: "text", text: "NEW_DAEMON_CODE" }],
+      });
+    } finally {
+      await stopFakeServer(fake.server);
+    }
+  });
+
+  test("returns INTERNAL for an arbitrary daemon error message", async () => {
+    const fake = await startFakeServer(false, { message: "not a code" });
+    delete process.env.TEGATA_BRIDGE;
+    try {
+      const result = await loginHandler({});
+      expect(result).toEqual({
+        isError: true,
         content: [{ type: "text", text: "INTERNAL" }],
+      });
+    } finally {
+      await stopFakeServer(fake.server);
+    }
+  });
+
+  test("returns the selector step in structured content", async () => {
+    const fake = await startFakeServer(false, {
+      message: "SELECTOR_NOT_FOUND",
+      data: { step: 1 },
+    });
+    delete process.env.TEGATA_BRIDGE;
+    try {
+      const result = await loginHandler({});
+      expect(result).toEqual({
+        isError: true,
+        content: [{ type: "text", text: "SELECTOR_NOT_FOUND" }],
+        structuredContent: { error: "SELECTOR_NOT_FOUND", step: 1 },
       });
     } finally {
       await stopFakeServer(fake.server);

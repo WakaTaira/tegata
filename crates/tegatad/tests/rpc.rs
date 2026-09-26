@@ -61,6 +61,48 @@ rl.on("line", (line) => {
 rl.on("close", () => { setInterval(() => {}, 1000); });
 "#;
 
+const SELECTOR_STEP_EXECUTOR: &str = r#"
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.op === "login") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: "SELECTOR_NOT_FOUND", step: 1 }) + "\n");
+  } else if (request.op === "shutdown") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true }) + "\n");
+    process.exit(0);
+  }
+});
+"#;
+
+const AUTHORIZE_SELECTOR_STEP_EXECUTOR: &str = r#"
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.op === "authorize_device") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: "SELECTOR_NOT_FOUND", step: 0 }) + "\n");
+  } else if (request.op === "shutdown") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true }) + "\n");
+    process.exit(0);
+  }
+});
+"#;
+
+const INVALID_SELECTOR_STEP_EXECUTOR: &str = r#"
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.op === "login") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: "SELECTOR_NOT_FOUND", step: -1 }) + "\n");
+  } else if (request.op === "shutdown") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true }) + "\n");
+    process.exit(0);
+  }
+});
+"#;
+
 const AUTHORIZE_SUCCESS_EXECUTOR: &str = r#"
 const readline = require("node:readline");
 const rl = readline.createInterface({ input: process.stdin });
@@ -252,6 +294,23 @@ fn authorize_device_returns_only_ok_and_does_not_create_a_session() {
     let status = rpc(&daemon.socket_path, "status", json!({}));
     assert_eq!(status["result"]["browsers"], json!(0));
     assert_eq!(status["result"]["leases"], json!(0));
+}
+
+#[test]
+fn authorize_device_selector_failure_includes_the_step() {
+    let daemon = Daemon::start_with_executor(AUTHORIZE_SELECTOR_STEP_EXECUTOR);
+    let response = rpc(
+        &daemon.socket_path,
+        "authorize_device",
+        json!({
+            "cred_id": "mock:site",
+            "verification_url": "https://example.test/device",
+            "user_code": "secret-device-code",
+            "success_selector": "#device-ok"
+        }),
+    );
+    error_message(&response, "SELECTOR_NOT_FOUND");
+    assert_eq!(response["error"]["data"], json!({ "step": 0 }));
 }
 
 #[test]
@@ -620,6 +679,30 @@ fn login_failure_reaps_the_executor() {
         wait_for_death(pid, Duration::from_secs(5)),
         "executor survived a failed login"
     );
+}
+
+#[test]
+fn selector_failure_includes_the_zero_based_step() {
+    let daemon = Daemon::start_with_executor(SELECTOR_STEP_EXECUTOR);
+    let response = rpc(
+        &daemon.socket_path,
+        "login",
+        json!({ "cred_id": "mock:site", "target_url": "http://127.0.0.1" }),
+    );
+    error_message(&response, "SELECTOR_NOT_FOUND");
+    assert_eq!(response["error"]["data"], json!({ "step": 1 }));
+}
+
+#[test]
+fn invalid_selector_failure_step_is_ignored() {
+    let daemon = Daemon::start_with_executor(INVALID_SELECTOR_STEP_EXECUTOR);
+    let response = rpc(
+        &daemon.socket_path,
+        "login",
+        json!({ "cred_id": "mock:site", "target_url": "http://127.0.0.1" }),
+    );
+    error_message(&response, "SELECTOR_NOT_FOUND");
+    assert!(response["error"].get("data").is_none());
 }
 
 #[test]

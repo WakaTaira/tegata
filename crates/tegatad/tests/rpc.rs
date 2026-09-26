@@ -657,7 +657,7 @@ fn sigterm_reaps_live_session_executors() {
     );
 }
 
-/// 監査行は RPC 応答の後に追記されるため、指定 method の行が現れるまで短時間待ってから読む。
+/// 指定 method の監査行が現れるまで短時間待ってから読む（ファイル I/O の遅延に対する保険）。
 fn read_audit_log(daemon: &Daemon, method: &str) -> String {
     let path = daemon.directory.join("state/audit.log");
     let needle = format!("\"method\":\"{method}\"");
@@ -671,5 +671,30 @@ fn read_audit_log(daemon: &Daemon, method: &str) -> String {
             return audit;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// 監査行は RPC 応答より前にファイルへ書き終わっていなければならない。応答を受け取った
+/// 直後に待たずに読み、その要求の行が必ず存在することを多数回の往復で確かめる。
+#[test]
+fn audit_record_is_on_disk_before_the_response_arrives() {
+    let daemon = Daemon::start();
+    let path = daemon.directory.join("state/audit.log");
+    for attempt in 0..500 {
+        let cred_id = format!("mock:missing-{attempt}");
+        let response = rpc(
+            &daemon.socket_path,
+            "login",
+            json!({ "cred_id": cred_id, "target_url": "http://127.0.0.1" }),
+        );
+        error_message(&response, "INVALID_CREDENTIAL");
+        let audit = std::fs::read_to_string(&path).unwrap_or_default();
+        let needle = format!("\"cred_id\":\"{cred_id}\"");
+        assert!(
+            audit
+                .lines()
+                .any(|line| line.contains(&needle) && serde_json::from_str::<Value>(line).is_ok()),
+            "audit record for attempt {attempt} was not on disk when the response arrived"
+        );
     }
 }

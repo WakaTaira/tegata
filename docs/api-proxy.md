@@ -84,7 +84,10 @@ token either. This does not apply to an MCP server the agent talks to over
 `open_api_proxy` goes through the same approval hook as `login`, when one is
 configured. The hook's environment carries `TEGATA_METHOD=open_api_proxy`,
 `TEGATA_TARGET_URL=<upstream>`, and `TEGATA_CRED_ID`, in place of the login
-destination. See [security.md](security.md#human-in-the-loop-approval).
+destination. On Windows, `approve_operator` holds the call in the operator's
+pending approval queue instead, with the upstream as its target URL — see
+[setup-windows-wsl.md](setup-windows-wsl.md#the-approval-hook). See
+[security.md](security.md#human-in-the-loop-approval).
 
 Starting a relay is rate-limited the same way starting a browser for `login`
 is, per caller and proxy `name`: more than 3 starts in 10 minutes, or a call

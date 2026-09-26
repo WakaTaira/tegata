@@ -230,7 +230,10 @@ declined.
 
 There is no way for the agent to detect whether a hook is configured other than
 being refused by one, and no parameter that influences it. Approval is an operator
-control, not part of the call.
+control, not part of the call. This holds the same way whether the operator
+answers through `approve_cmd` (Linux) or the operator approval hook (Windows,
+`approve_operator`) — the agent sees only `APPROVAL_DENIED` or
+`APPROVAL_TIMEOUT` either way.
 
 ### Session lifetime
 

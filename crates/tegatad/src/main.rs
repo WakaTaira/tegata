@@ -1,3 +1,5 @@
+#[cfg(any(windows, test))]
+mod approvals;
 #[cfg(windows)]
 mod dpapi;
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -104,6 +106,8 @@ struct Config {
     audit_log_max_bytes: Option<u64>,
     approve_cmd: Option<String>,
     approve_timeout_secs: Option<u64>,
+    #[serde(default)]
+    approve_operator: bool,
     executor_entry: Option<String>,
     #[cfg(unix)]
     executor_socket: Option<String>,
@@ -307,8 +311,11 @@ struct DaemonState {
     session_ttl: Duration,
     #[cfg(unix)]
     approve_cmd: Option<String>,
-    #[cfg(unix)]
     approve_timeout: Duration,
+    #[cfg(windows)]
+    approve_operator: bool,
+    #[cfg(windows)]
+    approvals: approvals::ApprovalQueue,
     peers: peers::SharedPeerStore,
     #[cfg(windows)]
     sealed_blob_path: PathBuf,
@@ -386,6 +393,10 @@ struct AuditRecord<'a> {
     namespace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     shared: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approval_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allow: Option<bool>,
     outcome: String,
 }
 
@@ -396,6 +407,8 @@ struct AuditFields {
     session_id: Option<String>,
     namespace: Option<String>,
     shared: Option<bool>,
+    approval_id: Option<String>,
+    allow: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -532,6 +545,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     password.zeroize();
                     result
                 }
+                windows_cli::WindowsCommand::Approval { command } => match command {
+                    windows_cli::ApprovalCommand::List { pipe } => {
+                        windows_cli::run_windows_cli(&pipe, "admin_approval_list", json!({}))
+                    }
+                    windows_cli::ApprovalCommand::Allow { id, pipe } => {
+                        windows_cli::run_windows_cli(
+                            &pipe,
+                            "admin_approval_decide",
+                            json!({ "id": id, "allow": true }),
+                        )
+                    }
+                    windows_cli::ApprovalCommand::Deny { id, pipe } => {
+                        windows_cli::run_windows_cli(
+                            &pipe,
+                            "admin_approval_decide",
+                            json!({ "id": id, "allow": false }),
+                        )
+                    }
+                },
                 windows_cli::WindowsCommand::Service { command } => match command {
                     windows_service::ServiceCommand::Install { config } => {
                         windows_service::install_service(&config)
@@ -668,6 +700,10 @@ async fn run_daemon(
     if config.approve_cmd.is_some() {
         return Err("approve_cmd is only supported on Unix".into());
     }
+    #[cfg(unix)]
+    if config.approve_operator {
+        return Err("approve_operator is only supported on Windows, where the operator answers through the elevated administrative pipe RPC; on Unix, use approve_cmd".into());
+    }
     #[cfg(windows)]
     if let Some(message) = config.providers.iter().find_map(|provider| {
         let ProviderConfigKind::Pass {
@@ -702,8 +738,6 @@ async fn run_daemon(
     }
     #[cfg(windows)]
     eprintln!("executor: spawned by the daemon (browser is not isolated)");
-    #[cfg(windows)]
-    let _ = config.approve_timeout_secs;
     #[cfg(windows)]
     let (token_hash_path, _sealed_blob_path) = resolve_windows_paths(&config);
     #[cfg(unix)]
@@ -918,8 +952,9 @@ async fn build_state(
     let audit_log_max_bytes = config.audit_log_max_bytes;
     #[cfg(unix)]
     let approve_cmd = config.approve_cmd.clone();
-    #[cfg(unix)]
     let approve_timeout = Duration::from_secs(config.approve_timeout_secs.unwrap_or(60));
+    #[cfg(windows)]
+    let approve_operator = config.approve_operator;
     let executor_entry = resolve_executor_entry(&config);
     #[cfg(unix)]
     let executor_socket = config.executor_socket.as_deref().map(PathBuf::from);
@@ -1018,8 +1053,11 @@ async fn build_state(
         session_ttl,
         #[cfg(unix)]
         approve_cmd,
-        #[cfg(unix)]
         approve_timeout,
+        #[cfg(windows)]
+        approve_operator,
+        #[cfg(windows)]
+        approvals: approvals::ApprovalQueue::new(),
         peers,
         #[cfg(windows)]
         sealed_blob_path,
@@ -1187,6 +1225,8 @@ fn spawn_session_reaper(state: SharedState) {
                         session_id: Some(session_id),
                         namespace: Some(namespace),
                         shared: None,
+                        approval_id: None,
+                        allow: None,
                     },
                     "ok".to_owned(),
                 )
@@ -1237,6 +1277,8 @@ async fn audit_provider_autolock(state: &SharedState, namespace: String) {
             session_id: None,
             namespace: Some(namespace),
             shared: None,
+            approval_id: None,
+            allow: None,
         },
         "ok".to_owned(),
     )
@@ -1272,7 +1314,7 @@ async fn serve_connection<S>(
         let rpc_id = NEXT_RPC_ID.fetch_add(1, Ordering::Relaxed);
         let (request, response, outcome, fields) = match parsed {
             Ok(request) => {
-                let fields = audit_fields(&request.method, &request.params);
+                let fields = request_audit_fields(&request);
                 let handled = RPC_CONTEXT
                     .scope(
                         RpcContext {
@@ -1311,6 +1353,8 @@ async fn serve_connection<S>(
                     session_id: None,
                     namespace: None,
                     shared: None,
+                    approval_id: None,
+                    allow: None,
                 },
             ),
         };
@@ -1427,6 +1471,8 @@ async fn append_audit(
         session_id: fields.session_id,
         namespace: fields.namespace,
         shared: fields.shared,
+        approval_id: fields.approval_id,
+        allow: fields.allow,
         outcome,
     };
     let mut bytes = serde_json::to_vec(&record).map_err(AppendAuditError::Serialize)?;
@@ -1507,6 +1553,10 @@ async fn handle_request(
             "admin_token_issue" => admin_token_issue(request, state).await,
             #[cfg(windows)]
             "admin_seal" => admin_seal(request, state).await,
+            #[cfg(windows)]
+            "admin_approval_list" => admin_approval_list(request, state).await,
+            #[cfg(windows)]
+            "admin_approval_decide" => admin_approval_decide(request, state).await,
             _ => classified(request.id.clone(), ErrorCode::Internal),
         };
     }
@@ -1633,6 +1683,46 @@ async fn admin_seal(request: &RpcRequest, state: SharedState) -> HandledRequest 
     match result {
         Ok(()) => success(request.id.clone(), json!({ "ok": true })),
         Err(error) => classified(request.id.clone(), error),
+    }
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+struct AdminApprovalDecideParams {
+    id: String,
+    allow: bool,
+}
+
+#[cfg(windows)]
+async fn admin_approval_list(request: &RpcRequest, state: SharedState) -> HandledRequest {
+    let queue = state.lock().await.approvals.clone();
+    let pending = queue
+        .list()
+        .into_iter()
+        .map(|pending| {
+            json!({
+                "id": pending.id,
+                "method": pending.method,
+                "cred_id": pending.cred_id,
+                "target_url": pending.target_url,
+                "principal": pending.principal,
+                "age_secs": pending.age_secs,
+            })
+        })
+        .collect::<Vec<_>>();
+    success(request.id.clone(), json!({ "pending": pending }))
+}
+
+#[cfg(windows)]
+async fn admin_approval_decide(request: &RpcRequest, state: SharedState) -> HandledRequest {
+    let params = match parse_params::<AdminApprovalDecideParams>(&request.params) {
+        Ok(params) => params,
+        Err(error) => return classified(request.id.clone(), error),
+    };
+    let queue = state.lock().await.approvals.clone();
+    match queue.decide(&params.id, params.allow) {
+        Ok(()) => success(request.id.clone(), json!({ "ok": true })),
+        Err(approvals::NotFound) => classified(request.id.clone(), ErrorCode::NotFound),
     }
 }
 
@@ -1778,8 +1868,7 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
     let namespace = namespace.to_owned();
     let principal = peer.principal();
     let key = sessions::BrowserKey::new(principal.clone(), namespace, params.cred_id.clone());
-    #[cfg(unix)]
-    if state.lock().await.approve_cmd.is_some() {
+    if approval_required(&*state.lock().await) {
         let credential_state = match credential_state(&state, &params.cred_id).await {
             Ok(Some(locked)) => locked,
             Ok(None) => return classified(request.id.clone(), ErrorCode::InvalidCredential),
@@ -2105,7 +2194,6 @@ fn valid_authorize_steps(steps: Option<&[tegata_core::wire::LoginStep]>) -> bool
     })
 }
 
-#[cfg(unix)]
 async fn credential_state(state: &SharedState, cred_id: &str) -> Result<Option<bool>, ErrorCode> {
     let Some((_, entry_id)) = cred_id.split_once(':') else {
         return Ok(None);
@@ -2192,6 +2280,50 @@ async fn approve_command(
             Err(ErrorCode::ApprovalTimeout)
         }
     }
+}
+
+/// 承認ゲートが構成されているかを返す。Unix は `approve_cmd`、Windows は
+/// `approve_operator` の保留キューを用いる。
+fn approval_required(daemon: &DaemonState) -> bool {
+    #[cfg(unix)]
+    {
+        daemon.approve_cmd.is_some()
+    }
+    #[cfg(windows)]
+    {
+        daemon.approve_operator
+    }
+}
+
+/// 保留キューに登録し、昇格した操作者の管理 RPC による決定を待つ。
+#[cfg(windows)]
+async fn approve_login(
+    state: &SharedState,
+    params: &LoginParams,
+    peer: &PeerIdentity,
+) -> Result<(), ErrorCode> {
+    let (queue, approve_timeout) = {
+        let daemon = state.lock().await;
+        (daemon.approvals.clone(), daemon.approve_timeout)
+    };
+    let pending = queue.register(approvals::ApprovalRequest {
+        method: "login".to_owned(),
+        cred_id: params.cred_id.clone(),
+        target_url: params.target_url.clone(),
+        principal: peer.principal(),
+    });
+    eprintln!(
+        "tegatad: approval pending {} login {}",
+        pending.id(),
+        params.cred_id
+    );
+    pending
+        .wait(approve_timeout)
+        .await
+        .map_err(|error| match error {
+            approvals::ApprovalError::Denied => ErrorCode::ApprovalDenied,
+            approvals::ApprovalError::Timeout => ErrorCode::ApprovalTimeout,
+        })
 }
 
 async fn logout(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) -> HandledRequest {
@@ -2432,6 +2564,8 @@ async fn terminate_peer_leases(state: SharedState, peer_id: &str) {
                 session_id: Some(session_id),
                 namespace: Some(namespace),
                 shared: None,
+                approval_id: None,
+                allow: None,
             },
             "ok".to_owned(),
         )
@@ -2459,6 +2593,8 @@ async fn audit_system_session(
             session_id: Some(session_id),
             namespace: Some(namespace),
             shared: None,
+            approval_id: None,
+            allow: None,
         },
         "ok".to_owned(),
     )
@@ -3085,6 +3221,21 @@ fn optional_namespace(params: &Value) -> Result<Option<String>, ErrorCode> {
     }
 }
 
+/// 要求の監査項目を組み立てる。承認の決定は、どの保留にどう答えたかを
+/// 監査で追えるように `approval_id` と `allow` を加える。
+fn request_audit_fields(request: &RpcRequest) -> AuditFields {
+    let mut fields = audit_fields(&request.method, &request.params);
+    if request.method == "admin_approval_decide" {
+        fields.approval_id = request
+            .params
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        fields.allow = request.params.get("allow").and_then(Value::as_bool);
+    }
+    fields
+}
+
 /// 監査へ転記してよい params のキーを method ごとに限定する。
 /// method が解釈しないキーまで転記すると、呼び出し側が監査記録を偽装できるためである。
 fn audit_param_keys(method: &str) -> &'static [&'static str] {
@@ -3129,6 +3280,8 @@ fn audit_fields(method: &str, params: &Value) -> AuditFields {
         session_id: field("session_id"),
         namespace,
         shared: None,
+        approval_id: None,
+        allow: None,
     }
 }
 
@@ -3181,6 +3334,8 @@ mod tests {
             session_id: None,
             namespace: None,
             shared: None,
+            approval_id: None,
+            allow: None,
             outcome: "ok".to_owned(),
         };
         assert_eq!(

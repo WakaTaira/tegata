@@ -215,9 +215,11 @@ browsers_path   = "C:\\ProgramData\\tegata-rig\\browsers"
 | `session_ttl_secs` | integer | no | Browser session lifetime; default `300` |
 | `executor_entry` | string | no | Path to the executor's `index.js` |
 
-`approve_cmd` and `approve_timeout_secs` are UNIX-only. A Windows configuration
-containing `approve_cmd` is refused at startup with an explicit error rather than
-silently ignored — see [setup-linux.md](setup-linux.md#the-approval-hook).
+`approve_cmd` remains UNIX-only. A Windows configuration containing it is refused
+at startup with an explicit error rather than silently ignored — see
+[setup-linux.md](setup-linux.md#the-approval-hook). `approve_timeout_secs` is
+shared with the Windows-only `approve_operator` hook below; on Unix it still
+governs `approve_cmd`.
 
 ### Transport
 
@@ -257,6 +259,60 @@ Only `bitwarden-cli` is supported on Windows. `pass` is UNIX-only, and `age-file
 is refused because the browser shares the daemon's service account and could read
 the identity file containing the private key. A Windows configuration containing
 either provider is refused at startup with an explicit error rather than ignored.
+
+## The approval hook
+
+`approve_cmd` cannot exist on Windows — the browser shares the daemon's service
+account, so an external command run by the daemon shares it too, and offers no
+signal an agent cannot forge on its own. `approve_operator` is the Windows
+equivalent: instead of a command, a person answers from an elevated PowerShell
+session, because the same administrative RPC gate that already refuses a WSL
+interop caller ([see security.md](security.md#human-in-the-loop-approval)) is
+the one thing on this host an agent cannot pass itself off as.
+
+```toml
+approve_operator     = true
+approve_timeout_secs = 300
+```
+
+`approve_operator` is Windows-only; a Unix configuration containing it is
+refused at startup with an explicit error. Raise `approve_timeout_secs` well
+above its default of 60 when using this hook — a human reading a pending list
+and typing a command needs longer than a scripted `approve_cmd` does. 300
+seconds is a reasonable starting point.
+
+With the hook enabled, every `login` registers a pending approval at the same
+point `approve_cmd` would gate it — after the credential is confirmed to exist,
+before any value is resolved or the executor starts — and then waits. The
+daemon writes one line to its stderr — visible through `TEGATA_LOG_FILE`, see
+[Troubleshooting](#troubleshooting) — when it does:
+
+```
+tegatad: approval pending 482913 login vw:a1b2c3
+```
+
+The six-digit number is the approval id. From an **elevated** PowerShell on the
+desktop:
+
+```
+tegatad.exe approval list
+tegatad.exe approval allow 482913
+tegatad.exe approval deny 482913
+```
+
+`approval list` shows every pending request with its id, method, credential
+reference, target URL, calling principal, and age. `allow` lets the waiting
+`login` proceed; `deny` fails it with `APPROVAL_DENIED`. An id that no longer
+exists — already decided, or timed out — returns `NOT_FOUND`. A `login` that
+receives no decision within `approve_timeout_secs` fails with
+`APPROVAL_TIMEOUT` and its pending entry is removed.
+
+These three commands go through the same named-pipe administrative RPC gate as
+`peer issue` and `seal`: elevated, a member of the local Administrators group,
+and not a WSL interop caller. Answering from inside WSL is not possible even
+with a valid token — the interop-origin refusal that protects `peer issue` and
+`seal` protects the approval queue the same way, so an agent running inside the
+distro cannot allow or deny its own pending request.
 
 ## WSL client
 

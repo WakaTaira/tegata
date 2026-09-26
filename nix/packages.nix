@@ -48,8 +48,8 @@ let
     npmBuildFlags = [ "--workspace" "@tegata/executor" ];
 
     installPhase = ''
-      install -Dm644 packages/tegata-executor/dist/index.js \
-        $out/lib/tegata-executor/index.js
+      mkdir -p $out/lib/tegata-executor
+      install -m644 packages/tegata-executor/dist/*.js $out/lib/tegata-executor/
       mkdir -p $out/lib/tegata-executor/node_modules
       cp -rL node_modules/playwright-core \
         $out/lib/tegata-executor/node_modules/

@@ -96,7 +96,7 @@ jobs:
           mkdir -p stage tegata-mcp tegata-executor/node_modules
           cp packages/tegata-mcp/dist/index.js tegata-mcp/index.js
           cp -rL node_modules tegata-mcp/node_modules
-          cp packages/tegata-executor/dist/index.js tegata-executor/index.js
+          cp packages/tegata-executor/dist/*.js tegata-executor/
           cp -rL node_modules/playwright-core tegata-executor/node_modules/
           tar czf stage/tegata-mcp-node.tar.gz tegata-mcp
           tar czf stage/tegata-executor-node.tar.gz tegata-executor

@@ -91,8 +91,8 @@ fails to launch at all.
 
 Each [release](https://github.com/WakaTaira/tegata/releases) ships prebuilt
 artifacts for x86_64 Linux: `tegatad-x86_64-linux-gnu` (glibc 2.35 baseline),
-`tegata-executor-node.tar.gz` (the executor `index.js` with `playwright-core`
-beside it), and `tegata-mcp-node.tar.gz` (the broker with its production
+`tegata-executor-node.tar.gz` (the executor modules with `playwright-core`
+beside them), and `tegata-mcp-node.tar.gz` (the broker with its production
 dependencies), plus `SHA256SUMS`. Unpack a bundle anywhere and point
 `executor_entry` or the agent at its `index.js`.
 
@@ -107,9 +107,10 @@ npm run build --workspace @tegata/executor
 ```
 
 The executor is not a single file: `packages/tegata-executor/dist/index.js`
-resolves `playwright-core` from the workspace's `node_modules` at run time. Set
-`executor_entry` to that `dist/index.js` and leave the checkout's
-`node_modules` in place, or copy the two side by side preserving the layout.
+imports the other modules in `dist/` and resolves `playwright-core` from the
+workspace's `node_modules` at run time. Set `executor_entry` to that
+`dist/index.js` and leave the checkout's `node_modules` in place, or copy all of
+`dist/` and `node_modules` side by side preserving the layout.
 Install the browsers with the version pinned in
 `packages/tegata-executor/package.json`:
 

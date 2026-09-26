@@ -25,7 +25,15 @@ impl BrowserKey {
 pub(crate) struct Lease {
     pub(crate) principal: String,
     pub(crate) expires_at: Instant,
-    pub(crate) target_id: String,
+    pub(crate) target: LeaseTarget,
+}
+
+/// リースが executor 上で占有している資源。リース終了時の解放要求の種類を決める。
+pub(crate) enum LeaseTarget {
+    /// ブラウザのタブ。解放は `release {target_id}` で行う。
+    Tab(String),
+    /// 注入プロキシのリスナー。解放は `api_proxy_stop` で行う。
+    ApiProxy,
 }
 
 pub(crate) struct Browser {

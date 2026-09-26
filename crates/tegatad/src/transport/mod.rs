@@ -68,6 +68,7 @@ pub(crate) enum Accepted<S> {
 
 /// Identity of an authenticated peer, as established by the transport.
 #[allow(dead_code)]
+#[derive(Clone)]
 pub(crate) enum PeerIdentity {
     /// Peer credentials of a UNIX domain socket client.
     Uid(u32),

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
-import { loginHandler } from "./index.js";
+import { loginHandler, openApiProxyHandler } from "./index.js";
 
 const endpoint = "ws://127.0.0.1:9001/devtools/browser/abc";
 const originalSocket = process.env.TEGATA_SOCKET;
@@ -118,6 +118,90 @@ describe.sequential("login bridge", () => {
           },
         ],
       });
+    } finally {
+      await stopFakeServer(fake.server);
+    }
+  });
+});
+
+const baseUrl = "http://127.0.0.1:9002/path-secret_1";
+
+/** open_api_proxy と bridge_open_tunnel に順に応答する偽デーモンを起動する。 */
+async function startFakeApiProxyServer() {
+  const socketPath = join(process.cwd(), `.tegata-mcp-${randomUUID()}.sock`);
+  const methods: unknown[] = [];
+  const server = createServer((socket) => {
+    let data = "";
+    socket.on("data", (chunk) => {
+      data += chunk.toString();
+      const lineEnd = data.indexOf("\n");
+      if (lineEnd === -1) return;
+      const request = JSON.parse(data.slice(0, lineEnd)) as {
+        method: string;
+        params?: unknown;
+      };
+      methods.push({ method: request.method, params: request.params });
+      const response =
+        request.method === "open_api_proxy"
+          ? {
+              jsonrpc: "2.0",
+              id: 1,
+              result: { session_id: "p1", base_url: baseUrl },
+            }
+          : { jsonrpc: "2.0", id: 1, result: { local_port: 4343 } };
+      socket.write(`${JSON.stringify(response)}\n`);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  process.env.TEGATA_SOCKET = socketPath;
+  return { server, methods };
+}
+
+describe.sequential("open_api_proxy bridge", () => {
+  test("rewrites only the base_url port through the bridge", async () => {
+    const fake = await startFakeApiProxyServer();
+    process.env.TEGATA_BRIDGE = "1";
+    try {
+      const result = await openApiProxyHandler({ name: "fx" });
+      expect(result).toEqual({
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              session_id: "p1",
+              base_url: "http://127.0.0.1:4343/path-secret_1",
+            }),
+          },
+        ],
+      });
+      expect(fake.methods).toEqual([
+        { method: "open_api_proxy", params: { name: "fx" } },
+        {
+          method: "bridge_open_tunnel",
+          params: { session_id: "p1", port: 9002 },
+        },
+      ]);
+    } finally {
+      await stopFakeServer(fake.server);
+    }
+  });
+
+  test("preserves the base_url when bridge mode is disabled", async () => {
+    const fake = await startFakeApiProxyServer();
+    delete process.env.TEGATA_BRIDGE;
+    try {
+      const result = await openApiProxyHandler({ name: "fx" });
+      expect(result).toEqual({
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ session_id: "p1", base_url: baseUrl }),
+          },
+        ],
+      });
+      expect(fake.methods).toEqual([
+        { method: "open_api_proxy", params: { name: "fx" } },
+      ]);
     } finally {
       await stopFakeServer(fake.server);
     }

@@ -2031,14 +2031,11 @@ async fn authorize_device(
         .uri
         .filter(|uri| !uri.is_empty())
         .unwrap_or(verification_origin);
-    #[cfg(unix)]
-    if state.lock().await.approve_cmd.is_some()
+    if approval_required(&*state.lock().await)
         && let Err(error) = approve_authorize_device(&state, &params, peer).await
     {
         return classified(request.id.clone(), error);
     }
-    #[cfg(not(unix))]
-    let _ = peer;
     let (credential, executor_entry, executor_socket, node_path, browsers_path) = {
         let credential = match resolve_credential(&state, &params.cred_id).await {
             Ok(Some(credential)) => credential,
@@ -2279,11 +2276,41 @@ fn approval_required(daemon: &DaemonState) -> bool {
     }
 }
 
-/// 保留キューに登録し、昇格した操作者の管理 RPC による決定を待つ。
 #[cfg(windows)]
 async fn approve_login(
     state: &SharedState,
     params: &LoginParams,
+    peer: &PeerIdentity,
+) -> Result<(), ErrorCode> {
+    approve_by_operator(state, &params.cred_id, &params.target_url, "login", peer).await
+}
+
+#[cfg(windows)]
+async fn approve_authorize_device(
+    state: &SharedState,
+    params: &AuthorizeDeviceParams,
+    peer: &PeerIdentity,
+) -> Result<(), ErrorCode> {
+    // verification_uri_complete の query に載る user_code を保留一覧へ広げないため、
+    // 監査と同じく query・fragment・userinfo を除いた URL を載せる。
+    let target_url = audit_target_url(&params.verification_url).ok_or(ErrorCode::Internal)?;
+    approve_by_operator(
+        state,
+        &params.cred_id,
+        &target_url,
+        "authorize_device",
+        peer,
+    )
+    .await
+}
+
+/// 保留キューに登録し、昇格した操作者の管理 RPC による決定を待つ。
+#[cfg(windows)]
+async fn approve_by_operator(
+    state: &SharedState,
+    cred_id: &str,
+    target_url: &str,
+    method: &str,
     peer: &PeerIdentity,
 ) -> Result<(), ErrorCode> {
     let (queue, approve_timeout) = {
@@ -2291,15 +2318,14 @@ async fn approve_login(
         (daemon.approvals.clone(), daemon.approve_timeout)
     };
     let pending = queue.register(approvals::ApprovalRequest {
-        method: "login".to_owned(),
-        cred_id: params.cred_id.clone(),
-        target_url: params.target_url.clone(),
+        method: method.to_owned(),
+        cred_id: cred_id.to_owned(),
+        target_url: target_url.to_owned(),
         principal: peer.principal(),
     });
     eprintln!(
-        "tegatad: approval pending {} login {}",
-        pending.id(),
-        params.cred_id
+        "tegatad: approval pending {} {method} {cred_id}",
+        pending.id()
     );
     pending
         .wait(approve_timeout)

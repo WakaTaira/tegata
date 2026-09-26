@@ -167,9 +167,9 @@ an opt-in for a deployment that provides its own helper.
 | `tegatad.exe peer list` | yes | List named client tokens |
 | `tegatad.exe token issue` | yes | Deprecated alias for `peer issue --label default`; removed in the next release |
 | `tegatad.exe seal` | yes | Seal the master password |
-| `tegatad.exe approval list` | yes | List pending login approvals |
-| `tegatad.exe approval allow <id>` | yes | Let a pending login proceed |
-| `tegatad.exe approval deny <id>` | yes | Refuse a pending login |
+| `tegatad.exe approval list` | yes | List pending `login` and `authorize_device` approvals |
+| `tegatad.exe approval allow <id>` | yes | Let a pending request proceed |
+| `tegatad.exe approval deny <id>` | yes | Refuse a pending request |
 | `tegatad.exe service install --config <path>` | yes | Register and provision |
 | `tegatad.exe service uninstall [--name <name>]` | yes | Remove the service and its firewall rule |
 | `tegatad.exe --config <path> --foreground` | — | Run in the foreground for debugging |
@@ -218,7 +218,7 @@ browsers_path   = "C:\\ProgramData\\tegata-rig\\browsers"
 | `unlock_mode` | string | no | `sealed` (default) or `askpass` |
 | `session_ttl_secs` | integer | no | Browser session lifetime; default `300` |
 | `executor_entry` | string | no | Path to the executor's `index.js` |
-| `approve_operator` | boolean | no | Hold every `login` for an operator decision; default `false` — see [The approval hook](#the-approval-hook) |
+| `approve_operator` | boolean | no | Hold every `login` and `authorize_device` for an operator decision; default `false` — see [The approval hook](#the-approval-hook) |
 | `approve_timeout_secs` | integer | no | How long a pending approval waits for a decision; default `60` |
 
 `approve_cmd` remains UNIX-only. A Windows configuration containing it is refused
@@ -287,11 +287,14 @@ above its default of 60 when using this hook — a human reading a pending list
 and typing a command needs longer than a scripted `approve_cmd` does. 300
 seconds is a reasonable starting point.
 
-With the hook enabled, every `login` registers a pending approval at the same
-point `approve_cmd` would gate it — after the credential is confirmed to exist,
-before any value is resolved or the executor starts — and then waits. The
-daemon writes one line to its stderr — visible through `TEGATA_LOG_FILE`, see
-[Troubleshooting](#troubleshooting) — when it does:
+With the hook enabled, every `login` and `authorize_device` registers a pending
+approval at the same point `approve_cmd` would gate it — after the credential is
+confirmed to exist, before any value is resolved or the executor starts — and
+then waits. For `authorize_device`, the target URL in the pending entry is the
+verification URL with its query, fragment, and userinfo removed, so the user
+code does not appear in the list. The daemon writes one line to its stderr —
+visible through `TEGATA_LOG_FILE`, see [Troubleshooting](#troubleshooting) —
+when it does:
 
 ```
 tegatad: approval pending 482913 login vw:a1b2c3
@@ -308,8 +311,8 @@ tegatad.exe approval deny 482913
 
 `approval list` shows every pending request with its id, method, credential
 reference, target URL, calling principal, and age. `allow` lets the waiting
-`login` proceed; `deny` fails it with `APPROVAL_DENIED`. An id that no longer
-exists — already decided, or timed out — returns `NOT_FOUND`. A `login` that
+request proceed; `deny` fails it with `APPROVAL_DENIED`. An id that no longer
+exists — already decided, or timed out — returns `NOT_FOUND`. A request that
 receives no decision within `approve_timeout_secs` fails with
 `APPROVAL_TIMEOUT` and its pending entry is removed.
 

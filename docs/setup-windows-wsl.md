@@ -107,7 +107,7 @@ tegatad.exe service install --config C:\ProgramData\tegata\config.toml
 
 That single command registers the service under `NT SERVICE\tegatad` with
 auto-start, adds an inbound firewall rule for the daemon's TCP port scoped to the
-`vEthernet (WSL*` interface, creates `C:\ProgramData\tegata` along with the state
+local subnet, creates `C:\ProgramData\tegata` along with the state
 and browser directories, applies a protected DACL to each, and — when
 `operator_sid` is set — grants that SID permission to start and stop the service.
 
@@ -454,7 +454,20 @@ access to `browsers_path`. A revision mismatch fails immediately at launch.
 
 **The bridge cannot connect.** Confirm the firewall rule exists and the distro's
 gateway address is what the bridge resolved; a mirrored-networking distro needs
-`--daemon-addr 127.0.0.1`. Confirm `tcp_port` is not `0`.
+`--daemon-addr 127.0.0.1`. Confirm `tcp_port` is not `0`. The rule uses
+`RemoteAddress LocalSubnet`, while the listener binds only the WSL gateway
+address (or `127.0.0.1` for mirrored networking).
+
+If a rule created by an older version stops matching after WSL restarts, a TCP
+connect attempt times out even though the rule is enabled. In an elevated
+PowerShell, replace it with the dynamically evaluated local-subnet rule:
+
+```powershell
+Get-NetFirewallRule -DisplayName '<name> WSL TCP' | Remove-NetFirewallRule
+New-NetFirewallRule -DisplayName '<name> WSL TCP' -Direction Inbound -Action Allow -Protocol TCP -LocalPort <port> -RemoteAddress LocalSubnet -Profile Any
+```
+
+Replace `<name>` with `service_name` and `<port>` with `tcp_port`.
 
 **`UNAUTHORIZED` from the bridge.** The token file does not match the stored hash.
 Issue a new peer with `tegatad.exe token issue` or `tegatad.exe peer issue`; this

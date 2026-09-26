@@ -603,6 +603,8 @@ Then deny the agent every other route to the same secrets — direct `bw` invoca
 and any socket client it could write. tegata isolates the vault, but it cannot stop
 an agent that is separately allowed to run `bw get password` itself.
 
+For each Bitwarden CLI invocation, the daemon writes a `tegatad: bw_diag {…}` line to stderr with the operation name, attempt count, duration, failure kind, exit code, and truncated stderr; it contains no stdout, session key, password, or email. At startup it writes a `tegatad: bw_version …` line to stderr. View these lines with `journalctl -u tegata`.
+
 ## Verifying the boundary
 
 ```sh

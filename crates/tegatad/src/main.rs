@@ -63,6 +63,16 @@ const EXECUTOR_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const EXECUTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const PASSWORD_FILE_DIR: &str = ".bw-passwords";
 
+tokio::task_local! {
+    pub(crate) static RPC_ID: u64;
+}
+
+static NEXT_RPC_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn current_rpc_id() -> Option<u64> {
+    RPC_ID.try_with(|rpc_id| *rpc_id).ok()
+}
+
 type ReadySender = Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<Result<(), String>>>>>;
 
 #[derive(Debug, Deserialize)]
@@ -296,6 +306,7 @@ enum ErrorCode {
     TotpNotExposable,
     ApprovalDenied,
     ApprovalTimeout,
+    ProviderUnavailable,
     Internal,
     NotFound,
     Unauthorized,
@@ -316,6 +327,7 @@ impl ErrorCode {
             Self::TotpNotExposable => "TOTP_NOT_EXPOSABLE",
             Self::ApprovalDenied => "APPROVAL_DENIED",
             Self::ApprovalTimeout => "APPROVAL_TIMEOUT",
+            Self::ProviderUnavailable => "PROVIDER_UNAVAILABLE",
             Self::Internal => "INTERNAL",
             Self::NotFound => "NOT_FOUND",
             Self::Unauthorized => "UNAUTHORIZED",
@@ -680,7 +692,7 @@ async fn run_daemon(
     tokio::fs::create_dir_all(&config.state_dir).await?;
     let peers_path = PathBuf::from(&config.state_dir).join("peers.json");
     let peers = peers::PeerStore::load_or_import(&peers_path, &token_hash_path)?;
-    let state = Arc::new(Mutex::new(build_state(config, peers.clone())?));
+    let state = Arc::new(Mutex::new(build_state(config, peers.clone()).await?));
     let cdp_ports = state.lock().await.cdp_ports.clone();
     let resolver: CdpPortResolver = Arc::new(move |session_id, peer| {
         cdp_ports.read().ok().and_then(|ports| {
@@ -868,7 +880,10 @@ where
     Ok(())
 }
 
-fn build_state(config: Config, peers: peers::SharedPeerStore) -> Result<DaemonState, io::Error> {
+async fn build_state(
+    config: Config,
+    peers: peers::SharedPeerStore,
+) -> Result<DaemonState, io::Error> {
     #[cfg(windows)]
     let (_, sealed_blob_path) = resolve_windows_paths(&config);
     #[cfg(windows)]
@@ -893,23 +908,24 @@ fn build_state(config: Config, peers: peers::SharedPeerStore) -> Result<DaemonSt
     let bw_path = resolve_bw_path(&config);
     let session_ttl = Duration::from_secs(config.session_ttl_secs.unwrap_or(300));
     let state_dir = PathBuf::from(&config.state_dir);
-    let providers = config
-        .providers
-        .into_iter()
-        .map(|provider| -> Result<Provider, io::Error> {
-            let namespace = provider.namespace;
-            let provider: Arc<Mutex<dyn CredentialProvider + Send>> = match provider.kind {
-                #[cfg(feature = "mock-provider")]
-                ProviderConfigKind::Mock { entries } => Arc::new(Mutex::new(
-                    StaticProvider::from_config(entries, &mut registry),
-                )),
-                ProviderConfigKind::BitwardenCli {
-                    server_url,
-                    email,
-                    askpass_cmd,
-                    totp_exposable,
-                    session_ttl_secs,
-                } => Arc::new(Mutex::new(BitwardenCliProvider::new(BitwardenCliConfig {
+    let mut providers = Vec::new();
+    let mut version_logged = false;
+    for provider in config.providers {
+        let namespace = provider.namespace;
+        let provider: Arc<Mutex<dyn CredentialProvider + Send>> = match provider.kind {
+            #[cfg(feature = "mock-provider")]
+            ProviderConfigKind::Mock { entries } => Arc::new(Mutex::new(
+                StaticProvider::from_config(entries, &mut registry),
+            )),
+            ProviderConfigKind::BitwardenCli {
+                server_url,
+                email,
+                askpass_cmd,
+                totp_exposable,
+                session_ttl_secs,
+            } => {
+                let provider = BitwardenCliProvider::new(BitwardenCliConfig {
+                    namespace: namespace.clone(),
                     server_url,
                     email,
                     askpass_cmd,
@@ -923,43 +939,44 @@ fn build_state(config: Config, peers: peers::SharedPeerStore) -> Result<DaemonSt
                     unlock_mode,
                     #[cfg(windows)]
                     sealed_blob_path: sealed_blob_path.clone(),
-                }))),
-                ProviderConfigKind::AgeFile {
-                    entries_path,
-                    identity_path,
-                    session_ttl_secs,
-                } => Arc::new(Mutex::new(FileProvider::new(FileProviderConfig {
-                    entries_path,
-                    identity_path,
-                    session_ttl: Duration::from_secs(
-                        session_ttl_secs.unwrap_or(session_ttl.as_secs()),
-                    ),
-                })?)),
-                #[cfg(unix)]
-                ProviderConfigKind::Pass {
-                    store_dir,
-                    gnupghome,
-                    pass_bin,
-                    totp_exposable,
-                    session_ttl_secs,
-                } => Arc::new(Mutex::new(PassProvider::new(PassProviderConfig {
-                    store_dir,
-                    gnupghome,
-                    pass_bin,
-                    totp_exposable,
-                    session_ttl: Duration::from_secs(
-                        session_ttl_secs.unwrap_or(session_ttl.as_secs()),
-                    ),
-                }))),
-                #[cfg(windows)]
-                ProviderConfigKind::Pass { .. } => unreachable!("pass provider was rejected above"),
-            };
-            Ok(Provider {
-                namespace,
-                provider,
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+                });
+                if !version_logged {
+                    provider.log_version().await;
+                    version_logged = true;
+                }
+                Arc::new(Mutex::new(provider))
+            }
+            ProviderConfigKind::AgeFile {
+                entries_path,
+                identity_path,
+                session_ttl_secs,
+            } => Arc::new(Mutex::new(FileProvider::new(FileProviderConfig {
+                entries_path,
+                identity_path,
+                session_ttl: Duration::from_secs(session_ttl_secs.unwrap_or(session_ttl.as_secs())),
+            })?)),
+            #[cfg(unix)]
+            ProviderConfigKind::Pass {
+                store_dir,
+                gnupghome,
+                pass_bin,
+                totp_exposable,
+                session_ttl_secs,
+            } => Arc::new(Mutex::new(PassProvider::new(PassProviderConfig {
+                store_dir,
+                gnupghome,
+                pass_bin,
+                totp_exposable,
+                session_ttl: Duration::from_secs(session_ttl_secs.unwrap_or(session_ttl.as_secs())),
+            }))),
+            #[cfg(windows)]
+            ProviderConfigKind::Pass { .. } => unreachable!("pass provider was rejected above"),
+        };
+        providers.push(Provider {
+            namespace,
+            provider,
+        });
+    }
     Ok(DaemonState {
         providers,
         browsers: HashMap::new(),
@@ -1230,17 +1247,22 @@ async fn serve_connection<S>(
             }
         }
         let parsed = serde_json::from_str::<RpcRequest>(&line);
+        let rpc_id = NEXT_RPC_ID.fetch_add(1, Ordering::Relaxed);
         let (request, response, outcome, fields) = match parsed {
             Ok(request) => {
                 let fields = audit_fields(&request.method, &request.params);
-                let handled = handle_request(
-                    &request,
-                    state.clone(),
-                    &peer,
-                    &allowed_uids,
-                    &operator_uids,
-                )
-                .await;
+                let handled = RPC_ID
+                    .scope(
+                        rpc_id,
+                        handle_request(
+                            &request,
+                            state.clone(),
+                            &peer,
+                            &allowed_uids,
+                            &operator_uids,
+                        ),
+                    )
+                    .await;
                 let mut fields = fields;
                 if request.method == "login"
                     && handled.outcome == "ok"
@@ -2736,6 +2758,7 @@ fn parse_error_code(value: &str) -> ErrorCode {
         "TOTP_NOT_EXPOSABLE" => ErrorCode::TotpNotExposable,
         "APPROVAL_DENIED" => ErrorCode::ApprovalDenied,
         "APPROVAL_TIMEOUT" => ErrorCode::ApprovalTimeout,
+        "PROVIDER_UNAVAILABLE" => ErrorCode::ProviderUnavailable,
         "INTERNAL" => ErrorCode::Internal,
         "NOT_FOUND" => ErrorCode::NotFound,
         _ => ErrorCode::Internal,

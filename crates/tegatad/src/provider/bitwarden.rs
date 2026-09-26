@@ -116,6 +116,7 @@ struct BwDiagnosticBase {
     session_present: bool,
     exit_code: Option<i32>,
     stderr: String,
+    io_error: Option<String>,
 }
 
 struct BwDiagnosticInput<'a> {
@@ -127,6 +128,7 @@ struct BwDiagnosticInput<'a> {
     exit_code: Option<i32>,
     stderr: &'a [u8],
     issued_secrets: &'a [String],
+    io_error: Option<io::ErrorKind>,
 }
 
 #[derive(Debug)]
@@ -181,6 +183,15 @@ impl BwRunError {
         match self {
             Self::NonZeroExit(status, _) => status.code(),
             Self::CreateDir(_) | Self::Process(_, _) | Self::Timeout(_) => None,
+        }
+    }
+
+    /// spawn・appdata ディレクトリ作成に伴う `io::Error` の種類のみを返す。パスを含み得る
+    /// `Display` 文は診断行に載せないため、`ErrorKind` の `Debug` 表現に限定する。
+    fn io_error_kind(&self) -> Option<io::ErrorKind> {
+        match self {
+            Self::CreateDir(error) | Self::Process(error, _) => Some(error.kind()),
+            Self::NonZeroExit(_, _) | Self::Timeout(_) => None,
         }
     }
 }
@@ -296,6 +307,7 @@ fn emit_bw_diag(base: BwDiagnosticBase, failure: Option<&str>, status: Option<&s
         "failure": failure,
         "exit_code": base.exit_code,
         "stderr": base.stderr,
+        "io_error": base.io_error,
     });
     if let Ok(json) = serde_json::to_string(&diagnostic) {
         eprintln!("tegatad: bw_diag {json}");
@@ -405,6 +417,7 @@ impl BitwardenCliProvider {
                 exit_code: error.exit_code(),
                 stderr: error.stderr(),
                 issued_secrets: &[],
+                io_error: error.io_error_kind(),
             });
             return Err((error, diagnostic));
         }
@@ -516,6 +529,7 @@ impl BitwardenCliProvider {
                     exit_code,
                     stderr: &stderr,
                     issued_secrets: &issued_secrets,
+                    io_error: None,
                 });
                 Ok(BwOutput {
                     stdout,
@@ -532,6 +546,7 @@ impl BitwardenCliProvider {
                     exit_code: error.exit_code(),
                     stderr: error.stderr(),
                     issued_secrets: &[],
+                    io_error: error.io_error_kind(),
                 });
                 Err((error, diagnostic))
             }
@@ -563,6 +578,7 @@ impl BitwardenCliProvider {
                 input.password,
                 input.issued_secrets,
             ),
+            io_error: input.io_error.map(|kind| format!("{kind:?}")),
         }
     }
 
@@ -1090,6 +1106,23 @@ mod tests {
             issued_session_secrets(&["login".to_owned(), "--check".to_owned()], b"out").is_empty()
         );
         assert!(issued_session_secrets(&["sync".to_owned()], b"out").is_empty());
+    }
+
+    #[test]
+    fn io_error_kind_reports_not_found_for_missing_binary() {
+        let error = std::process::Command::new("tegata-bw-that-does-not-exist")
+            .status()
+            .expect_err("missing binary should fail to spawn");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        let run_error = BwRunError::Process(error, Vec::new());
+        assert_eq!(
+            run_error.io_error_kind(),
+            Some(std::io::ErrorKind::NotFound)
+        );
+        assert_eq!(
+            format!("{:?}", run_error.io_error_kind().unwrap()),
+            "NotFound"
+        );
     }
 
     #[test]

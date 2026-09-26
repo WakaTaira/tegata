@@ -260,6 +260,12 @@ totp_exposable = ["Example Service"]
 session_ttl_secs = 900
 ```
 
+An `[[api_proxy]]` table injects a credential into a fixed upstream API instead
+of a browser login, reached through `open_api_proxy` rather than `login`:
+`[[api_proxy]]` with `name = "tailscale"`, `cred_id = "vw:a1b2c3d4"`, and
+`upstream = "https://api.tailscale.com"`. See [api-proxy.md](api-proxy.md) for
+the full option reference, the NixOS equivalent, and the residual risks.
+
 ### Top level
 
 | Key | Type | Required | Meaning |

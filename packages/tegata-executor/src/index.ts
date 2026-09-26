@@ -7,6 +7,11 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { type Browser, chromium, type Page } from "playwright-core";
+import {
+  type ApiProxy,
+  type ApiProxyRequestRecord,
+  startApiProxy,
+} from "./api-proxy.js";
 
 type FillStep = {
   action: "fill";
@@ -60,11 +65,23 @@ type LeaseRequest = { op: "lease"; id?: RequestId };
 
 type ReleaseRequest = { op: "release"; id?: RequestId; target_id: string };
 
+type ApiProxyStartRequest = {
+  op: "api_proxy_start";
+  id?: RequestId;
+  upstream: string;
+  header: string;
+  header_value: string;
+};
+
+type ApiProxyStopRequest = { op: "api_proxy_stop"; id?: RequestId };
+
 type Request =
   | LoginRequest
   | AuthorizeDeviceRequest
   | LeaseRequest
   | ReleaseRequest
+  | ApiProxyStartRequest
+  | ApiProxyStopRequest
   | { op: "hello"; id?: RequestId }
   | { op: "shutdown"; id?: RequestId };
 
@@ -110,6 +127,7 @@ let activeBrowser: Browser | undefined;
 let activeGuard: CdpGuard | undefined;
 let activeTempDir: string | undefined;
 let activeBrowserContextId: string | undefined;
+let activeApiProxy: ApiProxy | undefined;
 let shuttingDown = false;
 
 type CdpMessage = {
@@ -190,6 +208,23 @@ export function parseRequest(line: string): Request {
   if (value.op === "hello") return { op: "hello", id };
   if (value.op === "shutdown") return { op: "shutdown", id };
   if (value.op === "lease") return { op: "lease", id };
+  if (value.op === "api_proxy_stop") return { op: "api_proxy_stop", id };
+  if (value.op === "api_proxy_start") {
+    if (
+      typeof value.upstream !== "string" ||
+      typeof value.header !== "string" ||
+      typeof value.header_value !== "string"
+    ) {
+      throw new InvalidRequestError(id);
+    }
+    return {
+      op: "api_proxy_start",
+      id,
+      upstream: value.upstream,
+      header: value.header,
+      header_value: value.header_value,
+    };
+  }
   if (value.op === "release") {
     if (typeof value.target_id !== "string") {
       throw new InvalidRequestError(id);
@@ -1053,6 +1088,20 @@ function writeResponse(value: unknown, id?: RequestId): void {
   process.stdout.write(`${JSON.stringify(response)}\n`);
 }
 
+export function formatApiProxyEvent(record: ApiProxyRequestRecord): unknown {
+  return {
+    event: "api_proxy_request",
+    http_method: record.http_method,
+    path: record.path,
+    status: record.status,
+  };
+}
+
+function writeApiProxyEvent(record: ApiProxyRequestRecord): void {
+  // 応答行と同じく 1 回の write で 1 行を出力し、行単位の JSON を保つ。
+  process.stdout.write(`${JSON.stringify(formatApiProxyEvent(record))}\n`);
+}
+
 function monitorGuardFailure(guard: CdpGuard): void {
   void guard.failure.then(undefined, async () => {
     if (shuttingDown) return;
@@ -1218,9 +1267,52 @@ async function handleAuthorizeDevice(
   );
 }
 
+async function closeApiProxy(): Promise<void> {
+  const proxy = activeApiProxy;
+  activeApiProxy = undefined;
+  if (proxy !== undefined) await proxy.close();
+}
+
+async function handleApiProxyStart(
+  request: ApiProxyStartRequest,
+): Promise<void> {
+  if (activeApiProxy !== undefined) {
+    writeResponse(
+      { ok: false, error: "INTERNAL" satisfies ErrorCode },
+      request.id,
+    );
+    return;
+  }
+
+  try {
+    const proxy = await startApiProxy({
+      upstream: request.upstream,
+      header: request.header,
+      headerValue: request.header_value,
+      onRequest: writeApiProxyEvent,
+    });
+    activeApiProxy = proxy;
+    writeResponse(
+      { ok: true, port: proxy.port, secret: proxy.secret },
+      request.id,
+    );
+  } catch {
+    writeResponse(
+      { ok: false, error: "INTERNAL" satisfies ErrorCode },
+      request.id,
+    );
+  }
+}
+
+async function handleApiProxyStop(request: ApiProxyStopRequest): Promise<void> {
+  await closeApiProxy();
+  writeResponse({ ok: true }, request.id);
+}
+
 async function shutdown(request?: { id?: RequestId }): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
+  await closeApiProxy();
   await cleanupResources();
   if (request !== undefined) writeResponse({ ok: true }, request.id);
   process.exit(0);
@@ -1265,6 +1357,14 @@ async function main(): Promise<void> {
       }
       if (request.op === "authorize_device") {
         await handleAuthorizeDevice(request);
+        continue;
+      }
+      if (request.op === "api_proxy_start") {
+        await handleApiProxyStart(request);
+        continue;
+      }
+      if (request.op === "api_proxy_stop") {
+        await handleApiProxyStop(request);
         continue;
       }
       await handleLogin(request);

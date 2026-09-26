@@ -30,6 +30,15 @@ let
       "[[providers]]\n${renderAssignments values}"
       + lib.concatStringsSep "" (map renderEntry provider.entries);
 
+  renderApiProxy = name: proxy:
+    "[[api_proxy]]\n${renderAssignments {
+      inherit name;
+      cred_id = proxy.credId;
+      upstream = proxy.upstream;
+      header = proxy.header;
+      value = proxy.value;
+    }}";
+
   baseConfig = {
     executor_socket = "/run/tegata-executor/executor.sock";
     state_dir = "/var/lib/tegata";
@@ -68,6 +77,8 @@ let
     ${tcpListenConfig}
 
     ${lib.concatStringsSep "\n\n" (map renderProvider cfg.providers)}
+
+    ${lib.concatStringsSep "\n\n" (lib.mapAttrsToList renderApiProxy cfg.apiProxies)}
   '';
 
   allowedUserArgs = lib.concatStringsSep " " (map lib.escapeShellArg cfg.allowedUsers);
@@ -166,6 +177,33 @@ in
       });
       default = [];
       description = "Provider configurations written to the daemon TOML file.";
+    };
+
+    apiProxies = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.submodule {
+        options = {
+          credId = lib.mkOption {
+            type = lib.types.str;
+            description = "The namespaced credential reference whose value is injected.";
+          };
+          upstream = lib.mkOption {
+            type = lib.types.str;
+            description = "The fixed upstream base URL requests are relayed to.";
+          };
+          header = lib.mkOption {
+            type = lib.types.str;
+            default = "Authorization";
+            description = "The header the injected value is written to.";
+          };
+          value = lib.mkOption {
+            type = lib.types.str;
+            default = "Bearer {{secret}}";
+            description = "The header value template; {{secret}} is replaced with the credential's password.";
+          };
+        };
+      });
+      default = {};
+      description = "Injection proxies (open_api_proxy), keyed by the name an agent passes to open_api_proxy.";
     };
 
     executorEntry = lib.mkOption {

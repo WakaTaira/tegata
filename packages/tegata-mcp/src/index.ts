@@ -195,6 +195,37 @@ function rewriteEndpoint(login: ParsedLoginResult, localPort: number) {
   };
 }
 
+type BridgeTunnel =
+  | { localPort: number }
+  | { failure: ReturnType<typeof internalError | typeof errorResult> };
+
+/** bridge にセッションのポートへのトンネルを開かせ、bridge 側のローカルポートを得る。 */
+async function openBridgeTunnel(
+  sessionId: string,
+  port: number,
+): Promise<BridgeTunnel> {
+  const tunnelResponse = await callDaemon("bridge_open_tunnel", {
+    session_id: sessionId,
+    port,
+  });
+  if (tunnelResponse.error !== undefined) {
+    if (typeof tunnelResponse.error.message !== "string")
+      return { failure: internalError() };
+    return { failure: errorResult(tunnelResponse.error.message) };
+  }
+  if (
+    typeof tunnelResponse.result !== "object" ||
+    tunnelResponse.result === null
+  ) {
+    return { failure: internalError() };
+  }
+  const localPort = (tunnelResponse.result as { local_port?: unknown })
+    .local_port;
+  if (typeof localPort !== "number" || !Number.isInteger(localPort))
+    return { failure: internalError() };
+  return { localPort };
+}
+
 export async function loginHandler(params: unknown) {
   try {
     const response = await callDaemon("login", params);
@@ -208,26 +239,73 @@ export async function loginHandler(params: unknown) {
 
     const loginResult = parseLoginResult(response.result);
 
-    const tunnelResponse = await callDaemon("bridge_open_tunnel", {
-      session_id: loginResult.sessionId,
-      port: Number(loginResult.endpoint.port),
-    });
-    if (tunnelResponse.error !== undefined) {
-      if (typeof tunnelResponse.error.message !== "string")
-        return internalError();
-      return errorResult(tunnelResponse.error.message);
+    const tunnel = await openBridgeTunnel(
+      loginResult.sessionId,
+      Number(loginResult.endpoint.port),
+    );
+    if ("failure" in tunnel) return tunnel.failure;
+    return successResult(rewriteEndpoint(loginResult, tunnel.localPort));
+  } catch {
+    return internalError();
+  }
+}
+
+type ParsedApiProxyResult = {
+  result: Record<string, unknown>;
+  sessionId: string;
+  baseUrl: URL;
+};
+
+function parseApiProxyResult(result: unknown): ParsedApiProxyResult {
+  if (typeof result !== "object" || result === null)
+    throw new Error("invalid api proxy result");
+  const proxyResult = result as {
+    session_id?: unknown;
+    base_url?: unknown;
+    [key: string]: unknown;
+  };
+  if (
+    typeof proxyResult.session_id !== "string" ||
+    typeof proxyResult.base_url !== "string"
+  ) {
+    throw new Error("invalid api proxy result");
+  }
+  const baseUrl = new URL(proxyResult.base_url);
+  if (
+    baseUrl.protocol !== "http:" ||
+    baseUrl.hostname !== "127.0.0.1" ||
+    baseUrl.port === ""
+  ) {
+    throw new Error("invalid api proxy base_url");
+  }
+  return { result: proxyResult, sessionId: proxyResult.session_id, baseUrl };
+}
+
+/** ポートだけを bridge のローカルポートへ差し替え、path secret はそのまま残す。 */
+function rewriteBaseUrl(proxy: ParsedApiProxyResult, localPort: number) {
+  const baseUrl = new URL(proxy.baseUrl);
+  baseUrl.port = String(localPort);
+  return { ...proxy.result, base_url: baseUrl.toString() };
+}
+
+export async function openApiProxyHandler(params: unknown) {
+  try {
+    const response = await callDaemon("open_api_proxy", params);
+    if (response.error !== undefined) {
+      if (typeof response.error.message !== "string") return internalError();
+      return errorResult(response.error.message);
     }
-    if (
-      typeof tunnelResponse.result !== "object" ||
-      tunnelResponse.result === null
-    ) {
-      return internalError();
-    }
-    const localPort = (tunnelResponse.result as { local_port?: unknown })
-      .local_port;
-    if (typeof localPort !== "number" || !Number.isInteger(localPort))
-      return internalError();
-    return successResult(rewriteEndpoint(loginResult, localPort));
+    if (!("result" in response)) return internalError();
+    if (process.env.TEGATA_BRIDGE !== "1")
+      return successResult(response.result);
+
+    const proxyResult = parseApiProxyResult(response.result);
+    const tunnel = await openBridgeTunnel(
+      proxyResult.sessionId,
+      Number(proxyResult.baseUrl.port),
+    );
+    if ("failure" in tunnel) return tunnel.failure;
+    return successResult(rewriteBaseUrl(proxyResult, tunnel.localPort));
   } catch {
     return internalError();
   }
@@ -270,6 +348,16 @@ server.registerTool(
     },
   },
   (args) => forward("authorize_device", args),
+);
+
+server.registerTool(
+  "open_api_proxy",
+  {
+    description:
+      "Open a configured API proxy that injects a stored credential into requests to its fixed upstream. Send requests to base_url followed by the upstream path; close it with logout.",
+    inputSchema: { name: z.string() },
+  },
+  (args) => openApiProxyHandler(args),
 );
 
 server.registerTool(

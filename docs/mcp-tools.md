@@ -297,6 +297,38 @@ returns `DEVICE_CODE_REJECTED`, including when it renders while a step is still
 waiting for its selector. Approval hooks can also return `APPROVAL_DENIED`
 or `APPROVAL_TIMEOUT`.
 
+## `open_api_proxy`
+
+Opens a loopback HTTP relay that injects a credential's value into a fixed
+upstream API. The agent gets a URL that already carries the token's authority
+without ever seeing the token itself. See [api-proxy.md](api-proxy.md) for
+configuration and the full residual-risk discussion.
+
+**Input**
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `name` | string | yes | The name of a configured `[[api_proxy]]` entry |
+
+**Output**
+
+```json
+{ "session_id": "3f2b1c9e-...", "base_url": "http://127.0.0.1:41263/Ax7f...q2" }
+```
+
+`base_url` already includes the path secret. A request to `<base_url>/<path>`
+is relayed to the configured `upstream`'s `<path>` with the configured header
+replaced by the injected value; a request missing the secret, or carrying a
+different session's secret, gets a 404 and never reaches upstream. `session_id`
+is what `logout` takes to close the relay.
+
+An unknown `name` returns `NOT_FOUND`. Where an approval hook is configured, it
+gates `open_api_proxy` the same way it gates `login`, with `TEGATA_METHOD` set
+to `open_api_proxy` and `TEGATA_TARGET_URL` set to the proxy's upstream.
+
+The lease this opens behaves like any other session: it has a TTL, `logout`
+ends it early, and `lock_vault` closes every proxy in the locked namespace.
+
 ## `get_totp`
 
 Returns the *current code* for a credential explicitly marked as exposable. Never

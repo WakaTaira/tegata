@@ -141,6 +141,51 @@ pub struct ExecutorLeaseResponse {
     pub error: Option<String>,
 }
 
+/// `open_api_proxy` RPC のパラメータ。agent は `[[api_proxy]]` の名前でのみ選び、上流は指定できない。
+#[derive(Deserialize)]
+pub struct OpenApiProxyParams {
+    pub name: String,
+}
+
+/// 専用の executor 接続で注入プロキシのリスナーを起動する要求。
+///
+/// `header_value` は解決済みの秘密を含むため、executor へ書き込む以外の用途（ログ・監査）に出してはならない。
+#[derive(Serialize)]
+pub struct ExecutorApiProxyStartRequest {
+    pub op: &'static str,
+    pub id: u64,
+    pub upstream: String,
+    pub header: String,
+    pub header_value: String,
+}
+
+/// `api_proxy_start` への応答。成功時は loopback のポートと path secret を持つ。
+#[derive(Deserialize)]
+pub struct ExecutorApiProxyStartResponse {
+    pub id: Option<u64>,
+    pub ok: bool,
+    pub port: Option<u16>,
+    pub secret: Option<String>,
+    pub error: Option<String>,
+}
+
+/// executor 接続の注入プロキシのリスナーを閉じる要求。
+#[derive(Serialize)]
+pub struct ExecutorApiProxyStopRequest {
+    pub op: &'static str,
+    pub id: u64,
+}
+
+/// プロキシ経由の要求 1 件ごとに executor が書くイベント行。`id` を持たないため、
+/// 応答待ちの要求と照合されることはない。`path` は path secret と query を除去済みである。
+#[derive(Deserialize)]
+pub struct ExecutorApiProxyRequestEvent {
+    pub event: String,
+    pub http_method: String,
+    pub path: String,
+    pub status: u16,
+}
+
 /// Preamble version understood by this build.
 pub const PREAMBLE_VERSION: u32 = 1;
 

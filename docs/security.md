@@ -116,10 +116,11 @@ to container peers as well: sessions owned by another principal return
 
 ### 3. Only a thin, allowlisted RPC crosses the boundary
 
-Seven methods exist: `status`, `list_credentials`, `login`, `authorize_device`,
-`logout`, `get_totp`, `lock_vault`, plus two administrative methods on Windows. Anything else is
-answered with a JSON-RPC method-not-found error. There is no generic "run this on
-the isolated side" call, because such a call would be the boundary's own bypass.
+Eight methods exist: `status`, `list_credentials`, `login`, `authorize_device`,
+`open_api_proxy`, `logout`, `get_totp`, `lock_vault`, plus two administrative
+methods on Windows. Anything else is answered with a JSON-RPC method-not-found
+error. There is no generic "run this on the isolated side" call, because such a
+call would be the boundary's own bypass.
 
 Every response is scanned before it is written. The daemon keeps a registry of the
 secret values it has resolved during its lifetime and runs the outgoing response
@@ -270,7 +271,8 @@ legitimate `login` from one an injected instruction talked the agent into making
 both are the same call for a credential the agent is entitled to use. The answer to
 that is not a better boundary; it is a human.
 
-Setting `approve_cmd` gates every `login` and `authorize_device` on an external command. The daemon runs
+Setting `approve_cmd` gates every `login`, `authorize_device`, and
+`open_api_proxy` on an external command. The daemon runs
 it through `sh -c` on the isolated side and reads the exit status as the verdict:
 zero approves, anything else denies with `APPROVAL_DENIED`. A command that has not
 answered within `approve_timeout_secs` — 60 by default — has its whole process
@@ -296,8 +298,8 @@ environment variables:
 | Variable | Contents |
 | --- | --- |
 | `TEGATA_CRED_ID` | The namespaced credential reference being requested |
-| `TEGATA_TARGET_URL` | The login destination, or for `authorize_device` the verification URL with its query, fragment, and userinfo removed |
-| `TEGATA_METHOD` | `login` or `authorize_device` |
+| `TEGATA_TARGET_URL` | The login destination, for `authorize_device` the verification URL with its query, fragment, and userinfo removed, or for `open_api_proxy` the API proxy's upstream |
+| `TEGATA_METHOD` | `login`, `authorize_device`, or `open_api_proxy` |
 | `TEGATA_PEER` | The calling peer's uid, in decimal |
 
 That is enough for a human to make a decision — *which* account, at *which* site,

@@ -14,7 +14,7 @@ mod windows_cli;
 #[cfg(windows)]
 mod windows_service;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -27,9 +27,10 @@ use leakscan::scan_bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tegata_core::wire::{
-    AuthorizeDeviceParams, ExecutorAuthorizeDeviceRequest, ExecutorLeaseRequest,
-    ExecutorLoginRequest, ExecutorReleaseRequest, ExecutorResponse, ExecutorSecret, LoginParams,
-    RpcError, RpcRequest, RpcResponse,
+    AuthorizeDeviceParams, ExecutorApiProxyRequestEvent, ExecutorApiProxyStartRequest,
+    ExecutorApiProxyStartResponse, ExecutorApiProxyStopRequest, ExecutorAuthorizeDeviceRequest,
+    ExecutorLeaseRequest, ExecutorLoginRequest, ExecutorReleaseRequest, ExecutorResponse,
+    ExecutorSecret, LoginParams, OpenApiProxyParams, RpcError, RpcRequest, RpcResponse,
 };
 #[cfg(unix)]
 use tegata_core::wire::{ExecutorHelloRequest, ExecutorHelloResponse};
@@ -40,11 +41,10 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, interval, timeout};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 #[cfg(windows)]
 use tegata_core::wire::AdminSealParams;
-#[cfg(windows)]
-use zeroize::Zeroize;
 
 #[cfg(feature = "mock-provider")]
 use crate::provider::StaticProvider;
@@ -120,6 +120,8 @@ struct Config {
     listen: Option<Vec<ListenConfig>>,
     #[serde(default = "default_max_pending_connections")]
     max_pending_connections: usize,
+    #[serde(default)]
+    api_proxy: Vec<ApiProxyConfig>,
     /// Keys of the platform transport, read from the same top level table.
     /// Which keys those are depends on the target, so the transport module
     /// owns them.
@@ -129,6 +131,103 @@ struct Config {
 
 fn default_max_pending_connections() -> usize {
     8
+}
+
+/// `[[api_proxy]]` の 1 項目。agent は `name` で選ぶだけで、上流・注入ヘッダは設定で固定される。
+#[derive(Clone, Debug, Deserialize)]
+struct ApiProxyConfig {
+    name: String,
+    cred_id: String,
+    upstream: String,
+    #[serde(default = "default_api_proxy_header")]
+    header: String,
+    #[serde(default = "default_api_proxy_value")]
+    value: String,
+}
+
+const API_PROXY_SECRET_PLACEHOLDER: &str = "{{secret}}";
+
+fn default_api_proxy_header() -> String {
+    "Authorization".to_owned()
+}
+
+fn default_api_proxy_value() -> String {
+    format!("Bearer {API_PROXY_SECRET_PLACEHOLDER}")
+}
+
+/// 起動を拒否すべき `[[api_proxy]]` の設定誤りを検出する。
+fn validate_api_proxies(proxies: &[ApiProxyConfig]) -> Result<(), String> {
+    let mut names = HashSet::new();
+    for proxy in proxies {
+        if !names.insert(proxy.name.as_str()) {
+            return Err(format!(
+                "api_proxy \"{}\" is defined more than once",
+                proxy.name
+            ));
+        }
+        if !api_proxy_upstream_allowed(&proxy.upstream) {
+            return Err(format!(
+                "api_proxy \"{}\": upstream must be https:// or http:// on a loopback host (127.0.0.1, ::1, localhost)",
+                proxy.name
+            ));
+        }
+        if !proxy.value.contains(API_PROXY_SECRET_PLACEHOLDER) {
+            return Err(format!(
+                "api_proxy \"{}\": value must contain {API_PROXY_SECRET_PLACEHOLDER}",
+                proxy.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 上流が `https://`、または loopback ホストの `http://` であるかを判定する。
+///
+/// executor（WHATWG URL）と解釈が食い違いうる文字（制御文字・空白・バックスラッシュ）や、
+/// 解釈できないポートを含む値は、判定の取り違えを避けるため一律に拒否する。
+fn api_proxy_upstream_allowed(upstream: &str) -> bool {
+    if upstream
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace() || character == '\\')
+    {
+        return false;
+    }
+    let Some((scheme, remainder)) = upstream.split_once("://") else {
+        return false;
+    };
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host_port)| host_port);
+    let (host, port) = match host_port.strip_prefix('[') {
+        Some(bracketed) => match bracketed.split_once(']') {
+            Some((host, "")) => (host, None),
+            Some((host, tail)) => match tail.strip_prefix(':') {
+                Some(port) => (host, Some(port)),
+                None => return false,
+            },
+            None => return false,
+        },
+        None => match host_port.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (host_port, None),
+        },
+    };
+    if host.is_empty()
+        || port.is_some_and(|port| {
+            !port.is_empty()
+                && (!port.chars().all(|character| character.is_ascii_digit())
+                    || port.parse::<u16>().is_err())
+        })
+    {
+        return false;
+    }
+    if scheme.eq_ignore_ascii_case("https") {
+        return true;
+    }
+    scheme.eq_ignore_ascii_case("http")
+        && (host == "127.0.0.1" || host == "::1" || host.eq_ignore_ascii_case("localhost"))
 }
 
 fn normalize_listeners(config_text: &str, config: &Config) -> Result<Vec<ListenConfig>, io::Error> {
@@ -316,6 +415,7 @@ struct DaemonState {
     #[cfg(windows)]
     approvals: approvals::ApprovalQueue,
     peers: peers::SharedPeerStore,
+    api_proxies: HashMap<String, ApiProxyConfig>,
     #[cfg(windows)]
     sealed_blob_path: PathBuf,
 }
@@ -388,6 +488,8 @@ struct AuditRecord<'a> {
     method: String,
     #[serde(flatten)]
     fields: AuditFields,
+    #[serde(flatten)]
+    api_proxy: ApiProxyAuditFields,
     outcome: String,
 }
 
@@ -403,6 +505,19 @@ struct AuditFields {
     approval_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     approval_allow: Option<bool>,
+}
+
+/// 注入プロキシ経由の要求を記録する監査項目。他の監査行では全項目が省略される。
+#[derive(Default, Serialize)]
+struct ApiProxyAuditFields {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proxy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -686,6 +801,7 @@ async fn run_daemon(
     let config_text = tokio::fs::read_to_string(config_path).await?;
     let config: Config = toml::from_str(&config_text)?;
     let listeners = normalize_listeners(&config_text, &config)?;
+    validate_api_proxies(&config.api_proxy)?;
     #[cfg(unix)]
     if let Some(path) = config.executor_socket.as_deref() {
         let uid = validate_executor_socket(path).await?;
@@ -965,6 +1081,11 @@ async fn build_state(
     let bw_path = resolve_bw_path(&config);
     let session_ttl = Duration::from_secs(config.session_ttl_secs.unwrap_or(300));
     let state_dir = PathBuf::from(&config.state_dir);
+    let api_proxies = config
+        .api_proxy
+        .iter()
+        .map(|proxy| (proxy.name.clone(), proxy.clone()))
+        .collect();
     let mut providers = Vec::new();
     let mut version_logged = false;
     for provider in config.providers {
@@ -1059,6 +1180,7 @@ async fn build_state(
         #[cfg(windows)]
         approvals: approvals::ApprovalQueue::new(),
         peers,
+        api_proxies,
         #[cfg(windows)]
         sealed_blob_path,
     })
@@ -1210,7 +1332,7 @@ fn spawn_session_reaper(state: SharedState) {
                 expired
             };
             for (session_id, lease, executor, namespace, shutdown) in expired {
-                let release_failed = executor_release(&executor, lease.target_id).await.is_err();
+                let release_failed = release_lease(&executor, &lease.target).await.is_err();
                 if shutdown || release_failed {
                     shutdown_executor(executor).await;
                 }
@@ -1332,6 +1454,9 @@ async fn serve_connection<S>(
                         .map(ToOwned::to_owned);
                     fields.shared = handled.audit_shared;
                 }
+                if request.method == "open_api_proxy" {
+                    fields = open_api_proxy_audit_fields(&state, &request.params, &handled).await;
+                }
                 if let Some((approval_id, allow)) = handled.audit_approval {
                     fields.approval_id = Some(approval_id);
                     fields.approval_allow = Some(allow);
@@ -1363,6 +1488,39 @@ async fn serve_connection<S>(
         {
             break;
         }
+    }
+}
+
+/// `open_api_proxy` の監査項目を設定から組み立てる。agent が params に添えた
+/// `cred_id` などは記録せず、名前で引いた設定の値のみを用いる。
+async fn open_api_proxy_audit_fields(
+    state: &SharedState,
+    params: &Value,
+    handled: &HandledRequest,
+) -> AuditFields {
+    let proxy = match params.get("name").and_then(Value::as_str) {
+        Some(name) => state.lock().await.api_proxies.get(name).cloned(),
+        None => None,
+    };
+    let session_id = handled
+        .response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("session_id"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    AuditFields {
+        namespace: proxy.as_ref().and_then(|proxy| {
+            proxy
+                .cred_id
+                .split_once(':')
+                .map(|(namespace, _)| namespace.to_owned())
+        }),
+        cred_id: proxy.as_ref().map(|proxy| proxy.cred_id.clone()),
+        target_url: proxy.map(|proxy| proxy.upstream),
+        session_id,
+        shared: None,
+        ..AuditFields::default()
     }
 }
 
@@ -1445,6 +1603,25 @@ async fn append_audit(
     fields: AuditFields,
     outcome: String,
 ) -> Result<(), AppendAuditError> {
+    append_audit_record(
+        state,
+        peer,
+        method,
+        fields,
+        ApiProxyAuditFields::default(),
+        outcome,
+    )
+    .await
+}
+
+async fn append_audit_record(
+    state: &DaemonState,
+    peer: AuditPeer<'_>,
+    method: String,
+    fields: AuditFields,
+    api_proxy: ApiProxyAuditFields,
+    outcome: String,
+) -> Result<(), AppendAuditError> {
     let _guard = state.audit_lock.lock().await;
     let record = AuditRecord {
         ts: SystemTime::now()
@@ -1454,6 +1631,7 @@ async fn append_audit(
         peer,
         method,
         fields,
+        api_proxy,
         outcome,
     };
     let mut bytes = serde_json::to_vec(&record).map_err(AppendAuditError::Serialize)?;
@@ -1549,6 +1727,7 @@ async fn handle_request(
         "list_credentials" => list_credentials(request, state).await,
         "login" => login(request, state, peer).await,
         "authorize_device" => authorize_device(request, state, peer).await,
+        "open_api_proxy" => open_api_proxy(request, state, peer).await,
         "logout" => logout(request, state, peer).await,
         "get_totp" => get_totp(request, state).await,
         "lock_vault" => lock_vault(request, state).await,
@@ -1812,7 +1991,7 @@ async fn join_browser(
     let lease = sessions::Lease {
         principal: principal.to_owned(),
         expires_at: Instant::now() + ttl,
-        target_id: target_id.clone(),
+        target: sessions::LeaseTarget::Tab(target_id.clone()),
     };
     let mut daemon = state.lock().await;
     let Some(cdp_port) = daemon
@@ -1973,7 +2152,7 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
             sessions::Lease {
                 principal: principal.clone(),
                 expires_at: Instant::now() + ttl,
-                target_id,
+                target: sessions::LeaseTarget::Tab(target_id),
             },
         )]),
         exclusive: request_params.exclusive,
@@ -1991,7 +2170,7 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
         daemon.shared_browsers.insert(key, browser_id.clone());
     }
     drop(daemon);
-    spawn_executor_reaper(state.clone(), browser_id, reader, response_sender);
+    spawn_executor_reaper(state.clone(), browser_id, reader, response_sender, None);
     success(
         request.id.clone(),
         json!({
@@ -2068,6 +2247,146 @@ async fn authorize_device(
         Ok(()) => success(request.id.clone(), json!({ "ok": true })),
         Err(error) => classified(request.id.clone(), error),
     }
+}
+
+/// 設定済みの注入プロキシを専用の executor 接続で起動し、排他リースとして登録する。
+async fn open_api_proxy(
+    request: &RpcRequest,
+    state: SharedState,
+    peer: &PeerIdentity,
+) -> HandledRequest {
+    let params = match parse_params::<OpenApiProxyParams>(&request.params) {
+        Ok(params) => params,
+        Err(error) => return classified(request.id.clone(), error),
+    };
+    let Some(proxy) = state.lock().await.api_proxies.get(&params.name).cloned() else {
+        return classified(request.id.clone(), ErrorCode::NotFound);
+    };
+    let Some((namespace, _)) = proxy.cred_id.split_once(':') else {
+        return classified(request.id.clone(), ErrorCode::InvalidCredential);
+    };
+    let namespace = namespace.to_owned();
+    #[cfg(unix)]
+    if state.lock().await.approve_cmd.is_some() {
+        let credential_state = match credential_state(&state, &proxy.cred_id).await {
+            Ok(Some(locked)) => locked,
+            Ok(None) => return classified(request.id.clone(), ErrorCode::InvalidCredential),
+            Err(error) => return classified(request.id.clone(), error),
+        };
+        if credential_state {
+            return classified(request.id.clone(), ErrorCode::VaultLocked);
+        }
+        if let Err(error) = approve_command(
+            &state,
+            &proxy.cred_id,
+            &proxy.upstream,
+            "open_api_proxy",
+            peer,
+        )
+        .await
+        {
+            return classified(request.id.clone(), error);
+        }
+    }
+    let (credential, executor_entry, executor_socket, node_path, browsers_path, ttl) = {
+        let credential = match resolve_credential(&state, &proxy.cred_id).await {
+            Ok(Some(credential)) => credential,
+            Ok(None) => return classified(request.id.clone(), ErrorCode::InvalidCredential),
+            Err(error) => return classified(request.id.clone(), error),
+        };
+        if credential.locked {
+            return classified(request.id.clone(), ErrorCode::VaultLocked);
+        }
+        let daemon = state.lock().await;
+        (
+            credential,
+            daemon.executor_entry.clone(),
+            daemon.executor_socket.clone(),
+            daemon.node_path.clone(),
+            daemon.browsers_path.clone(),
+            daemon.session_ttl,
+        )
+    };
+    let header_value = proxy
+        .value
+        .replace(API_PROXY_SECRET_PLACEHOLDER, credential.password.as_str());
+    drop(credential);
+    let (port, secret, mut executor) = match start_api_proxy_executor(
+        &executor_entry,
+        executor_socket.as_deref(),
+        &node_path,
+        browsers_path.as_deref(),
+        &proxy,
+        header_value,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => return classified(request.id.clone(), error),
+    };
+    let Some(reader) = executor.take_reader() else {
+        stop_child(executor).await;
+        return classified(request.id.clone(), ErrorCode::Internal);
+    };
+    let (response_sender, response_receiver) = mpsc::unbounded_channel();
+    let connection = Arc::new(ExecutorConnection {
+        executor: Mutex::new(executor),
+        responses: Mutex::new(response_receiver),
+        operation: Mutex::new(()),
+        next_id: AtomicU64::new(2),
+    });
+    let principal = peer.principal();
+    let session_id = Uuid::new_v4().to_string();
+    // プロキシは共有しないため shared_browsers には登録しない。endpoint は CDP の
+    // 相乗りにのみ使われる値であり、path secret を残さないよう空とする。
+    let browser = sessions::Browser {
+        key: sessions::BrowserKey::new(principal.clone(), namespace.clone(), proxy.cred_id.clone()),
+        executor: connection.clone(),
+        cdp_port: port,
+        endpoint: String::new(),
+        leases: HashMap::from([(
+            session_id.clone(),
+            sessions::Lease {
+                principal: principal.clone(),
+                expires_at: Instant::now() + ttl,
+                target: sessions::LeaseTarget::ApiProxy,
+            },
+        )]),
+        exclusive: true,
+    };
+    let cdp_ports = state.lock().await.cdp_ports.clone();
+    if let Ok(mut ports) = cdp_ports.write() {
+        ports.insert(session_id.clone(), (principal, port));
+    } else {
+        shutdown_executor(connection).await;
+        return classified(request.id.clone(), ErrorCode::Internal);
+    }
+    let browser_id = Uuid::new_v4().to_string();
+    state
+        .lock()
+        .await
+        .browsers
+        .insert(browser_id.clone(), browser);
+    spawn_executor_reaper(
+        state.clone(),
+        browser_id,
+        reader,
+        response_sender,
+        Some(ApiProxyAuditContext {
+            session_id: session_id.clone(),
+            namespace,
+            name: proxy.name,
+            cred_id: proxy.cred_id,
+            peer: peer.clone(),
+        }),
+    );
+    success(
+        request.id.clone(),
+        json!({
+            "session_id": session_id,
+            "base_url": format!("http://127.0.0.1:{port}/{secret}"),
+        }),
+    )
 }
 
 async fn credential_metadata(
@@ -2378,7 +2697,7 @@ async fn logout(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) -
         Some((lease, executor, empty, namespace))
     };
     if let Some((lease, executor, empty, _)) = removed {
-        let release_failed = executor_release(&executor, lease.target_id).await.is_err();
+        let release_failed = release_lease(&executor, &lease.target).await.is_err();
         if empty || release_failed {
             shutdown_executor(executor).await;
         }
@@ -2499,7 +2818,7 @@ async fn terminate_browser(state: &SharedState, browser: sessions::Browser) {
     let namespace = browser.key.namespace.clone();
     let leases = browser.leases.into_iter().collect::<Vec<_>>();
     for (_, lease) in &leases {
-        if executor_release(&browser.executor, lease.target_id.clone())
+        if release_lease(&browser.executor, &lease.target)
             .await
             .is_err()
         {
@@ -2559,7 +2878,7 @@ async fn terminate_peer_leases(state: SharedState, peer_id: &str) {
         removed
     };
     for (session_id, lease, executor, namespace, shutdown) in removed {
-        let _ = executor_release(&executor, lease.target_id).await;
+        let _ = release_lease(&executor, &lease.target).await;
         if shutdown {
             shutdown_executor(executor).await;
         }
@@ -2916,6 +3235,70 @@ async fn shutdown_authorize_executor(executor: &mut ExecutorHandle) {
     }
 }
 
+/// executor 接続を 1 本開き、`api_proxy_start` を送ってリスナーのポートと path secret を受け取る。
+async fn start_api_proxy_executor(
+    entry: &Path,
+    executor_socket: Option<&Path>,
+    node_path: &Path,
+    browsers_path: Option<&Path>,
+    proxy: &ApiProxyConfig,
+    header_value: String,
+) -> Result<(u16, String, ExecutorHandle), ErrorCode> {
+    let mut executor = connect_executor(entry, executor_socket, node_path, browsers_path).await?;
+    let result = async {
+        let request = ExecutorApiProxyStartRequest {
+            op: "api_proxy_start",
+            id: 1,
+            upstream: proxy.upstream.clone(),
+            header: proxy.header.clone(),
+            header_value,
+        };
+        let mut line = serde_json::to_vec(&request).map_err(|_| ErrorCode::Internal)?;
+        drop(request);
+        line.push(b'\n');
+        let written = executor.write_line(&line).await;
+        line.zeroize();
+        written.map_err(|_| ErrorCode::Internal)?;
+        let response_line = timeout(EXECUTOR_TIMEOUT, executor.read_line())
+            .await
+            .map_err(|_| ErrorCode::Internal)?
+            .map_err(|_| ErrorCode::Internal)?;
+        if response_line.is_empty() {
+            return Err(ErrorCode::Internal);
+        }
+        let response: ExecutorApiProxyStartResponse =
+            serde_json::from_str(&response_line).map_err(|_| ErrorCode::Internal)?;
+        if response.id != Some(1) || !response.ok {
+            return Err(ErrorCode::Internal);
+        }
+        let port = response
+            .port
+            .filter(|port| *port != 0)
+            .ok_or(ErrorCode::Internal)?;
+        let secret = response
+            .secret
+            .filter(|secret| valid_api_proxy_secret(secret))
+            .ok_or(ErrorCode::Internal)?;
+        Ok((port, secret))
+    }
+    .await;
+    match result {
+        Ok((port, secret)) => Ok((port, secret, executor)),
+        Err(error) => {
+            stop_child(executor).await;
+            Err(error)
+        }
+    }
+}
+
+/// path secret は base_url の 1 セグメントとしてそのまま埋め込むため、base64url の文字だけを受け入れる。
+fn valid_api_proxy_secret(secret: &str) -> bool {
+    !secret.is_empty()
+        && secret
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
 fn cdp_port_from_endpoint(endpoint: &str) -> Option<u16> {
     let authority = endpoint.split_once("://")?.1.split('/').next()?;
     let port = authority.rsplit_once(':')?.1.parse().ok()?;
@@ -3026,6 +3409,30 @@ async fn executor_release(
     })
 }
 
+async fn executor_api_proxy_stop(connection: &Arc<ExecutorConnection>) -> Result<(), ErrorCode> {
+    let response = executor_request(connection, |id| ExecutorApiProxyStopRequest {
+        op: "api_proxy_stop",
+        id,
+    })
+    .await?;
+    (response.get("ok").and_then(Value::as_bool) == Some(true))
+        .then_some(())
+        .ok_or(ErrorCode::Internal)
+}
+
+/// リースが占有する executor 上の資源を、その種類に応じた要求で解放する。
+async fn release_lease(
+    connection: &Arc<ExecutorConnection>,
+    target: &sessions::LeaseTarget,
+) -> Result<(), ErrorCode> {
+    match target {
+        sessions::LeaseTarget::Tab(target_id) => {
+            executor_release(connection, target_id.clone()).await
+        }
+        sessions::LeaseTarget::ApiProxy => executor_api_proxy_stop(connection).await,
+    }
+}
+
 async fn shutdown_executor(connection: Arc<ExecutorConnection>) {
     let Ok(operation) = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, connection.operation.lock()).await
     else {
@@ -3124,11 +3531,63 @@ async fn stop_child(mut executor: ExecutorHandle) {
     }
 }
 
+/// 注入プロキシの executor が書くイベント行を監査へ記録するための文脈。
+struct ApiProxyAuditContext {
+    session_id: String,
+    namespace: String,
+    name: String,
+    cred_id: String,
+    peer: PeerIdentity,
+}
+
+/// `id` を持たず `event` を持つ行を executor のイベントとして取り出す。
+/// イベント行を応答チャネルへ流すと、id 照合中の要求が取り違えを検出して executor を停止させるため、ここで分離する。
+fn executor_event(line: &str) -> Option<Value> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    (value.get("id").is_none() && value.get("event").is_some()).then_some(value)
+}
+
+async fn audit_api_proxy_event(state: &SharedState, context: &ApiProxyAuditContext, event: Value) {
+    let event = match serde_json::from_value::<ExecutorApiProxyRequestEvent>(event) {
+        Ok(event) if event.event == "api_proxy_request" => event,
+        _ => {
+            eprintln!("tegatad: ignored an unrecognized executor event");
+            return;
+        }
+    };
+    let daemon = state.lock().await;
+    if let Err(error) = append_audit_record(
+        &daemon,
+        AuditPeer::Peer(&context.peer),
+        "api_proxy_request".to_owned(),
+        AuditFields {
+            cred_id: Some(context.cred_id.clone()),
+            target_url: None,
+            session_id: Some(context.session_id.clone()),
+            namespace: Some(context.namespace.clone()),
+            shared: None,
+            ..AuditFields::default()
+        },
+        ApiProxyAuditFields {
+            proxy: Some(context.name.clone()),
+            http_method: Some(event.http_method),
+            path: Some(event.path),
+            status: Some(event.status),
+        },
+        "ok".to_owned(),
+    )
+    .await
+    {
+        eprintln!("tegatad: audit append failed: {error}");
+    }
+}
+
 fn spawn_executor_reaper(
     state: SharedState,
     browser_id: String,
     mut reader: ExecutorReader,
     sender: mpsc::UnboundedSender<io::Result<String>>,
+    api_proxy: Option<ApiProxyAuditContext>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -3142,6 +3601,12 @@ fn spawn_executor_reaper(
             };
             match result {
                 Ok(line) if !line.is_empty() => {
+                    if let Some(event) = executor_event(&line) {
+                        if let Some(context) = &api_proxy {
+                            audit_api_proxy_event(&state, context, event).await;
+                        }
+                        continue;
+                    }
                     if sender.send(Ok(line)).is_err() {
                         return;
                     }
@@ -3317,6 +3782,7 @@ mod tests {
             peer: AuditPeer::Peer(&peer),
             method: "status".to_owned(),
             fields: AuditFields::default(),
+            api_proxy: super::ApiProxyAuditFields::default(),
             outcome: "ok".to_owned(),
         };
         assert_eq!(

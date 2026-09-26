@@ -119,16 +119,10 @@ pub(crate) fn run_windows_cli(
             println!("{token}");
             eprintln!("{peer_id}");
         }
-        "admin_peer_list" => {
+        "admin_peer_list" | "admin_approval_list" => {
             let result = response
                 .get("result")
-                .ok_or("admin_peer_list returned no result")?;
-            println!("{}", serde_json::to_string(result)?);
-        }
-        "admin_approval_list" => {
-            let result = response
-                .get("result")
-                .ok_or("admin_approval_list returned no result")?;
+                .ok_or_else(|| format!("{method} returned no result"))?;
             println!("{}", serde_json::to_string(result)?);
         }
         "admin_peer_revoke" => {}

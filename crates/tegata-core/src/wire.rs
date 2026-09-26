@@ -29,6 +29,8 @@ pub struct RpcResponse {
 pub struct RpcError {
     pub code: i32,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -108,13 +110,14 @@ pub struct ExecutorSecret {
 
 /// Executor response returned as one JSON line after a login attempt. A
 /// successful response contains a browser endpoint; a failed response carries
-/// a classification code.
+/// a classification code and may carry an explicit-step index.
 #[derive(Deserialize)]
 pub struct ExecutorResponse {
     pub id: Option<u64>,
     pub ok: bool,
     pub endpoint: Option<String>,
     pub error: Option<String>,
+    pub step: Option<Value>,
     pub target_id: Option<String>,
 }
 

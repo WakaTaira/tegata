@@ -48,10 +48,10 @@ the response has `isError: true` and the text is a bare classification code:
 INVALID_CREDENTIAL
 ```
 
-That is the whole message. There is no detail field, no stack trace, and no echo
-of the input — see [security.md](security.md#how-secrets-move-on-the-isolated-side)
-for why. A code the broker does not recognise is normalised to `INTERNAL`, so an
-unexpected daemon response cannot smuggle text out through the error path.
+That is the whole text message. It contains no stack trace and no echo of the
+input — see [security.md](security.md#how-secrets-move-on-the-isolated-side)
+for why. A code the broker does not recognise is passed through when it matches
+the public code format; arbitrary daemon text is normalised to `INTERNAL`.
 
 ### Classification codes
 
@@ -69,6 +69,10 @@ unexpected daemon response cannot smuggle text out through the error path.
 | `PROVIDER_UNAVAILABLE` | A transient failure of the credential provider (for example the Bitwarden CLI failing or timing out right after a daemon restart); the call may be retried. Returned by `list_credentials`, `login`, `get_totp`, and `lock_vault` when they call a provider |
 | `NOT_FOUND` | The session does not exist or belongs to another principal; its existence is not disclosed |
 | `INTERNAL` | Anything else, including a refused response that failed the leak scan |
+
+For an explicit `steps` array, `structuredContent.step` is the zero-based index
+of the step whose selector failed. Automatic mode and selector failures outside
+an explicit `steps` array omit this field.
 
 `INVALID_CREDENTIAL` covers both "no such credential" and "the site said no" on
 purpose: distinguishing them would tell an agent which identifiers are real.

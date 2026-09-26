@@ -16,6 +16,7 @@ const ERROR_CODES = [
   "INVALID_CREDENTIAL",
   "MFA_REQUIRED",
   "SELECTOR_NOT_FOUND",
+  "DEVICE_CODE_REJECTED",
   "VAULT_LOCKED",
   "RATE_LIMITED",
   "NOT_FOUND",
@@ -31,6 +32,23 @@ const loginStep = z.union([
     action: z.literal("fill"),
     selector: z.string(),
     value: z.enum(["{{username}}", "{{password}}", "{{totp}}"]),
+  }),
+  z.object({
+    action: z.literal("click"),
+    selector: z.string(),
+  }),
+]);
+
+const authorizeDeviceStep = z.union([
+  z.object({
+    action: z.literal("fill"),
+    selector: z.string(),
+    value: z.enum([
+      "{{username}}",
+      "{{password}}",
+      "{{totp}}",
+      "{{user_code}}",
+    ]),
   }),
   z.object({
     action: z.literal("click"),
@@ -235,6 +253,22 @@ server.registerTool(
     },
   },
   (args) => loginHandler(args),
+);
+
+server.registerTool(
+  "authorize_device",
+  {
+    description: "Authorize an OAuth device flow with a stored credential.",
+    inputSchema: {
+      cred_id: z.string(),
+      verification_url: z.string(),
+      user_code: z.string(),
+      steps: z.array(authorizeDeviceStep).optional(),
+      success_selector: z.string(),
+      failure_selector: z.string().optional(),
+    },
+  },
+  (args) => forward("authorize_device", args),
 );
 
 server.registerTool(

@@ -39,6 +39,16 @@ pub struct LoginParams {
     pub failure_selector: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct AuthorizeDeviceParams {
+    pub cred_id: String,
+    pub verification_url: String,
+    pub user_code: String,
+    pub steps: Option<Vec<LoginStep>>,
+    pub success_selector: String,
+    pub failure_selector: Option<String>,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub struct LoginStep {
     pub action: String,
@@ -71,6 +81,19 @@ pub struct ExecutorLoginRequest {
     pub target_url: String,
     pub steps: Option<Vec<LoginStep>>,
     pub success_selector: Option<String>,
+    pub failure_selector: Option<String>,
+    pub secret: ExecutorSecret,
+}
+
+#[derive(Serialize)]
+pub struct ExecutorAuthorizeDeviceRequest {
+    pub op: &'static str,
+    pub id: u64,
+    pub login_url: String,
+    pub verification_url: String,
+    pub user_code: String,
+    pub steps: Option<Vec<LoginStep>>,
+    pub success_selector: String,
     pub failure_selector: Option<String>,
     pub secret: ExecutorSecret,
 }

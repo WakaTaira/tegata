@@ -5,6 +5,7 @@ import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 import { type Browser, chromium, type Page } from "playwright-core";
 
 type FillStep = {
@@ -13,12 +14,19 @@ type FillStep = {
   value: "{{username}}" | "{{password}}" | "{{totp}}";
 };
 
+type DeviceFillStep = {
+  action: "fill";
+  selector: string;
+  value: FillStep["value"] | "{{user_code}}";
+};
+
 type ClickStep = {
   action: "click";
   selector: string;
 };
 
 type LoginStep = FillStep | ClickStep;
+type DeviceStep = DeviceFillStep | ClickStep;
 
 type RequestId = number;
 
@@ -36,12 +44,25 @@ type LoginRequest = {
   };
 };
 
+type AuthorizeDeviceRequest = {
+  op: "authorize_device";
+  id?: RequestId;
+  login_url: string;
+  verification_url: string;
+  user_code: string;
+  steps: DeviceStep[] | null;
+  success_selector: string;
+  failure_selector: string | null;
+  secret: LoginRequest["secret"];
+};
+
 type LeaseRequest = { op: "lease"; id?: RequestId };
 
 type ReleaseRequest = { op: "release"; id?: RequestId; target_id: string };
 
 type Request =
   | LoginRequest
+  | AuthorizeDeviceRequest
   | LeaseRequest
   | ReleaseRequest
   | { op: "hello"; id?: RequestId }
@@ -54,6 +75,7 @@ type ErrorCode =
   | "VAULT_LOCKED"
   | "RATE_LIMITED"
   | "TOTP_NOT_EXPOSABLE"
+  | "DEVICE_CODE_REJECTED"
   | "INTERNAL";
 
 class SelectorNotFoundError extends Error {}
@@ -61,6 +83,8 @@ class SelectorNotFoundError extends Error {}
 class InvalidCredentialError extends Error {}
 
 class MfaRequiredError extends Error {}
+
+class DeviceCodeRejectedError extends Error {}
 
 let activeBrowser: Browser | undefined;
 let activeGuard: CdpGuard | undefined;
@@ -121,13 +145,17 @@ function isSecretPlaceholder(value: unknown): value is FillStep["value"] {
   );
 }
 
+function isDevicePlaceholder(value: unknown): value is DeviceFillStep["value"] {
+  return isSecretPlaceholder(value) || value === "{{user_code}}";
+}
+
 class InvalidRequestError extends Error {
   constructor(readonly id?: RequestId) {
     super("invalid request");
   }
 }
 
-function parseRequest(line: string): Request {
+export function parseRequest(line: string): Request {
   let value: unknown;
   try {
     value = JSON.parse(line);
@@ -147,6 +175,60 @@ function parseRequest(line: string): Request {
       throw new InvalidRequestError(id);
     }
     return { op: "release", id, target_id: value.target_id };
+  }
+  if (value.op === "authorize_device") {
+    const secret = value.secret;
+    if (
+      typeof value.login_url !== "string" ||
+      typeof value.verification_url !== "string" ||
+      typeof value.user_code !== "string" ||
+      typeof value.success_selector !== "string" ||
+      (value.failure_selector !== undefined &&
+        !isNullableString(value.failure_selector)) ||
+      !isRecord(secret) ||
+      typeof secret.username !== "string" ||
+      typeof secret.password !== "string" ||
+      (secret.totp !== undefined && !isNullableString(secret.totp))
+    ) {
+      throw new InvalidRequestError(id);
+    }
+
+    let steps: DeviceStep[] | null = null;
+    if (value.steps !== undefined && value.steps !== null) {
+      if (!Array.isArray(value.steps)) throw new InvalidRequestError(id);
+      steps = value.steps.map((step): DeviceStep => {
+        if (!isRecord(step) || typeof step.selector !== "string") {
+          throw new InvalidRequestError(id);
+        }
+        if (step.action === "click") {
+          return { action: "click", selector: step.selector };
+        }
+        if (step.action === "fill" && isDevicePlaceholder(step.value)) {
+          return {
+            action: "fill",
+            selector: step.selector,
+            value: step.value,
+          };
+        }
+        throw new InvalidRequestError(id);
+      });
+    }
+
+    return {
+      op: "authorize_device",
+      id,
+      login_url: value.login_url,
+      verification_url: value.verification_url,
+      user_code: value.user_code,
+      steps,
+      success_selector: value.success_selector,
+      failure_selector: value.failure_selector ?? null,
+      secret: {
+        username: secret.username,
+        password: secret.password,
+        totp: secret.totp ?? null,
+      },
+    };
   }
   if (value.op !== "login") throw new InvalidRequestError(id);
 
@@ -500,20 +582,25 @@ async function click(page: Page, selector: string): Promise<void> {
   }
 }
 
-function substituteSecrets(
+export function substituteSecrets(
   value: string,
   secret: LoginRequest["secret"],
+  userCode?: string,
 ): string {
   const substitutions = {
     username: secret.username,
     password: secret.password,
     totp: secret.totp,
+    user_code: userCode,
   };
   return value.replace(
-    /\{\{(username|password|totp)\}\}/g,
+    /\{\{(username|password|totp|user_code)\}\}/g,
     (_placeholder, key: keyof typeof substitutions) => {
       const substitution = substitutions[key];
       if (substitution === null) throw new MfaRequiredError();
+      if (substitution === undefined) {
+        throw new Error("user code is unavailable");
+      }
       return substitution;
     },
   );
@@ -521,8 +608,10 @@ function substituteSecrets(
 
 async function runSteps(
   page: Page,
-  steps: LoginStep[] | null,
+  steps: LoginStep[] | DeviceStep[] | null,
   secret: LoginRequest["secret"],
+  userCode?: string,
+  automaticTotp = false,
 ): Promise<void> {
   if (steps !== null) {
     if (
@@ -533,7 +622,11 @@ async function runSteps(
     }
     for (const step of steps) {
       if (step.action === "fill") {
-        await fill(page, step.selector, substituteSecrets(step.value, secret));
+        await fill(
+          page,
+          step.selector,
+          substituteSecrets(step.value, secret, userCode),
+        );
       } else {
         await click(page, step.selector);
       }
@@ -566,6 +659,24 @@ async function runSteps(
     }
   }
   await fill(page, 'input[type="password"]', secret.password);
+
+  if (automaticTotp) {
+    const totpSelectors = [
+      'input[autocomplete="one-time-code"]',
+      'input[name="totp"]',
+      "input#totp",
+    ];
+    if (await selectorExists(page, totpSelectors[0])) {
+      if (secret.totp === null) throw new MfaRequiredError();
+      await fillFirstMatching(page, totpSelectors, secret.totp);
+    } else if (await selectorExists(page, totpSelectors[1])) {
+      if (secret.totp === null) throw new MfaRequiredError();
+      await fillFirstMatching(page, totpSelectors, secret.totp);
+    } else if (await selectorExists(page, totpSelectors[2])) {
+      if (secret.totp === null) throw new MfaRequiredError();
+      await fillFirstMatching(page, totpSelectors, secret.totp);
+    }
+  }
 
   const submit = page.locator('button[type="submit"], input[type="submit"]');
   if ((await submit.count()) > 0) {
@@ -659,9 +770,139 @@ async function waitForLoginResult(
   if (result !== "success") throw new Error("login result timed out");
 }
 
-async function executeLogin(
-  request: LoginRequest,
-): Promise<{ endpoint: string; targetId: string }> {
+export function classifyDeviceResult(
+  result: "success" | "failure" | undefined,
+): "ok" | "DEVICE_CODE_REJECTED" | "INTERNAL" {
+  if (result === "success") return "ok";
+  if (result === "failure") return "DEVICE_CODE_REJECTED";
+  return "INTERNAL";
+}
+
+async function selectorExists(page: Page, selector: string): Promise<boolean> {
+  return (await page.locator(selector).count()) > 0;
+}
+
+async function fillFirstMatching(
+  page: Page,
+  selectors: string[],
+  value: string,
+): Promise<void> {
+  for (const selector of selectors) {
+    const locator = page.locator(selector);
+    if ((await locator.count()) === 0) continue;
+    try {
+      await locator.first().fill(value, { timeout: 10_000 });
+    } catch (error) {
+      if (isTimeoutError(error)) throw new SelectorNotFoundError();
+      throw error;
+    }
+    return;
+  }
+  throw new SelectorNotFoundError();
+}
+
+async function clickFirstMatching(
+  page: Page,
+  selectors: string[],
+): Promise<void> {
+  for (const selector of selectors) {
+    const locator = page.locator(selector);
+    if ((await locator.count()) === 0) continue;
+    try {
+      await locator.first().click({ timeout: 10_000 });
+    } catch (error) {
+      if (isTimeoutError(error)) throw new SelectorNotFoundError();
+      throw error;
+    }
+    return;
+  }
+  throw new SelectorNotFoundError();
+}
+
+async function waitForDeviceResult(
+  page: Page,
+  successSelector: string,
+  failureSelector: string | null,
+): Promise<void> {
+  const waitForSelector = async (selector: string): Promise<boolean> => {
+    try {
+      await page.waitForSelector(selector, {
+        state: "attached",
+        timeout: 15_000,
+      });
+      return true;
+    } catch (error) {
+      if (isTimeoutError(error)) return false;
+      throw error;
+    }
+  };
+
+  const waits: Array<Promise<"success" | "failure" | undefined>> = [
+    waitForSelector(successSelector).then((matched) =>
+      matched ? "success" : undefined,
+    ),
+  ];
+  if (failureSelector !== null) {
+    waits.push(
+      waitForSelector(failureSelector).then((matched) =>
+        matched ? "failure" : undefined,
+      ),
+    );
+  }
+  const result = await Promise.race([
+    ...waits,
+    new Promise<undefined>((resolve) => setTimeout(resolve, 15_000)),
+  ]);
+  const classification = classifyDeviceResult(result);
+  if (classification === "DEVICE_CODE_REJECTED") {
+    throw new DeviceCodeRejectedError();
+  }
+  if (classification === "INTERNAL") {
+    throw new Error("device authorization result timed out");
+  }
+}
+
+async function executeDeviceFlow(
+  page: Page,
+  request: AuthorizeDeviceRequest,
+): Promise<void> {
+  if (request.failure_selector !== null) {
+    if (await selectorExists(page, request.failure_selector)) {
+      throw new DeviceCodeRejectedError();
+    }
+  }
+  if (request.steps === null) {
+    await fillFirstMatching(
+      page,
+      [
+        'input[name="user_code"]',
+        'input[autocomplete="one-time-code"]',
+        'input[type="text"]',
+      ],
+      request.user_code,
+    );
+    await clickFirstMatching(page, ['button[type="submit"]']);
+    if (request.failure_selector !== null) {
+      if (await selectorExists(page, request.failure_selector)) {
+        throw new DeviceCodeRejectedError();
+      }
+    }
+    await clickFirstMatching(page, [
+      'button:has-text("Authorize")',
+      'button:has-text("Continue")',
+      'button:has-text("Approve")',
+    ]);
+  } else {
+    await runSteps(page, request.steps, request.secret, request.user_code);
+  }
+  await waitForDeviceResult(
+    page,
+    request.success_selector,
+    request.failure_selector,
+  );
+}
+
+async function openBrowserPage() {
   const port = await reservePort();
   const dir = await mkdtemp(path.join(os.tmpdir(), "tegata-browser-"));
   activeTempDir = dir;
@@ -697,6 +938,22 @@ async function executeLogin(
     throw new Error("CDP target information was not returned");
   }
   await waitForTargetReady(guard, targetInfo.targetId);
+  return {
+    endpoint,
+    page,
+    pageSession,
+    targetId: targetInfo.targetId,
+    browserContextId: targetInfo.browserContextId,
+  };
+}
+
+async function executeLogin(
+  request: LoginRequest,
+): Promise<{ endpoint: string; targetId: string }> {
+  const { endpoint, page, pageSession, targetId, browserContextId } =
+    await openBrowserPage();
+  const guard = activeGuard;
+  if (guard === undefined) throw new Error("CDP guard is not available");
   await withGuard(guard, () => page.goto(request.target_url));
   await withGuard(guard, () => runSteps(page, request.steps, request.secret));
   await withGuard(guard, () =>
@@ -707,15 +964,37 @@ async function executeLogin(
     ),
   );
   await pageSession.detach().catch(() => undefined);
-  activeBrowserContextId = targetInfo.browserContextId;
+  activeBrowserContextId = browserContextId;
   monitorGuardFailure(guard);
   guard.assertOpen();
-  return { endpoint, targetId: targetInfo.targetId };
+  return { endpoint, targetId };
+}
+
+async function executeAuthorizeDevice(
+  request: AuthorizeDeviceRequest,
+): Promise<void> {
+  const { page, pageSession } = await openBrowserPage();
+  const guard = activeGuard;
+  if (guard === undefined) throw new Error("CDP guard is not available");
+  try {
+    await withGuard(guard, () => page.goto(request.login_url));
+    await withGuard(guard, () =>
+      runSteps(page, null, request.secret, undefined, true),
+    );
+    await withGuard(guard, () => waitForLoginResult(page, null, null));
+    await withGuard(guard, () => page.goto(request.verification_url));
+    await withGuard(guard, () => executeDeviceFlow(page, request));
+  } finally {
+    await pageSession.detach().catch(() => undefined);
+  }
+}
+
+export function formatResponse(value: unknown, id?: RequestId): unknown {
+  return id === undefined || !isRecord(value) ? value : { ...value, id };
 }
 
 function writeResponse(value: unknown, id?: RequestId): void {
-  const response =
-    id === undefined || !isRecord(value) ? value : { ...value, id };
+  const response = formatResponse(value, id);
   process.stdout.write(`${JSON.stringify(response)}\n`);
 }
 
@@ -872,6 +1151,39 @@ async function handleLogin(request: LoginRequest): Promise<void> {
   }
 }
 
+async function handleAuthorizeDevice(
+  request: AuthorizeDeviceRequest,
+): Promise<void> {
+  if (activeBrowser !== undefined) {
+    writeResponse(
+      { ok: false, error: "INTERNAL" satisfies ErrorCode },
+      request.id,
+    );
+    return;
+  }
+
+  let errorCode: ErrorCode | undefined;
+  try {
+    await executeAuthorizeDevice(request);
+  } catch (error) {
+    errorCode =
+      error instanceof DeviceCodeRejectedError
+        ? "DEVICE_CODE_REJECTED"
+        : error instanceof SelectorNotFoundError
+          ? "SELECTOR_NOT_FOUND"
+          : error instanceof InvalidCredentialError
+            ? "INVALID_CREDENTIAL"
+            : error instanceof MfaRequiredError
+              ? "MFA_REQUIRED"
+              : "INTERNAL";
+  }
+  await cleanupResources();
+  writeResponse(
+    errorCode === undefined ? { ok: true } : { ok: false, error: errorCode },
+    request.id,
+  );
+}
+
 async function shutdown(request?: { id?: RequestId }): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -887,13 +1199,6 @@ function handleStdinEof(): void {
   stdinEofHandled = true;
   void shutdown();
 }
-
-process.stdin.once("end", handleStdinEof);
-process.stdin.once("close", handleStdinEof);
-
-process.once("SIGTERM", () => {
-  void shutdown();
-});
 
 async function main(): Promise<void> {
   const input = createInterface({ input: process.stdin });
@@ -924,6 +1229,10 @@ async function main(): Promise<void> {
         await handleRelease(request);
         continue;
       }
+      if (request.op === "authorize_device") {
+        await handleAuthorizeDevice(request);
+        continue;
+      }
       await handleLogin(request);
     } catch (error) {
       writeResponse(
@@ -935,4 +1244,16 @@ async function main(): Promise<void> {
   await shutdown();
 }
 
-void main();
+if (
+  process.argv[1] !== undefined &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
+  process.stdin.once("end", handleStdinEof);
+  process.stdin.once("close", handleStdinEof);
+
+  process.once("SIGTERM", () => {
+    void shutdown();
+  });
+
+  void main();
+}

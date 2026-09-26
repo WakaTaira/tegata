@@ -15,6 +15,7 @@ interface Credentials {
 }
 
 const sessions = new Map<string, true>();
+const deviceCodes = new Map<string, boolean>();
 
 function usageError(message: string): never {
   throw new Error(message);
@@ -192,6 +193,43 @@ function loggedInPage(): string {
   return '<!doctype html><html lang="en"><body><div id="welcome">login-ok</div></body></html>';
 }
 
+function devicePage(): string {
+  return `<!doctype html>
+<html lang="en">
+<body>
+<form method="post" action="/device">
+<input name="user_code" type="text">
+<button type="submit">Continue</button>
+</form>
+</body>
+</html>`;
+}
+
+function deviceAuthorizationPage(userCode: string): string {
+  return `<!doctype html>
+<html lang="en">
+<body>
+<form method="post" action="/device/approve">
+<input type="hidden" name="user_code" value="${userCode}">
+<button type="submit">Authorize</button>
+</form>
+</body>
+</html>`;
+}
+
+function deviceErrorPage(): string {
+  return '<!doctype html><html lang="en"><body><p id="device-error">unknown device code</p></body></html>';
+}
+
+function deviceApprovedPage(): string {
+  return '<!doctype html><html lang="en"><body><p id="device-ok">device approved</p></body></html>';
+}
+
+function newDeviceCode(): string {
+  const value = randomBytes(4).toString("hex").toUpperCase();
+  return `${value.slice(0, 4)}-${value.slice(4)}`;
+}
+
 function sessionFrom(request: IncomingMessage): string | undefined {
   const cookieHeader = request.headers.cookie;
   if (cookieHeader === undefined) return undefined;
@@ -242,6 +280,80 @@ function handleRequest(
           response,
           loginForm(true, credentials.totp_seed !== undefined),
         );
+      }
+    });
+    return;
+  }
+
+  if (request.method === "POST" && request.url === "/device/issue") {
+    const userCode = newDeviceCode();
+    deviceCodes.set(userCode, false);
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ user_code: userCode }));
+    return;
+  }
+
+  if (request.method === "GET" && request.url?.startsWith("/device/status?")) {
+    const userCode = new URL(request.url, "http://127.0.0.1").searchParams.get(
+      "user_code",
+    );
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(
+      JSON.stringify({
+        approved: userCode !== null && deviceCodes.get(userCode) === true,
+      }),
+    );
+    return;
+  }
+
+  if (request.method === "GET" && request.url === "/device") {
+    writePage(response, devicePage());
+    return;
+  }
+
+  if (request.method === "POST" && request.url === "/device") {
+    const session = sessionFrom(request);
+    if (session === undefined || !sessions.has(session)) {
+      response.writeHead(302, { Location: "/" });
+      response.end();
+      return;
+    }
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk: string) => {
+      body += chunk;
+    });
+    request.on("end", () => {
+      const userCode = new URLSearchParams(body).get("user_code");
+      writePage(
+        response,
+        userCode !== null && deviceCodes.has(userCode)
+          ? deviceAuthorizationPage(userCode)
+          : deviceErrorPage(),
+      );
+    });
+    return;
+  }
+
+  if (request.method === "POST" && request.url === "/device/approve") {
+    const session = sessionFrom(request);
+    if (session === undefined || !sessions.has(session)) {
+      response.writeHead(302, { Location: "/" });
+      response.end();
+      return;
+    }
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk: string) => {
+      body += chunk;
+    });
+    request.on("end", () => {
+      const userCode = new URLSearchParams(body).get("user_code");
+      if (userCode !== null && deviceCodes.has(userCode)) {
+        deviceCodes.set(userCode, true);
+        writePage(response, deviceApprovedPage());
+      } else {
+        writePage(response, deviceErrorPage());
       }
     });
     return;

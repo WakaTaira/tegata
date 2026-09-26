@@ -22,12 +22,13 @@ use clap::Parser;
 use leakscan::scan_bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tegata_core::wire::{
+    AuthorizeDeviceParams, ExecutorAuthorizeDeviceRequest, ExecutorLeaseRequest,
+    ExecutorLoginRequest, ExecutorReleaseRequest, ExecutorResponse, ExecutorSecret, LoginParams,
+    RpcError, RpcRequest, RpcResponse,
+};
 #[cfg(unix)]
 use tegata_core::wire::{ExecutorHelloRequest, ExecutorHelloResponse};
-use tegata_core::wire::{
-    ExecutorLeaseRequest, ExecutorLoginRequest, ExecutorReleaseRequest, ExecutorResponse,
-    ExecutorSecret, LoginParams, RpcError, RpcRequest, RpcResponse,
-};
 use tegata_core::{Secret, totp};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -289,6 +290,7 @@ enum ErrorCode {
     InvalidCredential,
     MfaRequired,
     SelectorNotFound,
+    DeviceCodeRejected,
     VaultLocked,
     RateLimited,
     TotpNotExposable,
@@ -308,6 +310,7 @@ impl ErrorCode {
             Self::InvalidCredential => "INVALID_CREDENTIAL",
             Self::MfaRequired => "MFA_REQUIRED",
             Self::SelectorNotFound => "SELECTOR_NOT_FOUND",
+            Self::DeviceCodeRejected => "DEVICE_CODE_REJECTED",
             Self::VaultLocked => "VAULT_LOCKED",
             Self::RateLimited => "RATE_LIMITED",
             Self::TotpNotExposable => "TOTP_NOT_EXPOSABLE",
@@ -367,6 +370,10 @@ struct LoginRequestParams {
     login: LoginParams,
     #[serde(default)]
     exclusive: bool,
+}
+
+struct CredentialMetadata {
+    uri: Option<String>,
 }
 
 struct HandledRequest {
@@ -1451,6 +1458,7 @@ async fn handle_request(
         "status" => status(request, state).await,
         "list_credentials" => list_credentials(request, state).await,
         "login" => login(request, state, peer).await,
+        "authorize_device" => authorize_device(request, state, peer).await,
         "logout" => logout(request, state, peer).await,
         "get_totp" => get_totp(request, state).await,
         "lock_vault" => lock_vault(request, state).await,
@@ -1863,6 +1871,141 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
     .with_audit_shared(false)
 }
 
+async fn authorize_device(
+    request: &RpcRequest,
+    state: SharedState,
+    peer: &PeerIdentity,
+) -> HandledRequest {
+    let params = match parse_params::<AuthorizeDeviceParams>(&request.params) {
+        Ok(params) => params,
+        Err(error) => return classified(request.id.clone(), error),
+    };
+    let verification_origin = match http_origin(&params.verification_url) {
+        Some(origin) => origin,
+        None => return classified(request.id.clone(), ErrorCode::Internal),
+    };
+    if !valid_authorize_steps(params.steps.as_deref()) {
+        return classified(request.id.clone(), ErrorCode::Internal);
+    }
+    if params.cred_id.split_once(':').is_none() {
+        return classified(request.id.clone(), ErrorCode::InvalidCredential);
+    }
+    let metadata = match credential_metadata(&state, &params.cred_id).await {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => return classified(request.id.clone(), ErrorCode::InvalidCredential),
+        Err(error) => return classified(request.id.clone(), error),
+    };
+    let login_url = metadata
+        .uri
+        .filter(|uri| !uri.is_empty())
+        .unwrap_or(verification_origin);
+    #[cfg(unix)]
+    if state.lock().await.approve_cmd.is_some()
+        && let Err(error) = approve_authorize_device(&state, &params, peer).await
+    {
+        return classified(request.id.clone(), error);
+    }
+    let (credential, executor_entry, executor_socket, node_path, browsers_path) = {
+        let credential = match resolve_credential(&state, &params.cred_id).await {
+            Ok(Some(credential)) => credential,
+            Ok(None) => return classified(request.id.clone(), ErrorCode::InvalidCredential),
+            Err(error) => return classified(request.id.clone(), error),
+        };
+        if credential.locked {
+            return classified(request.id.clone(), ErrorCode::VaultLocked);
+        }
+        let daemon = state.lock().await;
+        (
+            credential,
+            daemon.executor_entry.clone(),
+            daemon.executor_socket.clone(),
+            daemon.node_path.clone(),
+            daemon.browsers_path.clone(),
+        )
+    };
+    match authorize_device_with_executor(
+        &executor_entry,
+        executor_socket.as_deref(),
+        &node_path,
+        browsers_path.as_deref(),
+        &params,
+        login_url,
+        &credential,
+    )
+    .await
+    {
+        Ok(()) => success(request.id.clone(), json!({ "ok": true })),
+        Err(error) => classified(request.id.clone(), error),
+    }
+}
+
+async fn credential_metadata(
+    state: &SharedState,
+    cred_id: &str,
+) -> Result<Option<CredentialMetadata>, ErrorCode> {
+    let Some((namespace, entry_id)) = cred_id.split_once(':') else {
+        return Ok(None);
+    };
+    let provider = {
+        let daemon = state.lock().await;
+        let Some(provider) = daemon
+            .providers
+            .iter()
+            .find(|provider| provider.namespace == namespace)
+        else {
+            return Ok(None);
+        };
+        provider.provider.clone()
+    };
+    let mut provider = provider.lock().await;
+    let refs_result = provider.list_refs().await;
+    let autolocked = provider.take_autolock_event();
+    drop(provider);
+    if autolocked {
+        audit_provider_autolock(state, namespace.to_owned()).await;
+    }
+    let refs = refs_result?;
+    Ok(refs
+        .into_iter()
+        .find(|credential| credential.id == entry_id)
+        .map(|credential| CredentialMetadata {
+            uri: credential.uri,
+        }))
+}
+
+fn http_origin(value: &str) -> Option<String> {
+    let (scheme, remainder) = value.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    if authority.is_empty()
+        || authority
+            .chars()
+            .any(|character| character.is_ascii_control() || character.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some(format!("{}://{authority}", scheme.to_ascii_lowercase()))
+}
+
+fn valid_authorize_steps(steps: Option<&[tegata_core::wire::LoginStep]>) -> bool {
+    steps.is_none_or(|steps| {
+        steps.iter().all(|step| match step.action.as_str() {
+            "click" => step.value.is_none(),
+            "fill" => matches!(
+                step.value.as_deref(),
+                Some("{{username}}")
+                    | Some("{{password}}")
+                    | Some("{{totp}}")
+                    | Some("{{user_code}}")
+            ),
+            _ => false,
+        })
+    })
+}
+
 #[cfg(unix)]
 async fn credential_state(state: &SharedState, cred_id: &str) -> Result<Option<bool>, ErrorCode> {
     let Some((namespace, entry_id)) = cred_id.split_once(':') else {
@@ -1903,6 +2046,33 @@ async fn approve_login(
     params: &LoginParams,
     peer: &PeerIdentity,
 ) -> Result<(), ErrorCode> {
+    approve_command(state, &params.cred_id, &params.target_url, "login", peer).await
+}
+
+#[cfg(unix)]
+async fn approve_authorize_device(
+    state: &SharedState,
+    params: &AuthorizeDeviceParams,
+    peer: &PeerIdentity,
+) -> Result<(), ErrorCode> {
+    approve_command(
+        state,
+        &params.cred_id,
+        &params.verification_url,
+        "authorize_device",
+        peer,
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn approve_command(
+    state: &SharedState,
+    cred_id: &str,
+    target_url: &str,
+    method: &str,
+    peer: &PeerIdentity,
+) -> Result<(), ErrorCode> {
     let (approve_cmd, approve_timeout) = {
         let daemon = state.lock().await;
         (daemon.approve_cmd.clone(), daemon.approve_timeout)
@@ -1917,8 +2087,9 @@ async fn approve_login(
     let mut command = Command::new("sh");
     command
         .args(["-c", approve_cmd.as_str()])
-        .env("TEGATA_CRED_ID", &params.cred_id)
-        .env("TEGATA_TARGET_URL", &params.target_url)
+        .env("TEGATA_CRED_ID", cred_id)
+        .env("TEGATA_TARGET_URL", target_url)
+        .env("TEGATA_METHOD", method)
         .env("TEGATA_PEER", peer_uid)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -2326,14 +2497,12 @@ async fn read_executor_line<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<
     String::from_utf8(line).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-async fn start_executor(
+async fn connect_executor(
     entry: &Path,
     executor_socket: Option<&Path>,
     node_path: &Path,
     browsers_path: Option<&Path>,
-    params: &LoginParams,
-    credential: &ResolvedCredential,
-) -> Result<(String, String, ExecutorHandle), ErrorCode> {
+) -> Result<ExecutorHandle, ErrorCode> {
     #[cfg(not(windows))]
     let _ = browsers_path;
     #[cfg(windows)]
@@ -2344,30 +2513,44 @@ async fn start_executor(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        // Safety net: if the handle is dropped without an explicit shutdown
-        // (a cancelled login task, runtime teardown), kill the executor
-        // rather than leaking it.
         .kill_on_drop(true);
     #[cfg(windows)]
     if let Some(browsers_path) = browsers_path {
         command.env("PLAYWRIGHT_BROWSERS_PATH", browsers_path);
     }
     #[cfg(unix)]
-    let mut executor = if let Some(socket) = executor_socket {
+    if let Some(socket) = executor_socket {
         let stream = timeout(EXECUTOR_TIMEOUT, tokio::net::UnixStream::connect(socket))
             .await
             .map_err(|_| ErrorCode::Internal)?
             .map_err(|_| ErrorCode::Internal)?;
         let (reader, writer) = stream.into_split();
-        ExecutorHandle::Socket {
+        Ok(ExecutorHandle::Socket {
             reader: Arc::new(Mutex::new(reader)),
             writer,
-        }
+        })
     } else {
-        ExecutorHandle::Spawned(command.spawn().map_err(|_| ErrorCode::Internal)?)
-    };
+        Ok(ExecutorHandle::Spawned(
+            command.spawn().map_err(|_| ErrorCode::Internal)?,
+        ))
+    }
     #[cfg(windows)]
-    let mut executor = ExecutorHandle::Spawned(command.spawn().map_err(|_| ErrorCode::Internal)?);
+    {
+        Ok(ExecutorHandle::Spawned(
+            command.spawn().map_err(|_| ErrorCode::Internal)?,
+        ))
+    }
+}
+
+async fn start_executor(
+    entry: &Path,
+    executor_socket: Option<&Path>,
+    node_path: &Path,
+    browsers_path: Option<&Path>,
+    params: &LoginParams,
+    credential: &ResolvedCredential,
+) -> Result<(String, String, ExecutorHandle), ErrorCode> {
+    let mut executor = connect_executor(entry, executor_socket, node_path, browsers_path).await?;
     let result = async {
         let totp = credential.totp_seed.as_ref().map(|seed| {
             let now = SystemTime::now()
@@ -2429,6 +2612,87 @@ async fn start_executor(
     }
 }
 
+async fn authorize_device_with_executor(
+    entry: &Path,
+    executor_socket: Option<&Path>,
+    node_path: &Path,
+    browsers_path: Option<&Path>,
+    params: &AuthorizeDeviceParams,
+    login_url: String,
+    credential: &ResolvedCredential,
+) -> Result<(), ErrorCode> {
+    let mut executor = connect_executor(entry, executor_socket, node_path, browsers_path).await?;
+    let result = async {
+        let totp = credential.totp_seed.as_ref().map(|seed| {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            tegata_core::totp(seed.as_str(), now).0
+        });
+        let request = ExecutorAuthorizeDeviceRequest {
+            op: "authorize_device",
+            id: 1,
+            login_url,
+            verification_url: params.verification_url.clone(),
+            user_code: params.user_code.clone(),
+            steps: params.steps.clone(),
+            success_selector: params.success_selector.clone(),
+            failure_selector: params.failure_selector.clone(),
+            secret: ExecutorSecret {
+                username: credential.username.as_str().to_owned(),
+                password: credential.password.as_str().to_owned(),
+                totp,
+            },
+        };
+        let mut line = serde_json::to_vec(&request).map_err(|_| ErrorCode::Internal)?;
+        line.push(b'\n');
+        executor
+            .write_line(&line)
+            .await
+            .map_err(|_| ErrorCode::Internal)?;
+        let response_line = timeout(EXECUTOR_TIMEOUT, executor.read_line())
+            .await
+            .map_err(|_| ErrorCode::Internal)?
+            .map_err(|_| ErrorCode::Internal)?;
+        if response_line.is_empty() {
+            return Err(ErrorCode::Internal);
+        }
+        let response: ExecutorResponse =
+            serde_json::from_str(&response_line).map_err(|_| ErrorCode::Internal)?;
+        if response.id != Some(1) {
+            return Err(ErrorCode::Internal);
+        }
+        if response.ok {
+            Ok(())
+        } else {
+            Err(response
+                .error
+                .as_deref()
+                .map(parse_authorize_error_code)
+                .unwrap_or(ErrorCode::Internal))
+        }
+    }
+    .await;
+    shutdown_authorize_executor(&mut executor).await;
+    result
+}
+
+async fn shutdown_authorize_executor(executor: &mut ExecutorHandle) {
+    let id = 2;
+    let Ok(mut request) = serde_json::to_vec(&json!({ "op": "shutdown", "id": id })) else {
+        return;
+    };
+    request.push(b'\n');
+    let write_result = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, executor.write_line(&request)).await;
+    if matches!(write_result, Ok(Ok(()))) {
+        let _ = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, executor.read_line()).await;
+    }
+    if !wait_or_kill_executor(executor).await {
+        kill_executor_handle(executor).await;
+    }
+}
+
 fn cdp_port_from_endpoint(endpoint: &str) -> Option<u16> {
     let authority = endpoint.split_once("://")?.1.split('/').next()?;
     let port = authority.rsplit_once(':')?.1.parse().ok()?;
@@ -2440,6 +2704,7 @@ fn parse_error_code(value: &str) -> ErrorCode {
         "INVALID_CREDENTIAL" => ErrorCode::InvalidCredential,
         "MFA_REQUIRED" => ErrorCode::MfaRequired,
         "SELECTOR_NOT_FOUND" => ErrorCode::SelectorNotFound,
+        "DEVICE_CODE_REJECTED" => ErrorCode::DeviceCodeRejected,
         "VAULT_LOCKED" => ErrorCode::VaultLocked,
         "RATE_LIMITED" => ErrorCode::RateLimited,
         "TOTP_NOT_EXPOSABLE" => ErrorCode::TotpNotExposable,
@@ -2447,6 +2712,15 @@ fn parse_error_code(value: &str) -> ErrorCode {
         "APPROVAL_TIMEOUT" => ErrorCode::ApprovalTimeout,
         "INTERNAL" => ErrorCode::Internal,
         "NOT_FOUND" => ErrorCode::NotFound,
+        _ => ErrorCode::Internal,
+    }
+}
+
+fn parse_authorize_error_code(value: &str) -> ErrorCode {
+    match value {
+        "INVALID_CREDENTIAL" | "MFA_REQUIRED" | "SELECTOR_NOT_FOUND" | "DEVICE_CODE_REJECTED" => {
+            parse_error_code(value)
+        }
         _ => ErrorCode::Internal,
     }
 }
@@ -2734,6 +3008,7 @@ fn audit_fields(params: &Value) -> AuditFields {
         target_url: params
             .get("target_url")
             .and_then(Value::as_str)
+            .or_else(|| params.get("verification_url").and_then(Value::as_str))
             .map(ToOwned::to_owned),
         session_id: params
             .get("session_id")

@@ -254,7 +254,7 @@ legitimate `login` from one an injected instruction talked the agent into making
 both are the same call for a credential the agent is entitled to use. The answer to
 that is not a better boundary; it is a human.
 
-Setting `approve_cmd` gates every `login` on an external command. The daemon runs
+Setting `approve_cmd` gates every `login` and `authorize_device` on an external command. The daemon runs
 it through `sh -c` on the isolated side and reads the exit status as the verdict:
 zero approves, anything else denies with `APPROVAL_DENIED`. A command that has not
 answered within `approve_timeout_secs` — 60 by default — has its whole process
@@ -280,7 +280,8 @@ environment variables:
 | Variable | Contents |
 | --- | --- |
 | `TEGATA_CRED_ID` | The namespaced credential reference being requested |
-| `TEGATA_TARGET_URL` | The login destination |
+| `TEGATA_TARGET_URL` | The login destination, or the device verification URL |
+| `TEGATA_METHOD` | `login` or `authorize_device` |
 | `TEGATA_PEER` | The calling peer's uid, in decimal |
 
 That is enough for a human to make a decision — *which* account, at *which* site,
@@ -294,7 +295,10 @@ security control that quietly does nothing is worse than one that is absent.
 
 Consider a hook mandatory for any credential whose misuse you could not undo. It
 is the only mechanism in tegata that constrains *which* logins happen, as opposed
-to what the agent learns from them.
+to what the agent learns from them. For device flows, the hook is especially
+recommended: the agent itself starts the grant, while tegata cannot verify whose
+grant it is approving. The `user_code` is short-lived and single-use, but it is
+never written to logs or audit records.
 
 ## Audit log
 

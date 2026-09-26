@@ -66,7 +66,7 @@ unexpected daemon response cannot smuggle text out through the error path.
 | `TOTP_NOT_EXPOSABLE` | The credential is not marked `totp_exposable`, or has no seed |
 | `APPROVAL_DENIED` | A configured approval hook refused this login |
 | `APPROVAL_TIMEOUT` | The approval hook did not answer within its timeout |
-| `PROVIDER_UNAVAILABLE` | A transient failure of the credential provider (for example the Bitwarden CLI failing or timing out right after a daemon restart); the call may be retried. Returned by `list_credentials`, `login`, and `get_totp` when they call a provider |
+| `PROVIDER_UNAVAILABLE` | A transient failure of the credential provider (for example the Bitwarden CLI failing or timing out right after a daemon restart); the call may be retried. Returned by `list_credentials`, `login`, `get_totp`, and `lock_vault` when they call a provider |
 | `NOT_FOUND` | The session does not exist or belongs to another principal; its existence is not disclosed |
 | `INTERNAL` | Anything else, including a refused response that failed the leak scan |
 

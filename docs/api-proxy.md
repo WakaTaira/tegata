@@ -24,9 +24,10 @@ value      = "Bearer {{secret}}"   # default
 
 `upstream` must be `https://`, or `http://` to a loopback host
 (`127.0.0.1`, `::1`, `localhost`) for local test targets. `value` must contain
-`{{secret}}`, which is replaced with the credential's password. A duplicate
-`name`, a non-loopback `http://` upstream, or a `value` without `{{secret}}`
-refuses startup.
+`{{secret}}`, which is replaced with the credential's password. An empty or
+duplicate `name`, a `cred_id` that is not `<namespace>:<entry id>`, a
+non-loopback `http://` upstream, or a `value` without `{{secret}}` refuses
+startup.
 
 On NixOS, the equivalent is `services.tegata.apiProxies`, an attribute set keyed
 by the same `name`:
@@ -61,6 +62,13 @@ the agent sent for that header. A request against the bare port, without the
 secret prefix, or with a different session's secret, gets a 404 and never
 reaches upstream.
 
+The path of `upstream` is a prefix, not a boundary: the upstream API decides
+what a path under it means. The relay does refuse dot segments, though. A
+request whose path after the secret contains a `.` or `..` segment (after
+percent-decoding), any `%2e`, or a backslash (including `%5c`) gets a 404 and
+is not forwarded, so the agent cannot walk out of the configured base path by
+path normalization.
+
 A Terraform provider that takes its token from an environment variable, or a
 `base_url`-shaped setting, points at this directly:
 
@@ -78,6 +86,11 @@ configured. The hook's environment carries `TEGATA_METHOD=open_api_proxy`,
 `TEGATA_TARGET_URL=<upstream>`, and `TEGATA_CRED_ID`, in place of the login
 destination. See [security.md](security.md#human-in-the-loop-approval).
 
+Starting a relay is rate-limited the same way starting a browser for `login`
+is, per caller and proxy `name`: more than 3 starts in 10 minutes, or a call
+during the 2, 5, then 15 second backoff after a failed start, returns
+`RATE_LIMITED`.
+
 ## Session lifetime
 
 `open_api_proxy` opens a lease exactly like `login` does: it has a TTL, it is
@@ -90,10 +103,17 @@ session is gone.
 ## Audit
 
 Every request through the relay writes one `api_proxy_request` audit line,
-carrying the session's `principal`, the proxy's `name`, the HTTP method, and the
-path with the secret prefix stripped — but never the query string, since a
-query is a plausible place for a caller to put something sensitive. `open_api_proxy`
-itself is audited like `login`, with `target_url` set to the upstream.
+carrying the session's `principal`, the proxy's `name`, the HTTP method, the
+upstream's `status`, and the path with the secret prefix stripped — but never
+the query string, since a query is a plausible place for a caller to put
+something sensitive. The recorded path is cut to 512 bytes, and a leading
+segment shaped like a path secret is recorded as `[redacted]`. `outcome` is
+`ok` for a status below 400, `upstream_unreachable` when the relay could not
+reach the upstream (502), and `upstream_error` otherwise. A request without the
+session's secret, or one refused for its dot segments, is answered with a 404
+and not audited, so that any local user who can reach the port cannot add lines
+under the session owner's name. `open_api_proxy` itself is audited like
+`login`, with `target_url` set to the upstream.
 
 ## Residual risk
 

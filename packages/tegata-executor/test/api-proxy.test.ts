@@ -1,10 +1,11 @@
 import http from "node:http";
-import type { AddressInfo } from "node:net";
+import net, { type AddressInfo } from "node:net";
 import { afterEach, describe, expect, test } from "vitest";
 import {
   type ApiProxy,
   type ApiProxyRequestRecord,
   filterHeaders,
+  hasUnsafePathSegment,
   matchSecretPath,
   startApiProxy,
 } from "../src/api-proxy.js";
@@ -47,6 +48,7 @@ async function startUpstream(
     response.end(JSON.stringify({ user: "fixture" }));
   },
   basePath = "",
+  host = "127.0.0.1",
 ): Promise<Upstream> {
   const received: ReceivedRequest[] = [];
   const server = http.createServer((request, response) => {
@@ -66,14 +68,24 @@ async function startUpstream(
       handler(request, response);
     });
   });
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve) => server.listen(0, host, resolve));
   const { port } = server.address() as AddressInfo;
   const close = async () => {
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   };
   cleanups.push(close);
-  return { url: `http://127.0.0.1:${port}${basePath}`, received, close };
+  const urlHost = host.includes(":") ? `[${host}]` : host;
+  return { url: `http://${urlHost}:${port}${basePath}`, received, close };
+}
+
+/** IPv6 を無効化した環境では ::1 へ bind できないため、事前に確かめる。 */
+function ipv6LoopbackAvailable(): Promise<boolean> {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once("error", () => resolve(false));
+    probe.listen(0, "::1", () => probe.close(() => resolve(true)));
+  });
 }
 
 async function startProxy(
@@ -131,7 +143,7 @@ function rawRequest(
   });
 }
 
-describe("api proxy secret path", () => {
+describe("API proxy secret path", () => {
   test("matches only the exact secret segment and strips it", () => {
     expect(matchSecretPath("/abc/api/whoami?q=1", "abc")).toEqual({
       matched: true,
@@ -179,12 +191,52 @@ describe("api proxy secret path", () => {
     expect(wrong.status).toBe(404);
     expect(suffixed.status).toBe(404);
     expect(upstream.received).toEqual([]);
-    expect(events.map((event) => event.status)).toEqual([404, 404, 404]);
-    expect(JSON.stringify(events)).not.toContain(proxy.secret);
+    // secret を持たない要求は監査の増幅に使えないよう、イベントを出さない。
+    expect(events).toEqual([]);
+  });
+
+  test("detects dot segments, encoded dots, and backslashes", () => {
+    for (const path of [
+      "/api/../admin",
+      "/api/./whoami",
+      "/..",
+      "/api/%2e%2e/admin",
+      "/api/%2E/whoami",
+      "/api/v%2e1",
+      "/api\\..\\admin",
+      "/api/%5c",
+      "/api/%E0%A4%A",
+    ]) {
+      expect(hasUnsafePathSegment(path), path).toBe(true);
+    }
+    for (const path of ["/", "/api/whoami", "/api/v1.2/.well", "/a..b/c"]) {
+      expect(hasUnsafePathSegment(path), path).toBe(false);
+    }
+  });
+
+  test("rejects dot segments with 404 without contacting upstream", async () => {
+    const upstream = await startUpstream(undefined, "/base");
+    const { proxy, events } = await startProxy(upstream.url);
+
+    for (const suffix of [
+      "/../admin",
+      "/api/./whoami",
+      "/%2e%2e/admin",
+      "/api/%2E%2E",
+      "/api\\..\\admin",
+    ]) {
+      const response = await rawRequest(
+        proxy.port,
+        `/${proxy.secret}${suffix}`,
+      );
+      expect(response.status, suffix).toBe(404);
+    }
+    expect(upstream.received).toEqual([]);
+    expect(events).toEqual([]);
   });
 });
 
-describe("api proxy forwarding", () => {
+describe("API proxy forwarding", () => {
   test("filters every hop-by-hop header and the connection-listed names", () => {
     expect(
       filterHeaders(
@@ -369,7 +421,31 @@ describe("api proxy forwarding", () => {
   });
 });
 
-describe("api proxy lifecycle", () => {
+describe("API proxy IPv6 upstream", () => {
+  test("forwards to a bracketed IPv6 loopback upstream", async (context) => {
+    if (!(await ipv6LoopbackAvailable())) {
+      context.skip("IPv6 loopback is unavailable on this host");
+      return;
+    }
+    const upstream = await startUpstream(undefined, "", "::1");
+    expect(upstream.url).toMatch(/^http:\/\/\[::1\]:\d+$/);
+    const { proxy, events } = await startProxy(upstream.url);
+
+    const response = await rawRequest(
+      proxy.port,
+      `/${proxy.secret}/api/whoami`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(JSON.parse(response.body)).toEqual({ user: "fixture" });
+    expect(upstream.received[0].headers.host).toBe(new URL(upstream.url).host);
+    expect(events).toEqual([
+      { http_method: "GET", path: "/api/whoami", status: 200 },
+    ]);
+  });
+});
+
+describe("API proxy lifecycle", () => {
   test("closes the listener and existing connections on close", async () => {
     const upstream = await startUpstream();
     const { proxy } = await startProxy(upstream.url);
@@ -432,7 +508,7 @@ describe("api proxy lifecycle", () => {
   });
 });
 
-describe("api proxy protocol", () => {
+describe("API proxy protocol", () => {
   test("parses start and stop requests", () => {
     expect(
       parseRequest(

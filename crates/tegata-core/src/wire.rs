@@ -4,6 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Deserialize)]
 pub struct RpcRequest {
@@ -150,13 +151,23 @@ pub struct OpenApiProxyParams {
 /// 専用の executor 接続で注入プロキシのリスナーを起動する要求。
 ///
 /// `header_value` は解決済みの秘密を含むため、executor へ書き込む以外の用途（ログ・監査）に出してはならない。
+/// 破棄時に消去されるよう `Zeroizing` で保持する。
 #[derive(Serialize)]
 pub struct ExecutorApiProxyStartRequest {
     pub op: &'static str,
     pub id: u64,
     pub upstream: String,
     pub header: String,
-    pub header_value: String,
+    #[serde(serialize_with = "serialize_zeroizing")]
+    pub header_value: Zeroizing<String>,
+}
+
+/// `Zeroizing<String>` を文字列として直列化する。zeroize の serde 機能に依存しないための変換である。
+fn serialize_zeroizing<S: serde::Serializer>(
+    value: &Zeroizing<String>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(value)
 }
 
 /// `api_proxy_start` への応答。成功時は loopback のポートと path secret を持つ。

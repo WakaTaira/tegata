@@ -146,6 +146,19 @@ function successResult(result: unknown) {
   };
 }
 
+/** デーモンが返す loopback の URL を検証する。bridge はこのポートへのトンネルのみを開く。 */
+function parseLoopbackUrl(value: string, protocol: "ws:" | "http:"): URL {
+  const url = new URL(value);
+  if (
+    url.protocol !== protocol ||
+    url.hostname !== "127.0.0.1" ||
+    url.port === ""
+  ) {
+    throw new Error("invalid loopback url");
+  }
+  return url;
+}
+
 type ParsedLoginResult = {
   result: Record<string, unknown>;
   sessionId: string;
@@ -168,14 +181,7 @@ function parseLoginResult(result: unknown): ParsedLoginResult {
     throw new Error("invalid login result");
   }
 
-  const endpoint = new URL(loginResult.channel.endpoint);
-  if (
-    endpoint.protocol !== "ws:" ||
-    endpoint.hostname !== "127.0.0.1" ||
-    endpoint.port === ""
-  ) {
-    throw new Error("invalid login endpoint");
-  }
+  const endpoint = parseLoopbackUrl(loginResult.channel.endpoint, "ws:");
   return {
     result: loginResult,
     sessionId: loginResult.session_id,
@@ -258,7 +264,7 @@ type ParsedApiProxyResult = {
 
 function parseApiProxyResult(result: unknown): ParsedApiProxyResult {
   if (typeof result !== "object" || result === null)
-    throw new Error("invalid api proxy result");
+    throw new Error("invalid API proxy result");
   const proxyResult = result as {
     session_id?: unknown;
     base_url?: unknown;
@@ -268,16 +274,9 @@ function parseApiProxyResult(result: unknown): ParsedApiProxyResult {
     typeof proxyResult.session_id !== "string" ||
     typeof proxyResult.base_url !== "string"
   ) {
-    throw new Error("invalid api proxy result");
+    throw new Error("invalid API proxy result");
   }
-  const baseUrl = new URL(proxyResult.base_url);
-  if (
-    baseUrl.protocol !== "http:" ||
-    baseUrl.hostname !== "127.0.0.1" ||
-    baseUrl.port === ""
-  ) {
-    throw new Error("invalid api proxy base_url");
-  }
+  const baseUrl = parseLoopbackUrl(proxyResult.base_url, "http:");
   return { result: proxyResult, sessionId: proxyResult.session_id, baseUrl };
 }
 

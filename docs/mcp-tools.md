@@ -1,6 +1,6 @@
 # MCP tool contract
 
-This is the complete surface tegata exposes to an agent. Six tools, no generic
+This is the complete surface tegata exposes to an agent. Seven tools, no generic
 escape hatch. Anything not listed here does not cross the boundary.
 
 ## Connecting
@@ -319,12 +319,16 @@ configuration and the full residual-risk discussion.
 `base_url` already includes the path secret. A request to `<base_url>/<path>`
 is relayed to the configured `upstream`'s `<path>` with the configured header
 replaced by the injected value; a request missing the secret, or carrying a
-different session's secret, gets a 404 and never reaches upstream. `session_id`
+different session's secret, gets a 404 and never reaches upstream, as does a
+request whose path contains a dot segment, `%2e`, or a backslash. `session_id`
 is what `logout` takes to close the relay.
 
 An unknown `name` returns `NOT_FOUND`. Where an approval hook is configured, it
 gates `open_api_proxy` the same way it gates `login`, with `TEGATA_METHOD` set
 to `open_api_proxy` and `TEGATA_TARGET_URL` set to the proxy's upstream.
+Starts are rate-limited like `login`, per caller and `name`: during the backoff
+after a failed start, or after 3 starts in 10 minutes, the call returns
+`RATE_LIMITED`.
 
 The lease this opens behaves like any other session: it has a TTL, `logout`
 ends it early, and `lock_vault` closes every proxy in the locked namespace.
@@ -421,7 +425,8 @@ mechanism, not a port forwarder.
 The daemon speaks newline-delimited JSON-RPC 2.0 — one request object per line, one
 response object per line. The MCP broker is a thin adapter over exactly the calls
 documented above, plus `status`, which returns `{"ok": true, "browsers": n,
-"leases": n}` and is useful as a liveness check.
+"leases": n}` and is useful as a liveness check. `browsers` counts running
+browsers only; `leases` counts every live session, API proxies included.
 
 Method names and parameters are identical to the tool names and inputs. A method
 outside the allowlist is answered with a standard JSON-RPC method-not-found error;

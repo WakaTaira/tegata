@@ -245,7 +245,7 @@ they are meant to be read as the specification of what the boundary guarantees.
 
 Implemented today: the systemd and Windows service boundaries; three credential
 backends behind the provider trait — Bitwarden CLI, age-encrypted file, and GNU
-pass — usable together; the Playwright form executor; the six MCP tools;
+pass — usable together; the Playwright form executor; the seven MCP tools;
 human-in-the-loop login approval — an external command on Linux, and on Windows
 an approval queue the operator answers from an elevated PowerShell with
 `tegatad approval allow/deny`; an audit log covering both agent calls and
@@ -255,6 +255,9 @@ machine, with an owner on every session; the container boundary — the daemon o
 the host, reached from a containerized agent through `tegata-bridge` and a named
 token; OAuth device-flow approval — the daemon logs in and approves a
 device-code grant the agent's own tool started, without handing out a browser;
+an injection proxy for static API tokens — `open_api_proxy` hands the agent a
+loopback base URL and adds the stored token to every request for one configured
+upstream, so the agent never holds it;
 and prebuilt release binaries and bundles for non-Nix deployments,
 published from tags on the
 [releases page](https://github.com/WakaTaira/tegata/releases).
@@ -264,8 +267,9 @@ Planned, tracked in the
 
 - **CDP isolation** — the browser in its own network namespace, reachable only
   through the daemon's authenticated relay
-- **Injection proxy** ([#14](https://github.com/WakaTaira/tegata/issues/14)) —
-  API calls with the operator's identity for agents that must not hold a token
+- **Injection proxy, remaining parts**
+  ([#20](https://github.com/WakaTaira/tegata/issues/20)) — a tegata-owned OAuth
+  client and hosted stdio MCP servers
 
 Each feature is designed in a private brief before implementation; what lands
 publicly is the design's contract, as acceptance tests under `tests/acceptance/`.

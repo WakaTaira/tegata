@@ -77,12 +77,15 @@ an explicit `steps` array omit this field.
 `INVALID_CREDENTIAL` covers both "no such credential" and "the site said no" on
 purpose: distinguishing them would tell an agent which identifiers are real.
 
-Three further codes exist at the transport level and never reach the MCP layer:
+Three further codes come from the transport level rather than from a tool:
 `UNAUTHORIZED` (bad or missing token, or a SID not on the allowlist) and
 `FORBIDDEN` (a tunnel request for a port that is not the named session's CDP
 port) and `NOT_FOUND` (a CDP tunnel preamble whose session does not exist or does
 not belong to the calling principal; the session's existence is not disclosed).
-The administrative RPCs add `ADMIN_REQUIRED` and `ADMIN_SEAL_UNAVAILABLE`.
+They normally stop at the broker's connection or the bridge's tunnel request;
+when one does reach a tool call, the broker returns it as is rather than as
+`INTERNAL`. The administrative RPCs add `ADMIN_REQUIRED` and
+`ADMIN_SEAL_UNAVAILABLE`.
 
 ---
 

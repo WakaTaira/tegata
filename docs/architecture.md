@@ -98,7 +98,7 @@ acceptance suite asserts none appear.
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │ Agent                                                          │
-│   sees: a catalog of names, six tools, a CDP endpoint          │
+│   sees: a catalog of names, seven tools, a CDP endpoint        │
 └────────────────────────────┬───────────────────────────────────┘
                              │ MCP over stdio
 ┌────────────────────────────▼───────────────────────────────────┐
@@ -187,7 +187,9 @@ The peer key is whatever the transport established — `peer_uid`, `peer_sid` (w
 `elevated` and `administrator` alongside it), or `peer_token` — so the record is
 written in the vocabulary of the boundary that actually authenticated the caller.
 `session_id` and `namespace` are `null` on calls they do not apply to. `outcome`
-is `ok` or the classification code. For `authorize_device`, `target_url` is the
+is `ok` or the classification code; for `api_proxy_request` it is `ok`,
+`upstream_error`, or `upstream_unreachable`, derived from the upstream status
+(see [api-proxy.md](api-proxy.md#audit)). For `authorize_device`, `target_url` is the
 `verification_url`. Only references are recorded; no value is, and the
 `user_code` is not recorded.
 

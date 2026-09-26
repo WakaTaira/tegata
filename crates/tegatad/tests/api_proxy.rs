@@ -47,6 +47,26 @@ rl.on("line", (line) => {
 rl.on("close", () => { setInterval(() => {}, 1000); });
 "#;
 
+/// 開始応答の直後に、監査で整形されるべき path のイベント行を書く偽 executor。
+/// 1 行目は path secret と同じ形の先頭 segment、2 行目は上限を超える長さの path を持つ。
+const PATH_EVENT_EXECUTOR: &str = r#"
+const readline = require("node:readline");
+const event = (path, status) =>
+  process.stdout.write(JSON.stringify({ event: "api_proxy_request", http_method: "GET", path, status }) + "\n");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.op === "api_proxy_start") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true, port: 38998, secret: "fake-path-secret_A1" }) + "\n");
+    event("/Ax7fQ2mN9pL3kR8sT1vW0y/api/whoami", 401);
+    event("/" + "a".repeat(600), 200);
+  } else {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true }) + "\n");
+    if (request.op === "shutdown") process.exit(0);
+  }
+});
+"#;
+
 /// 開始要求を失敗させる偽 executor。
 const FAILING_PROXY_EXECUTOR: &str = r#"
 const readline = require("node:readline");
@@ -265,6 +285,8 @@ fn open_api_proxy_injects_the_resolved_value_and_audits_requests() {
 
     let status = rpc(daemon.socket(), "status", json!({}));
     assert_eq!(status["result"]["leases"], json!(1));
+    // プロキシはブラウザとして数えない。
+    assert_eq!(status["result"]["browsers"], json!(0));
 
     wait_for(
         "api_proxy_request audit record",
@@ -288,6 +310,7 @@ fn open_api_proxy_injects_the_resolved_value_and_audits_requests() {
     assert_eq!(request["http_method"], json!("GET"));
     assert_eq!(request["path"], json!("/api/whoami"));
     assert_eq!(request["status"], json!(200));
+    assert_eq!(request["outcome"], json!("ok"));
     assert_eq!(
         request["principal"],
         json!(format!("uid:{}", unsafe { libc::geteuid() }))
@@ -327,6 +350,12 @@ fn logout_stops_the_proxy_without_confusing_event_lines_with_responses() {
                 .any(|record| record["method"] == "api_proxy_request" && record["status"] == 502)
         },
     );
+    let unreachable = daemon
+        .audit_records()
+        .into_iter()
+        .find(|record| record["method"] == "api_proxy_request" && record["status"] == 502)
+        .expect("502 audit record");
+    assert_eq!(unreachable["outcome"], json!("upstream_unreachable"));
     let again = rpc(
         daemon.socket(),
         "logout",
@@ -393,6 +422,63 @@ fn executor_start_failure_is_internal_and_leaves_no_lease() {
     error_message(&response, "INTERNAL");
     let status = rpc(daemon.socket(), "status", json!({}));
     assert_eq!(status["result"]["leases"], json!(0));
+}
+
+#[test]
+fn audit_redacts_secret_shaped_segments_and_truncates_long_paths() {
+    let daemon = Daemon::start(Options::new(PATH_EVENT_EXECUTOR));
+    let response = rpc(daemon.socket(), "open_api_proxy", json!({ "name": "fx" }));
+    assert!(response.get("result").is_some(), "{response}");
+
+    wait_for(
+        "two api_proxy_request records",
+        Duration::from_secs(5),
+        || {
+            daemon
+                .audit_records()
+                .iter()
+                .filter(|record| record["method"] == "api_proxy_request")
+                .count()
+                == 2
+        },
+    );
+    let records = daemon.audit_records();
+    let requests = records
+        .iter()
+        .filter(|record| record["method"] == "api_proxy_request")
+        .collect::<Vec<_>>();
+    assert_eq!(requests[0]["path"], json!("/[redacted]/api/whoami"));
+    assert_eq!(requests[0]["outcome"], json!("upstream_error"));
+    let long_path = requests[1]["path"].as_str().expect("path");
+    assert_eq!(long_path.len(), 512);
+    assert_eq!(requests[1]["outcome"], json!("ok"));
+    assert!(!daemon.audit_text().contains("Ax7fQ2mN9pL3kR8sT1vW0y"));
+}
+
+#[test]
+fn repeated_opens_are_rate_limited_per_proxy() {
+    let daemon = Daemon::start(Options::new(PROXY_EXECUTOR));
+    for _ in 0..3 {
+        open(&daemon);
+    }
+    let limited = rpc(daemon.socket(), "open_api_proxy", json!({ "name": "fx" }));
+    error_message(&limited, "RATE_LIMITED");
+    assert_eq!(
+        executor_ops(&daemon)
+            .iter()
+            .filter(|op| op.as_str() == "api_proxy_start")
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn failed_starts_back_off() {
+    let daemon = Daemon::start(Options::new(FAILING_PROXY_EXECUTOR));
+    let first = rpc(daemon.socket(), "open_api_proxy", json!({ "name": "fx" }));
+    error_message(&first, "INTERNAL");
+    let second = rpc(daemon.socket(), "open_api_proxy", json!({ "name": "fx" }));
+    error_message(&second, "RATE_LIMITED");
 }
 
 #[test]
@@ -472,6 +558,14 @@ fn invalid_api_proxy_configs_refuse_startup() {
         (
             api_proxy_section("novalue", UPSTREAM, Some("Bearer static")),
             "{{secret}}",
+        ),
+        (
+            api_proxy_section("", UPSTREAM, None),
+            "name must not be empty",
+        ),
+        (
+            api_proxy_section("nocolon", UPSTREAM, None).replace("mock:site", "mocksite"),
+            "cred_id",
         ),
     ];
     for (section, reason) in cases {

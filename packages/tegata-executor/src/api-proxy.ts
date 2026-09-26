@@ -22,8 +22,13 @@ export type ApiProxy = {
   close: () => Promise<void>;
 };
 
+export type SecretPathMatch =
+  | { matched: true; path: string; query: string }
+  | { matched: false; path: string };
+
 type Upstream = {
   url: URL;
+  hostname: string;
   basePath: string;
   transport: typeof http | typeof https;
   agent: http.Agent;
@@ -37,10 +42,6 @@ const HOP_BY_HOP_HEADERS = new Set([
   "transfer-encoding",
   "upgrade",
 ]);
-
-export type SecretPathMatch =
-  | { matched: true; path: string; query: string }
-  | { matched: false; path: string };
 
 function splitQuery(target: string): { pathname: string; query: string } {
   const index = target.indexOf("?");
@@ -73,6 +74,24 @@ export function matchSecretPath(
   const rest = end < 0 ? "/" : pathname.slice(end);
   if (!secretEquals(segment, secret)) return { matched: false, path: rest };
   return { matched: true, path: rest, query };
+}
+
+/**
+ * secret を剥がした後の path が、上流で base path の外へ解決されうる形を含むかを判定する。
+ * パーセントデコード後に `.` / `..` となる segment、`%2e` 表記、バックスラッシュ（`%5c` を含む）を拒否する。
+ * デコードできない segment は解釈が上流次第となるため、同じく拒否する。
+ */
+export function hasUnsafePathSegment(path: string): boolean {
+  if (path.includes("\\") || /%2e/i.test(path)) return true;
+  return path.split("/").some((segment) => {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      return true;
+    }
+    return decoded === "." || decoded === ".." || decoded.includes("\\");
+  });
 }
 
 function isHopByHop(name: string, connectionTokens: Set<string>): boolean {
@@ -119,6 +138,9 @@ function parseUpstream(upstream: string): Upstream {
   const transport = url.protocol === "https:" ? https : http;
   return {
     url,
+    // WHATWG URL は IPv6 リテラルの hostname を角括弧付きで返すが、http.request は括弧なしの
+    // アドレスを要求するため、ここで剥がしておく。
+    hostname: url.hostname.replace(/^\[(.*)\]$/, "$1"),
     basePath: url.pathname.replace(/\/+$/, ""),
     transport,
     agent: new transport.Agent({ keepAlive: true }),
@@ -157,7 +179,7 @@ function forward(
   const path = `${upstream.basePath}${target.path}`;
   const upstreamRequest = upstream.transport.request({
     protocol: upstream.url.protocol,
-    hostname: upstream.url.hostname,
+    hostname: upstream.hostname,
     port: upstream.url.port === "" ? undefined : upstream.url.port,
     method: request.method,
     path: `${path === "" ? "/" : path}${target.query}`,
@@ -195,20 +217,21 @@ function handleRequest(
   secret: string,
   options: ApiProxyOptions,
 ): void {
-  const method = request.method ?? "";
   const match = matchSecretPath(request.url ?? "", secret);
+  // secret を持たない要求は記録しない。loopback の任意の利用者が、リース所有者の名義で
+  // 監査行を増やせないようにするためである。上流へ送らない要求も同じく記録の対象外とする。
+  if (!match.matched || hasUnsafePathSegment(match.path)) {
+    request.resume();
+    respondNotFound(response);
+    return;
+  }
+  const method = request.method ?? "";
   let recorded = false;
   const record = (status: number): void => {
     if (recorded) return;
     recorded = true;
     options.onRequest({ http_method: method, path: match.path, status });
   };
-  if (!match.matched) {
-    record(404);
-    request.resume();
-    respondNotFound(response);
-    return;
-  }
   forward(request, response, upstream, options, match, record);
 }
 

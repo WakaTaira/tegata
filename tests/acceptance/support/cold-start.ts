@@ -9,6 +9,8 @@ export type FakeBwMode =
   | "always-fail"
   | "invalid-json"
   | "success"
+  | "sync-fail"
+  | "sync-hang"
   | `fail-until:${number}`;
 
 export interface ColdStartCanaries {
@@ -24,7 +26,10 @@ export interface ColdStartDaemon {
   namespace: string;
   canaries: ColdStartCanaries;
   setBwMode(mode: FakeBwMode): void;
+  setBwItemName(name: string): void;
   callLog(): string[];
+  loginCalls(): string[];
+  syncCalls(): string[];
   listItemsCalls(): string[];
   stderr(): string;
   stop(): Promise<void>;
@@ -36,6 +41,8 @@ set -u
 call_log="\${FAKE_BW_CALL_LOG:?}"
 state_file="\${FAKE_BW_STATE_FILE:?}"
 list_count_file="\${FAKE_BW_LIST_COUNT_FILE:?}"
+remote_items_file="\${FAKE_BW_REMOTE_ITEMS_FILE:?}"
+cached_items_file="\${FAKE_BW_CACHED_ITEMS_FILE:?}"
 
 printf '%s\\n' "$*" >> "$call_log"
 
@@ -69,7 +76,27 @@ if [ "\${1:-}" = "status" ]; then
   exit 0
 fi
 
-if [ "\${1:-}" = "sync" ] || [ "\${1:-}" = "logout" ] || [ "\${1:-}" = "lock" ]; then
+if [ "\${1:-}" = "sync" ]; then
+  mode=success
+  if [ -f "$state_file" ]; then
+    mode=$(sed -n '1p' "$state_file")
+  fi
+  case "$mode" in
+    sync-fail)
+      exit 1
+      ;;
+    sync-hang)
+      sleep 30
+      exit 0
+      ;;
+  esac
+  if [ -f "$remote_items_file" ]; then
+    cp "$remote_items_file" "$cached_items_file"
+  fi
+  exit 0
+fi
+
+if [ "\${1:-}" = "logout" ] || [ "\${1:-}" = "lock" ]; then
   exit 0
 fi
 
@@ -104,12 +131,21 @@ if [ "\${1:-}" = "list" ] && [ "\${2:-}" = "items" ]; then
       fi
       ;;
   esac
-  printf '%s\\n' "$FAKE_BW_ITEMS_JSON"
+  items_json="$FAKE_BW_ITEMS_JSON"
+  if [ -f "$cached_items_file" ]; then
+    items_json=$(cat "$cached_items_file")
+  fi
+  printf '%s\\n' "$items_json"
   exit 0
 fi
 
 if [ "\${1:-}" = "get" ] && [ "\${2:-}" = "item" ]; then
-  printf '%s\\n' "$FAKE_BW_ITEM_JSON"
+  item_json="$FAKE_BW_ITEM_JSON"
+  if [ -f "$cached_items_file" ]; then
+    item_json=$(cat "$cached_items_file")
+    item_json=$(printf '%s' "$item_json" | sed 's/^\\[//; s/\\]$//')
+  fi
+  printf '%s\\n' "$item_json"
   exit 0
 fi
 
@@ -173,6 +209,7 @@ export async function startColdStartDaemon(opts: {
   namespace: string;
   serverUrl: string;
   canaries: ColdStartCanaries;
+  env?: Record<string, string>;
 }): Promise<ColdStartDaemon> {
   const daemonDir = fs.mkdtempSync(
     path.join(os.tmpdir(), "tegatad-cold-start-"),
@@ -188,6 +225,8 @@ export async function startColdStartDaemon(opts: {
   const statePath = path.join(daemonDir, "bw-state");
   const callLogPath = path.join(daemonDir, "bw-calls.log");
   const listCountPath = path.join(daemonDir, "bw-list-count");
+  const remoteItemsPath = path.join(daemonDir, "bw-remote-items.json");
+  const cachedItemsPath = path.join(daemonDir, "bw-cached-items.json");
   const socketPath = path.join(daemonDir, "tegatad.sock");
   const configPath = path.join(daemonDir, "config.toml");
   fs.writeFileSync(bwPath, FAKE_BW, { mode: 0o700 });
@@ -199,6 +238,8 @@ export async function startColdStartDaemon(opts: {
     name: opts.canaries.itemName,
     login: { uris: [{ uri: "https://cold-start.invalid/login" }] },
   };
+  fs.writeFileSync(remoteItemsPath, JSON.stringify([item]), { mode: 0o600 });
+  fs.writeFileSync(cachedItemsPath, JSON.stringify([item]), { mode: 0o600 });
   const config = [
     `socket_path = ${tomlString(socketPath)}`,
     `state_dir = ${tomlString(stateDir)}`,
@@ -222,10 +263,13 @@ export async function startColdStartDaemon(opts: {
     cwd: daemonDir,
     env: {
       ...process.env,
+      ...opts.env,
       PATH: `${fakeBinDir}${path.delimiter}${inheritedPath}`,
       FAKE_BW_CALL_LOG: callLogPath,
       FAKE_BW_STATE_FILE: statePath,
       FAKE_BW_LIST_COUNT_FILE: listCountPath,
+      FAKE_BW_REMOTE_ITEMS_FILE: remoteItemsPath,
+      FAKE_BW_CACHED_ITEMS_FILE: cachedItemsPath,
       FAKE_BW_SERVER_URL: opts.serverUrl,
       FAKE_BW_SESSION: opts.canaries.sessionKey,
       FAKE_BW_EMAIL: opts.canaries.email,
@@ -254,7 +298,19 @@ export async function startColdStartDaemon(opts: {
     setBwMode(mode) {
       fs.writeFileSync(statePath, `${mode}\n`, { mode: 0o600 });
     },
+    setBwItemName(name) {
+      fs.writeFileSync(remoteItemsPath, JSON.stringify([{ ...item, name }]), {
+        mode: 0o600,
+      });
+    },
     callLog: () => readLines(callLogPath),
+    loginCalls: () =>
+      readLines(callLogPath).filter((line) => {
+        const args = line.split(/\s+/);
+        return args[0] === "login" && args[1] !== "--check";
+      }),
+    syncCalls: () =>
+      readLines(callLogPath).filter((line) => line.split(/\s+/)[0] === "sync"),
     listItemsCalls: () =>
       readLines(callLogPath).filter((line) => {
         const args = line.split(/\s+/);

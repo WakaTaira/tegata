@@ -343,6 +343,8 @@ Vaultwarden.
 | `totp_exposable` | list of string | no | Item **names** whose current code `get_totp` may return |
 | `session_ttl_secs` | integer | no | Unlock lifetime; defaults to the global value |
 
+The daemon runs `bw sync` when it establishes a session and, while that session remains within its TTL, at most once every 60 seconds from the previous sync attempt. A failed periodic sync is non-fatal: the daemon continues with the local cache. A timeout or process-start failure during the initial sync discards the session and returns `PROVIDER_UNAVAILABLE` without retrying login, and `bw sync` is limited to 30 seconds; other `bw` commands retain their 60-second limit.
+
 #### `type = "age-file"`
 
 An age-encrypted TOML file. The daemon decrypts it in process with the pure-Rust

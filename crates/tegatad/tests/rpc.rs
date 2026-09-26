@@ -241,6 +241,34 @@ fn authorize_device_returns_only_ok_and_does_not_create_a_session() {
 }
 
 #[test]
+fn authorize_device_audit_uses_verification_url_without_query_or_spoofed_target() {
+    let daemon = Daemon::start_with_executor(AUTHORIZE_SUCCESS_EXECUTOR);
+    let response = rpc(
+        &daemon.socket_path,
+        "authorize_device",
+        json!({
+            "cred_id": "mock:site",
+            "verification_url": "https://example.test/device?user_code=secret-device-code#fragment",
+            "target_url": "https://attacker.test/forged",
+            "user_code": "secret-device-code",
+            "success_selector": "#device-ok"
+        }),
+    );
+    assert_eq!(response["result"], json!({ "ok": true }));
+
+    let audit =
+        std::fs::read_to_string(daemon.directory.join("state/audit.log")).expect("read audit log");
+    let record = audit
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("parse audit record"))
+        .find(|record| record["method"] == "authorize_device")
+        .expect("authorize_device audit record");
+    assert_eq!(record["target_url"], json!("https://example.test/device"));
+    assert!(!audit.contains("secret-device-code"));
+    assert!(!audit.contains("attacker.test"));
+}
+
+#[test]
 fn authorize_device_propagates_device_code_rejected() {
     let daemon = Daemon::start_with_executor(AUTHORIZE_REJECTED_EXECUTOR);
     let response = rpc(

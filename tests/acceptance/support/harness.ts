@@ -40,6 +40,7 @@ export const ERROR_CODES = [
   "TOTP_NOT_EXPOSABLE",
   "APPROVAL_DENIED",
   "APPROVAL_TIMEOUT",
+  "DEVICE_CODE_REJECTED",
   "INTERNAL",
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];

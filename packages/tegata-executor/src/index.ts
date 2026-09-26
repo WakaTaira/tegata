@@ -78,13 +78,33 @@ type ErrorCode =
   | "DEVICE_CODE_REJECTED"
   | "INTERNAL";
 
-class SelectorNotFoundError extends Error {}
+export class SelectorNotFoundError extends Error {}
 
-class InvalidCredentialError extends Error {}
+export class InvalidCredentialError extends Error {}
 
-class MfaRequiredError extends Error {}
+export class MfaRequiredError extends Error {}
 
-class DeviceCodeRejectedError extends Error {}
+export class DeviceCodeRejectedError extends Error {}
+
+type ExecutionStage = "login" | "device";
+
+export function classifyError(
+  error: unknown,
+  stage: ExecutionStage,
+): ErrorCode {
+  if (stage === "device") {
+    return error instanceof DeviceCodeRejectedError
+      ? "DEVICE_CODE_REJECTED"
+      : "INTERNAL";
+  }
+  return error instanceof SelectorNotFoundError
+    ? "SELECTOR_NOT_FOUND"
+    : error instanceof InvalidCredentialError
+      ? "INVALID_CREDENTIAL"
+      : error instanceof MfaRequiredError
+        ? "MFA_REQUIRED"
+        : "INTERNAL";
+}
 
 let activeBrowser: Browser | undefined;
 let activeGuard: CdpGuard | undefined;
@@ -606,12 +626,13 @@ export function substituteSecrets(
   );
 }
 
-async function runSteps(
+export async function runSteps(
   page: Page,
   steps: LoginStep[] | DeviceStep[] | null,
   secret: LoginRequest["secret"],
   userCode?: string,
   automaticTotp = false,
+  failureSelector: string | null = null,
 ): Promise<void> {
   if (steps !== null) {
     if (
@@ -629,6 +650,12 @@ async function runSteps(
         );
       } else {
         await click(page, step.selector);
+      }
+      if (
+        failureSelector !== null &&
+        (await selectorExists(page, failureSelector))
+      ) {
+        throw new DeviceCodeRejectedError();
       }
     }
     return;
@@ -696,25 +723,59 @@ async function runSteps(
   }
 }
 
+type WaitResult = "success" | "failure" | undefined;
+
+async function waitForSelector(page: Page, selector: string): Promise<boolean> {
+  try {
+    await page.waitForSelector(selector, {
+      state: "attached",
+      timeout: 15_000,
+    });
+    return true;
+  } catch (error) {
+    if (isTimeoutError(error)) return false;
+    throw error;
+  }
+}
+
+async function waitForResult(
+  page: Page,
+  successSelector: string | null,
+  failureSelector: string | null,
+  waitForDefaultResult?: () => Promise<WaitResult>,
+): Promise<WaitResult> {
+  const waits: Array<Promise<WaitResult>> = [];
+  if (successSelector !== null) {
+    waits.push(
+      waitForSelector(page, successSelector).then((matched) =>
+        matched ? "success" : undefined,
+      ),
+    );
+  }
+  if (failureSelector !== null) {
+    waits.push(
+      waitForSelector(page, failureSelector).then((matched) =>
+        matched ? "failure" : undefined,
+      ),
+    );
+  }
+  if (
+    waitForDefaultResult !== undefined &&
+    (successSelector === null || failureSelector === null)
+  ) {
+    waits.push(waitForDefaultResult());
+  }
+  return Promise.race([
+    ...waits,
+    new Promise<undefined>((resolve) => setTimeout(resolve, 15_000)),
+  ]);
+}
+
 async function waitForLoginResult(
   page: Page,
   successSelector: string | null,
   failureSelector: string | null,
 ): Promise<void> {
-  const waitForSelector = async (selector: string | null): Promise<boolean> => {
-    if (selector === null) return false;
-    try {
-      await page.waitForSelector(selector, {
-        state: "attached",
-        timeout: 15_000,
-      });
-      return true;
-    } catch (error) {
-      if (isTimeoutError(error)) return false;
-      throw error;
-    }
-  };
-
   const waitForDefaultResult = async (): Promise<
     "success" | "failure" | undefined
   > => {
@@ -744,28 +805,12 @@ async function waitForLoginResult(
     return undefined;
   };
 
-  const waits: Array<Promise<"success" | "failure" | undefined>> = [];
-  if (successSelector !== null) {
-    waits.push(
-      waitForSelector(successSelector).then((matched) =>
-        matched ? "success" : undefined,
-      ),
-    );
-  }
-  if (failureSelector !== null) {
-    waits.push(
-      waitForSelector(failureSelector).then((matched) =>
-        matched ? "failure" : undefined,
-      ),
-    );
-  }
-  if (successSelector === null || failureSelector === null) {
-    waits.push(waitForDefaultResult());
-  }
-  const result = await Promise.race([
-    ...waits,
-    new Promise<undefined>((resolve) => setTimeout(resolve, 15_000)),
-  ]);
+  const result = await waitForResult(
+    page,
+    successSelector,
+    failureSelector,
+    waitForDefaultResult,
+  );
   if (result === "failure") throw new InvalidCredentialError();
   if (result !== "success") throw new Error("login result timed out");
 }
@@ -824,35 +869,7 @@ async function waitForDeviceResult(
   successSelector: string,
   failureSelector: string | null,
 ): Promise<void> {
-  const waitForSelector = async (selector: string): Promise<boolean> => {
-    try {
-      await page.waitForSelector(selector, {
-        state: "attached",
-        timeout: 15_000,
-      });
-      return true;
-    } catch (error) {
-      if (isTimeoutError(error)) return false;
-      throw error;
-    }
-  };
-
-  const waits: Array<Promise<"success" | "failure" | undefined>> = [
-    waitForSelector(successSelector).then((matched) =>
-      matched ? "success" : undefined,
-    ),
-  ];
-  if (failureSelector !== null) {
-    waits.push(
-      waitForSelector(failureSelector).then((matched) =>
-        matched ? "failure" : undefined,
-      ),
-    );
-  }
-  const result = await Promise.race([
-    ...waits,
-    new Promise<undefined>((resolve) => setTimeout(resolve, 15_000)),
-  ]);
+  const result = await waitForResult(page, successSelector, failureSelector);
   const classification = classifyDeviceResult(result);
   if (classification === "DEVICE_CODE_REJECTED") {
     throw new DeviceCodeRejectedError();
@@ -893,7 +910,14 @@ async function executeDeviceFlow(
       'button:has-text("Approve")',
     ]);
   } else {
-    await runSteps(page, request.steps, request.secret, request.user_code);
+    await runSteps(
+      page,
+      request.steps,
+      request.secret,
+      request.user_code,
+      false,
+      request.failure_selector,
+    );
   }
   await waitForDeviceResult(
     page,
@@ -972,20 +996,27 @@ async function executeLogin(
 
 async function executeAuthorizeDevice(
   request: AuthorizeDeviceRequest,
-): Promise<void> {
-  const { page, pageSession } = await openBrowserPage();
-  const guard = activeGuard;
-  if (guard === undefined) throw new Error("CDP guard is not available");
+): Promise<ErrorCode | undefined> {
+  let stage: ExecutionStage = "login";
   try {
-    await withGuard(guard, () => page.goto(request.login_url));
-    await withGuard(guard, () =>
-      runSteps(page, null, request.secret, undefined, true),
-    );
-    await withGuard(guard, () => waitForLoginResult(page, null, null));
-    await withGuard(guard, () => page.goto(request.verification_url));
-    await withGuard(guard, () => executeDeviceFlow(page, request));
-  } finally {
-    await pageSession.detach().catch(() => undefined);
+    const { page, pageSession } = await openBrowserPage();
+    const guard = activeGuard;
+    if (guard === undefined) throw new Error("CDP guard is not available");
+    try {
+      await withGuard(guard, () => page.goto(request.login_url));
+      await withGuard(guard, () =>
+        runSteps(page, null, request.secret, undefined, true),
+      );
+      await withGuard(guard, () => waitForLoginResult(page, null, null));
+      stage = "device";
+      await withGuard(guard, () => page.goto(request.verification_url));
+      await withGuard(guard, () => executeDeviceFlow(page, request));
+    } finally {
+      await pageSession.detach().catch(() => undefined);
+    }
+    return undefined;
+  } catch (error) {
+    return classifyError(error, stage);
   }
 }
 
@@ -1138,14 +1169,7 @@ async function handleLogin(request: LoginRequest): Promise<void> {
     const { endpoint, targetId } = await executeLogin(request);
     writeResponse({ ok: true, endpoint, target_id: targetId }, request.id);
   } catch (error) {
-    const errorCode: ErrorCode =
-      error instanceof SelectorNotFoundError
-        ? "SELECTOR_NOT_FOUND"
-        : error instanceof InvalidCredentialError
-          ? "INVALID_CREDENTIAL"
-          : error instanceof MfaRequiredError
-            ? "MFA_REQUIRED"
-            : "INTERNAL";
+    const errorCode = classifyError(error, "login");
     await cleanupResources();
     writeResponse({ ok: false, error: errorCode }, request.id);
   }
@@ -1162,21 +1186,7 @@ async function handleAuthorizeDevice(
     return;
   }
 
-  let errorCode: ErrorCode | undefined;
-  try {
-    await executeAuthorizeDevice(request);
-  } catch (error) {
-    errorCode =
-      error instanceof DeviceCodeRejectedError
-        ? "DEVICE_CODE_REJECTED"
-        : error instanceof SelectorNotFoundError
-          ? "SELECTOR_NOT_FOUND"
-          : error instanceof InvalidCredentialError
-            ? "INVALID_CREDENTIAL"
-            : error instanceof MfaRequiredError
-              ? "MFA_REQUIRED"
-              : "INTERNAL";
-  }
+  const errorCode = await executeAuthorizeDevice(request);
   await cleanupResources();
   writeResponse(
     errorCode === undefined ? { ok: true } : { ok: false, error: errorCode },

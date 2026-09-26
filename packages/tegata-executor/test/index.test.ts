@@ -83,12 +83,44 @@ describe("authorize_device protocol", () => {
           { action: "click", selector: "#approve" },
         ],
         { username: "alice", password: "secret", totp: null },
-        "ABCD-EFGH",
-        false,
-        "#device-error",
+        { userCode: "ABCD-EFGH", failureSelector: "#device-error" },
       ),
     ).rejects.toBeInstanceOf(DeviceCodeRejectedError);
     expect(actions).toEqual(["click:#submit"]);
+  });
+
+  test("rechecks the failure selector when a device step times out", async () => {
+    const actions: string[] = [];
+    let rejectionRendered = false;
+    const page = {
+      click: async (selector: string) => {
+        actions.push(`click:${selector}`);
+        if (selector === "#approve") {
+          // 拒否表示が遅れて描画され、次の操作のセレクタ待ちが先に timeout した状況を模す。
+          rejectionRendered = true;
+          const timeout = new Error("locator.click: Timeout 10000ms exceeded");
+          timeout.name = "TimeoutError";
+          throw timeout;
+        }
+      },
+      locator: (selector: string) => ({
+        count: async () =>
+          selector === "#device-error" && rejectionRendered ? 1 : 0,
+      }),
+    } as unknown as Parameters<typeof runSteps>[0];
+
+    const error = await runSteps(
+      page,
+      [
+        { action: "click", selector: "#submit" },
+        { action: "click", selector: "#approve" },
+      ],
+      { username: "alice", password: "secret", totp: null },
+      { userCode: "ABCD-EFGH", failureSelector: "#device-error" },
+    ).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(DeviceCodeRejectedError);
+    expect(classifyError(error, "device")).toBe("DEVICE_CODE_REJECTED");
+    expect(actions).toEqual(["click:#submit", "click:#approve"]);
   });
 
   test("keeps login steps independent from the device failure selector check", async () => {

@@ -1905,6 +1905,8 @@ async fn authorize_device(
     {
         return classified(request.id.clone(), error);
     }
+    #[cfg(not(unix))]
+    let _ = peer;
     let (credential, executor_entry, executor_socket, node_path, browsers_path) = {
         let credential = match resolve_credential(&state, &params.cred_id).await {
             Ok(Some(credential)) => credential,
@@ -2006,6 +2008,14 @@ fn http_origin(value: &str) -> Option<String> {
 
 fn audit_target_url(value: &str) -> Option<String> {
     let origin = http_origin(value)?;
+    let (scheme, authority) = origin.split_once("://")?;
+    // userinfo（`user:pw@`）は認証情報を含みうるため、監査と承認フックへ渡す前に除く。
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    if host.is_empty() {
+        return None;
+    }
     let (_, remainder) = value.split_once("://")?;
     let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
     let path = if remainder[authority_end..].starts_with('/') {
@@ -2017,7 +2027,7 @@ fn audit_target_url(value: &str) -> Option<String> {
     } else {
         ""
     };
-    Some(format!("{origin}{path}"))
+    Some(format!("{scheme}://{host}{path}"))
 }
 
 fn valid_authorize_steps(steps: Option<&[tegata_core::wire::LoginStep]>) -> bool {
@@ -2068,10 +2078,13 @@ async fn approve_authorize_device(
     params: &AuthorizeDeviceParams,
     peer: &PeerIdentity,
 ) -> Result<(), ErrorCode> {
+    // verification_uri_complete の query に載る user_code をフックへ広げないため、
+    // 監査と同じく query・fragment・userinfo を除いた URL を渡す。
+    let target_url = audit_target_url(&params.verification_url).ok_or(ErrorCode::Internal)?;
     approve_command(
         state,
         &params.cred_id,
-        &params.verification_url,
+        &target_url,
         "authorize_device",
         peer,
     )
@@ -3012,32 +3025,49 @@ fn optional_namespace(params: &Value) -> Result<Option<String>, ErrorCode> {
     }
 }
 
+/// 監査へ転記してよい params のキーを method ごとに限定する。
+/// method が解釈しないキーまで転記すると、呼び出し側が監査記録を偽装できるためである。
+fn audit_param_keys(method: &str) -> &'static [&'static str] {
+    match method {
+        "login" => &["cred_id", "target_url"],
+        "authorize_device" => &["cred_id", "verification_url"],
+        "logout" => &["session_id"],
+        "get_totp" => &["cred_id"],
+        "list_credentials" | "lock_vault" => &["namespace"],
+        _ => &[],
+    }
+}
+
 fn audit_fields(method: &str, params: &Value) -> AuditFields {
+    let allowed = audit_param_keys(method);
+    let field = |key: &str| {
+        if !allowed.contains(&key) {
+            return None;
+        }
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    };
     let target_url = match method {
-        "login" => params
-            .get("target_url")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        "authorize_device" => params
-            .get("verification_url")
-            .and_then(Value::as_str)
+        "authorize_device" => field("verification_url")
+            .as_deref()
             .and_then(audit_target_url),
-        _ => None,
+        _ => field("target_url"),
+    };
+    let cred_id = field("cred_id");
+    let namespace = match method {
+        "login" | "authorize_device" | "get_totp" => cred_id
+            .as_deref()
+            .and_then(|cred_id| cred_id.split_once(':'))
+            .map(|(namespace, _)| namespace.to_owned()),
+        _ => field("namespace"),
     };
     AuditFields {
-        cred_id: params
-            .get("cred_id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+        cred_id,
         target_url,
-        session_id: params
-            .get("session_id")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        namespace: params
-            .get("namespace")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
+        session_id: field("session_id"),
+        namespace,
         shared: None,
     }
 }

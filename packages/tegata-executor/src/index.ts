@@ -626,14 +626,19 @@ export function substituteSecrets(
   );
 }
 
+export interface RunStepsOptions {
+  userCode?: string;
+  automaticTotp?: boolean;
+  failureSelector?: string | null;
+}
+
 export async function runSteps(
   page: Page,
   steps: LoginStep[] | DeviceStep[] | null,
   secret: LoginRequest["secret"],
-  userCode?: string,
-  automaticTotp = false,
-  failureSelector: string | null = null,
+  options: RunStepsOptions = {},
 ): Promise<void> {
+  const { userCode, automaticTotp = false, failureSelector = null } = options;
   if (steps !== null) {
     if (
       secret.totp === null &&
@@ -642,21 +647,16 @@ export async function runSteps(
       throw new MfaRequiredError();
     }
     for (const step of steps) {
-      if (step.action === "fill") {
-        await fill(
-          page,
-          step.selector,
-          substituteSecrets(step.value, secret, userCode),
-        );
-      } else {
-        await click(page, step.selector);
-      }
-      if (
-        failureSelector !== null &&
-        (await selectorExists(page, failureSelector))
-      ) {
-        throw new DeviceCodeRejectedError();
-      }
+      await withRejectionCheck(page, failureSelector, () =>
+        step.action === "fill"
+          ? fill(
+              page,
+              step.selector,
+              substituteSecrets(step.value, secret, userCode),
+            )
+          : click(page, step.selector),
+      );
+      await throwIfRejected(page, failureSelector);
     }
     return;
   }
@@ -827,6 +827,35 @@ async function selectorExists(page: Page, selector: string): Promise<boolean> {
   return (await page.locator(selector).count()) > 0;
 }
 
+async function throwIfRejected(
+  page: Page,
+  failureSelector: string | null,
+): Promise<void> {
+  if (
+    failureSelector !== null &&
+    (await selectorExists(page, failureSelector))
+  ) {
+    throw new DeviceCodeRejectedError();
+  }
+}
+
+// SPA 型サイトでは拒否表示が遅れて描画され、次の操作のセレクタ待ちが先に timeout しうる。
+// そのためセレクタ不在で失敗した時点で failure_selector を再確認し、拒否として分類する。
+async function withRejectionCheck(
+  page: Page,
+  failureSelector: string | null,
+  action: () => Promise<void>,
+): Promise<void> {
+  try {
+    await action();
+  } catch (error) {
+    if (error instanceof SelectorNotFoundError) {
+      await throwIfRejected(page, failureSelector);
+    }
+    throw error;
+  }
+}
+
 async function fillFirstMatching(
   page: Page,
   selectors: string[],
@@ -883,41 +912,36 @@ async function executeDeviceFlow(
   page: Page,
   request: AuthorizeDeviceRequest,
 ): Promise<void> {
-  if (request.failure_selector !== null) {
-    if (await selectorExists(page, request.failure_selector)) {
-      throw new DeviceCodeRejectedError();
-    }
-  }
+  const failureSelector = request.failure_selector;
+  await throwIfRejected(page, failureSelector);
   if (request.steps === null) {
-    await fillFirstMatching(
-      page,
-      [
-        'input[name="user_code"]',
-        'input[autocomplete="one-time-code"]',
-        'input[type="text"]',
-      ],
-      request.user_code,
+    await withRejectionCheck(page, failureSelector, () =>
+      fillFirstMatching(
+        page,
+        [
+          'input[name="user_code"]',
+          'input[autocomplete="one-time-code"]',
+          'input[type="text"]',
+        ],
+        request.user_code,
+      ),
     );
-    await clickFirstMatching(page, ['button[type="submit"]']);
-    if (request.failure_selector !== null) {
-      if (await selectorExists(page, request.failure_selector)) {
-        throw new DeviceCodeRejectedError();
-      }
-    }
-    await clickFirstMatching(page, [
-      'button:has-text("Authorize")',
-      'button:has-text("Continue")',
-      'button:has-text("Approve")',
-    ]);
+    await withRejectionCheck(page, failureSelector, () =>
+      clickFirstMatching(page, ['button[type="submit"]']),
+    );
+    await throwIfRejected(page, failureSelector);
+    await withRejectionCheck(page, failureSelector, () =>
+      clickFirstMatching(page, [
+        'button:has-text("Authorize")',
+        'button:has-text("Continue")',
+        'button:has-text("Approve")',
+      ]),
+    );
   } else {
-    await runSteps(
-      page,
-      request.steps,
-      request.secret,
-      request.user_code,
-      false,
-      request.failure_selector,
-    );
+    await runSteps(page, request.steps, request.secret, {
+      userCode: request.user_code,
+      failureSelector,
+    });
   }
   await waitForDeviceResult(
     page,
@@ -1005,7 +1029,7 @@ async function executeAuthorizeDevice(
     try {
       await withGuard(guard, () => page.goto(request.login_url));
       await withGuard(guard, () =>
-        runSteps(page, null, request.secret, undefined, true),
+        runSteps(page, null, request.secret, { automaticTotp: true }),
       );
       await withGuard(guard, () => waitForLoginResult(page, null, null));
       stage = "device";

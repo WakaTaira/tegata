@@ -1,6 +1,6 @@
 # MCP tool contract
 
-This is the complete surface tegata exposes to an agent. Five tools, no generic
+This is the complete surface tegata exposes to an agent. Six tools, no generic
 escape hatch. Anything not listed here does not cross the boundary.
 
 ## Connecting

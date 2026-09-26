@@ -100,8 +100,8 @@ to container peers as well: sessions owned by another principal return
 
 ### 3. Only a thin, allowlisted RPC crosses the boundary
 
-Six methods exist: `status`, `list_credentials`, `login`, `logout`, `get_totp`,
-`lock_vault`, plus two administrative methods on Windows. Anything else is
+Seven methods exist: `status`, `list_credentials`, `login`, `authorize_device`,
+`logout`, `get_totp`, `lock_vault`, plus two administrative methods on Windows. Anything else is
 answered with a JSON-RPC method-not-found error. There is no generic "run this on
 the isolated side" call, because such a call would be the boundary's own bypass.
 
@@ -274,7 +274,7 @@ this control exists to avoid. Gating on a credential that actually exists keeps 
 prompt rare and meaningful, and preserves the quiet `INVALID_CREDENTIAL` refusal
 for everything else.
 
-**The hook is told references, never values.** It receives exactly three
+**The hook is told references, never values.** It receives exactly four
 environment variables:
 
 | Variable | Contents |

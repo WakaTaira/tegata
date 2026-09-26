@@ -60,7 +60,7 @@ use super::{
     Accepted, CdpPortResolver, ClientStream, ListenConfig, PeerAuthenticator, PeerIdentity,
     TcpTransport, Transport,
 };
-use crate::interop::{Origin, ProcEntry, classify_ancestry, trace_ancestry};
+use crate::interop::{Origin, OriginWalk, ProcEntry, classify_ancestry, trace_ancestry};
 
 /// Configuration keys owned by this transport.
 #[derive(Clone, Debug, Deserialize)]
@@ -200,6 +200,7 @@ struct ClientIdentity {
     administrator: bool,
     pid: u32,
     origin: Origin,
+    origin_walk: OriginWalk,
 }
 
 struct TokenIdentity {
@@ -313,8 +314,8 @@ async fn validate_client(
         return None;
     }
     let client_pid = client_process_id(&connected).unwrap_or(0);
-    let origin = process_origin(client_pid);
-    let identity = client_identity(&connected, client_pid, origin).ok()?;
+    let (origin, origin_walk) = process_origin(client_pid);
+    let identity = client_identity(&connected, client_pid, origin, origin_walk).ok()?;
     let normal_allowed = allowed_sids.iter().any(|sid| sid == &identity.sid);
     if !normal_allowed && !(identity.administrator && identity.elevated) {
         return None;
@@ -327,6 +328,7 @@ async fn validate_client(
             normal_allowed,
             pid: identity.pid,
             origin: identity.origin,
+            origin_walk: identity.origin_walk,
         },
         PrefixedStream::new(prefix[0], connected),
     ))
@@ -439,16 +441,21 @@ fn client_process_id(pipe: &NamedPipeServer) -> io::Result<u32> {
     Ok(pid)
 }
 
-fn process_origin(client_pid: u32) -> Origin {
-    if client_pid == 0 {
-        return Origin::Unknown;
+fn process_origin(client_pid: u32) -> (Origin, OriginWalk) {
+    // PID を取得できなかった場合はプロセス表を取らず、空の表で走査して client_missing とする。
+    let mut table = Vec::new();
+    if client_pid != 0 {
+        table = match process_table() {
+            Ok(table) => table,
+            Err(_) => return (Origin::Unknown, OriginWalk::SnapshotFailed),
+        };
+        fill_creation_times(client_pid, &mut table);
     }
-    let mut table = match process_table() {
-        Ok(table) => table,
-        Err(_) => return Origin::Unknown,
-    };
-    fill_creation_times(client_pid, &mut table);
-    classify_ancestry(client_pid, &table)
+    let trace = trace_ancestry(client_pid, &table);
+    (
+        classify_ancestry(&trace),
+        OriginWalk::Terminated(trace.termination),
+    )
 }
 
 fn process_table() -> io::Result<Vec<ProcEntry>> {
@@ -490,8 +497,12 @@ fn process_table() -> io::Result<Vec<ProcEntry>> {
 }
 
 fn fill_creation_times(client_pid: u32, table: &mut [ProcEntry]) {
-    let ancestry = trace_ancestry(client_pid, table);
-    for pid in ancestry.pids {
+    let pids: Vec<u32> = trace_ancestry(client_pid, table)
+        .chain
+        .iter()
+        .map(|entry| entry.pid)
+        .collect();
+    for pid in pids {
         let created = process_creation_time(pid);
         if let Some(entry) = table.iter_mut().find(|entry| entry.pid == pid) {
             entry.created = created;
@@ -530,7 +541,12 @@ fn process_creation_time(pid: u32) -> Option<u64> {
 /// belongs to another account. Impersonation is bound to the calling thread,
 /// so the token is opened and the impersonation reverted without an
 /// intervening suspension point.
-fn client_identity(pipe: &NamedPipeServer, pid: u32, origin: Origin) -> io::Result<ClientIdentity> {
+fn client_identity(
+    pipe: &NamedPipeServer,
+    pid: u32,
+    origin: Origin,
+    origin_walk: OriginWalk,
+) -> io::Result<ClientIdentity> {
     let handle = pipe.as_raw_handle();
     // SAFETY: `handle` belongs to a connected named pipe whose client has already sent data.
     if unsafe { ImpersonateNamedPipeClient(handle) } == 0 {
@@ -571,6 +587,7 @@ fn client_identity(pipe: &NamedPipeServer, pid: u32, origin: Origin) -> io::Resu
         administrator,
         pid,
         origin,
+        origin_walk,
     })
 }
 

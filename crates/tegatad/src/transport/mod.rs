@@ -15,7 +15,7 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
-use crate::interop::Origin;
+use crate::interop::{Origin, OriginWalk};
 use std::future::Future;
 use std::io;
 
@@ -80,6 +80,7 @@ pub(crate) enum PeerIdentity {
         normal_allowed: bool,
         pid: u32,
         origin: Origin,
+        origin_walk: OriginWalk,
     },
     /// TCP client that presented a valid preamble token.
     Peer { peer_id: String, label: String },
@@ -134,6 +135,7 @@ impl serde::Serialize for PeerIdentity {
                 administrator,
                 pid,
                 origin,
+                origin_walk,
                 ..
             } => {
                 map.serialize_entry("peer_sid", sid)?;
@@ -141,6 +143,7 @@ impl serde::Serialize for PeerIdentity {
                 map.serialize_entry("administrator", administrator)?;
                 map.serialize_entry("peer_pid", pid)?;
                 map.serialize_entry("peer_origin", &origin.as_str())?;
+                map.serialize_entry("peer_origin_walk", &origin_walk.as_str())?;
             }
             Self::Peer { peer_id, label } => {
                 map.serialize_entry("peer_token", &true)?;

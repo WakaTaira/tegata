@@ -87,10 +87,13 @@ cycle, a parent whose creation time is later than the child's when both are
 available, or the depth limit. Among the verified entries, an ancestry containing
 `wsl.exe`, `wslhost.exe`, `wslservice.exe`, `wslrelay.exe`, or `wslg.exe` is
 classified as `wsl_interop` and is refused even when the token is elevated and
-belongs to the Administrators group. A client PID missing from the snapshot or a
-failed snapshot is `unknown` and is refused; the other walk termination cases are
-`native` when no interop executable was seen. This is a heuristic and fails
-closed; the [non-elevated WSL startup procedure](setup-windows-wsl.md#how-the-distro-is-started-matters)
+belongs to the Administrators group. The check fails closed only when the caller
+itself cannot be found: a client PID that cannot be obtained, a failed snapshot,
+or a client PID missing from the snapshot is `unknown` and is refused. A walk that
+ends at any of the other termination cases is judged on the chain it verified and
+is `native` when no interop executable was seen, so an interop launch whose host
+process has already exited — a detached start — is not detected. The check is
+defense in depth; the [non-elevated WSL startup procedure](setup-windows-wsl.md#how-the-distro-is-started-matters)
 remains the primary defense for issue #12.
 
 Running the daemon *inside* the same WSL distro as the agent is possible with the
@@ -335,9 +338,11 @@ credential value by construction.
 **The peer field names the caller in the vocabulary of the transport that
 authenticated it.** On Linux that is `peer_uid`. On Windows a named pipe client
 contributes `peer_sid` together with `elevated`, `administrator`, `peer_pid`, and
-`peer_origin` (`native`, `wsl_interop`, or `unknown`), so the log shows not just
-who called an administrative RPC but on what authority and process path; a
-token-authenticated TCP client contributes `peer_token`.
+`peer_origin` (`native`, `wsl_interop`, or `unknown`) with `peer_origin_walk`, the
+reason the ancestry walk ended (`client_missing`, `parent_missing`, `root`,
+`cycle`, `creation_time_reversed`, `depth_limit`, or `snapshot_failed`), so the log
+shows not just who called an administrative RPC but on what authority and process
+path; a token-authenticated TCP client contributes `peer_token`.
 
 **The daemon audits its own actions too.** Not everything worth recording is
 something an agent asked for, so three events carry `"peer_system": true` instead

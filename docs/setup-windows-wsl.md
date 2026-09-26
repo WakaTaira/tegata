@@ -372,6 +372,8 @@ service.
 
 **To record the service's stderr.** Add `TEGATA_LOG_FILE=C:\ProgramData\tegata\daemon.log` to the service's `Environment` registry value to append stderr to that file. Place the file under the state directory in a location readable only by the service account. It does not contain secret values, but it does contain paths and error messages.
 
+For each Bitwarden CLI invocation, the daemon writes a `tegatad: bw_diag {…}` line to stderr with the operation name, attempt count, duration, failure kind, exit code, and truncated stderr; it contains no stdout, session key, password, or email. At startup it writes a `tegatad: bw_version …` line to stderr. View these lines in the file configured by `TEGATA_LOG_FILE`.
+
 **The browser fails to launch.** The Playwright browser revision must match the
 `playwright-core` bundled with the executor, and the service account needs read
 access to `browsers_path`. A revision mismatch fails immediately at launch.

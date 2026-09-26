@@ -23,6 +23,7 @@ const ERROR_CODES = [
   "TOTP_NOT_EXPOSABLE",
   "APPROVAL_DENIED",
   "APPROVAL_TIMEOUT",
+  "PROVIDER_UNAVAILABLE",
   "INTERNAL",
 ] as const;
 type ErrorCode = (typeof ERROR_CODES)[number];

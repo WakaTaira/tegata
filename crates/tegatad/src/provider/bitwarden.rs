@@ -14,6 +14,8 @@ use crate::ErrorCode;
 use crate::UnlockMode;
 
 const BW_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const BW_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+const BW_RESYNC_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(crate) struct BitwardenCliProvider {
     namespace: String,
@@ -26,6 +28,7 @@ pub(crate) struct BitwardenCliProvider {
     session_ttl: Duration,
     session: Option<Secret>,
     unlocked_at: Option<Instant>,
+    last_sync_at: Option<Instant>,
     locked: bool,
     autolock_event_pending: bool,
     catalog: Vec<BitwardenCatalogItem>,
@@ -131,6 +134,22 @@ struct BwDiagnosticInput<'a> {
     io_error: Option<io::ErrorKind>,
 }
 
+fn duration_from_env(name: &str, default: Duration) -> Duration {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(default)
+}
+
+fn bw_sync_timeout() -> Duration {
+    duration_from_env("TEGATA_BW_SYNC_TIMEOUT_MS", BW_SYNC_TIMEOUT)
+}
+
+fn bw_resync_interval() -> Duration {
+    duration_from_env("TEGATA_BW_RESYNC_INTERVAL_MS", BW_RESYNC_INTERVAL)
+}
+
 #[derive(Debug)]
 enum BwRunError {
     CreateDir(io::Error),
@@ -159,6 +178,29 @@ impl fmt::Display for BwRunError {
 }
 
 impl std::error::Error for BwRunError {}
+
+enum BwOperationError {
+    Normal(ErrorCode),
+    NoColdStartRetry(ErrorCode),
+}
+
+impl From<ErrorCode> for BwOperationError {
+    fn from(error: ErrorCode) -> Self {
+        Self::Normal(error)
+    }
+}
+
+impl BwOperationError {
+    fn into_error_code(self) -> ErrorCode {
+        match self {
+            Self::Normal(error) | Self::NoColdStartRetry(error) => error,
+        }
+    }
+
+    fn can_retry_cold_start(&self) -> bool {
+        matches!(self, Self::Normal(ErrorCode::ProviderUnavailable))
+    }
+}
 
 impl BwRunError {
     fn stderr(&self) -> &[u8] {
@@ -343,6 +385,7 @@ impl BitwardenCliProvider {
             session_ttl: config.session_ttl,
             session: None,
             unlocked_at: None,
+            last_sync_at: None,
             locked: false,
             autolock_event_pending: false,
             catalog: Vec::new(),
@@ -388,7 +431,19 @@ impl BitwardenCliProvider {
         password: Option<&Secret>,
         context: BwAttemptContext,
     ) -> Result<BwOutput, BwRunError> {
-        self.run_bw_unreported(args, session, password, context)
+        self.run_bw_with_timeout(args, session, password, context, BW_COMMAND_TIMEOUT)
+            .await
+    }
+
+    async fn run_bw_with_timeout(
+        &self,
+        args: &[String],
+        session: Option<&Secret>,
+        password: Option<&Secret>,
+        context: BwAttemptContext,
+        command_timeout: Duration,
+    ) -> Result<BwOutput, BwRunError> {
+        self.run_bw_unreported(args, session, password, context, command_timeout)
             .await
             .map_err(|(error, diagnostic)| {
                 emit_bw_diag(diagnostic, Some(error.failure()), None);
@@ -404,6 +459,7 @@ impl BitwardenCliProvider {
         session: Option<&Secret>,
         password: Option<&Secret>,
         context: BwAttemptContext,
+        command_timeout: Duration,
     ) -> Result<BwOutput, (BwRunError, BwDiagnosticBase)> {
         let started_at = Instant::now();
         if let Err(error) = tokio::fs::create_dir_all(&self.appdata_dir).await {
@@ -443,12 +499,17 @@ impl BitwardenCliProvider {
         if let Some(password) = password {
             command.env("BW_PASSWORD", password.as_str());
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.as_std_mut().process_group(0);
+        }
         let result = match command.spawn() {
             Ok(mut child) => match (child.stdout.take(), child.stderr.take()) {
                 (Some(mut stdout), Some(mut stderr)) => {
                     let mut stdout_output = Vec::new();
                     let mut stderr_output = Vec::new();
-                    match timeout(BW_COMMAND_TIMEOUT, async {
+                    match timeout(command_timeout, async {
                         let (status, stdout_result, stderr_result) = tokio::join!(
                             child.wait(),
                             stdout.read_to_end(&mut stdout_output),
@@ -492,6 +553,9 @@ impl BitwardenCliProvider {
                     {
                         Ok(result) => result,
                         Err(_) => {
+                            #[cfg(unix)]
+                            crate::kill_process_group(&child);
+                            #[cfg(windows)]
                             let _ = child.start_kill();
                             let _ = child.wait().await;
                             let _ = stderr.read_to_end(&mut stderr_output).await;
@@ -500,6 +564,9 @@ impl BitwardenCliProvider {
                     }
                 }
                 (stdout, stderr) => {
+                    #[cfg(unix)]
+                    crate::kill_process_group(&child);
+                    #[cfg(windows)]
                     let _ = child.start_kill();
                     let _ = child.wait().await;
                     let mut stderr_output = Vec::new();
@@ -718,9 +785,27 @@ impl BitwardenCliProvider {
         Err(ErrorCode::Internal)
     }
 
+    async fn sync_session(&mut self, context: BwAttemptContext) -> Result<(), BwRunError> {
+        self.last_sync_at = Some(Instant::now());
+        let output = self
+            .run_bw_with_timeout(
+                &["sync".to_owned()],
+                self.session.as_ref(),
+                None,
+                context,
+                bw_sync_timeout(),
+            )
+            .await?;
+        output.finish(None, None);
+        Ok(())
+    }
+
     async fn login_check(&self, context: BwAttemptContext) -> Result<bool, ErrorCode> {
         let args = vec!["login".to_owned(), "--check".to_owned()];
-        match self.run_bw_unreported(&args, None, None, context).await {
+        match self
+            .run_bw_unreported(&args, None, None, context, BW_COMMAND_TIMEOUT)
+            .await
+        {
             Ok(output) => {
                 output.finish(None, Some("logged_in"));
                 Ok(true)
@@ -741,9 +826,12 @@ impl BitwardenCliProvider {
         }
     }
 
-    async fn ensure_session(&mut self, context: BwAttemptContext) -> Result<(), ErrorCode> {
+    async fn ensure_session(&mut self, context: BwAttemptContext) -> Result<(), BwOperationError> {
         if let (Some(_session), Some(unlocked_at)) = (&self.session, self.unlocked_at) {
             if unlocked_at.elapsed() < self.session_ttl {
+                if should_resync(self.last_sync_at, Instant::now(), bw_resync_interval()) {
+                    let _ = self.sync_session(context).await;
+                }
                 return Ok(());
             }
             self.expire_session().await;
@@ -769,7 +857,9 @@ impl BitwardenCliProvider {
                 output.finish(None, None);
                 current_server
             }
-            Err(error) => return Err(classify_bw_run_error(&error)),
+            Err(error) => {
+                return Err(BwOperationError::Normal(classify_bw_run_error(&error)));
+            }
         };
         if current_server.as_deref() != Some(self.server_url.as_str()) {
             // If the server differs, the login state must be discarded before changing the configuration.
@@ -791,7 +881,7 @@ impl BitwardenCliProvider {
                 context,
             )
             .await
-            .map_err(|_| ErrorCode::Internal)?;
+            .map_err(|error| classify_bw_run_error(&error))?;
         }
         let logged_in = self.login_check(context).await?;
         let login_args = if logged_in {
@@ -802,13 +892,14 @@ impl BitwardenCliProvider {
         self.establish_session(&login_args, &password, context)
             .await?;
         drop(password);
-        if self
-            .run_bw_with_context(&["sync".to_owned()], self.session.as_ref(), None, context)
-            .await
-            .is_err()
-        {
+        if let Err(error) = self.sync_session(context).await {
             self.session = None;
             self.unlocked_at = None;
+            if !should_retry_login_after_sync(&error) {
+                return Err(BwOperationError::NoColdStartRetry(classify_bw_run_error(
+                    &error,
+                )));
+            }
             let _ = self
                 .run_bw_with_context(&["logout".to_owned()], None, None, context)
                 .await;
@@ -818,13 +909,12 @@ impl BitwardenCliProvider {
             self.establish_session(&login_args, &password, context)
                 .await?;
             drop(password);
-            if let Err(error) = self
-                .run_bw_with_context(&["sync".to_owned()], self.session.as_ref(), None, context)
-                .await
-            {
+            if let Err(error) = self.sync_session(context).await {
                 self.session = None;
                 self.unlocked_at = None;
-                return Err(classify_bw_run_error(&error));
+                return Err(BwOperationError::NoColdStartRetry(classify_bw_run_error(
+                    &error,
+                )));
             }
         }
         self.unlocked_at = Some(Instant::now());
@@ -860,7 +950,7 @@ impl BitwardenCliProvider {
     async fn list_items(
         &mut self,
         context: BwAttemptContext,
-    ) -> Result<Vec<BitwardenItem>, ErrorCode> {
+    ) -> Result<Vec<BitwardenItem>, BwOperationError> {
         self.ensure_session(context).await?;
         let output = self
             .run_bw_with_context(
@@ -870,7 +960,7 @@ impl BitwardenCliProvider {
                 context,
             )
             .await
-            .map_err(|error| classify_bw_run_error(&error))?;
+            .map_err(|error| BwOperationError::Normal(classify_bw_run_error(&error)))?;
         match serde_json::from_slice::<Vec<BitwardenItem>>(&output.stdout) {
             Ok(items) => {
                 output.finish(None, None);
@@ -879,14 +969,16 @@ impl BitwardenCliProvider {
             Err(_) => {
                 log_bw_parse_error("list items");
                 output.finish(Some("parse"), None);
-                Err(ErrorCode::Internal)
+                Err(BwOperationError::Normal(ErrorCode::Internal))
             }
         }
     }
 
     async fn get_item(&mut self, item_id: &str) -> Result<BitwardenItem, ErrorCode> {
         let context = BwAttemptContext::new(false, 1);
-        self.ensure_session(context).await?;
+        self.ensure_session(context)
+            .await
+            .map_err(BwOperationError::into_error_code)?;
         let output = self
             .run_bw_with_context(
                 &["get".to_owned(), "item".to_owned(), item_id.to_owned()],
@@ -928,11 +1020,13 @@ impl BitwardenCliProvider {
         let method = crate::current_rpc_method();
         let retry_cold_start = can_retry_cold_start(context, method.as_deref());
         let items = match self.list_items(context).await {
-            Err(ErrorCode::ProviderUnavailable) if retry_cold_start => {
+            Err(error) if retry_cold_start && error.can_retry_cold_start() => {
                 sleep(Duration::from_secs(2)).await;
-                self.list_items(context.with_attempt(2)).await?
+                self.list_items(context.with_attempt(2))
+                    .await
+                    .map_err(BwOperationError::into_error_code)?
             }
-            result => result?,
+            result => result.map_err(BwOperationError::into_error_code)?,
         };
         self.catalog = items
             .iter()
@@ -991,6 +1085,14 @@ fn can_retry_cold_start(context: BwAttemptContext, method: Option<&str>) -> bool
     context.cold_start && method == Some("list_credentials")
 }
 
+fn should_resync(last_sync_at: Option<Instant>, now: Instant, interval: Duration) -> bool {
+    last_sync_at.is_none_or(|last_sync_at| now.duration_since(last_sync_at) >= interval)
+}
+
+fn should_retry_login_after_sync(error: &BwRunError) -> bool {
+    matches!(error, BwRunError::NonZeroExit(_, _))
+}
+
 impl CredentialProvider for BitwardenCliProvider {
     fn list_refs(&mut self) -> ProviderFuture<'_, Vec<CredentialRef>> {
         Box::pin(self.list_refs_inner())
@@ -1029,10 +1131,12 @@ impl CredentialProvider for BitwardenCliProvider {
 mod tests {
     use super::{
         BwAttemptContext, BwRunError, can_retry_cold_start, classify_bw_run_error,
-        issued_session_secrets, sanitize_stderr,
+        issued_session_secrets, sanitize_stderr, should_resync, should_retry_login_after_sync,
     };
     use crate::ErrorCode;
     use std::path::Path;
+    use std::time::Duration;
+    use tokio::time::Instant;
 
     #[test]
     fn classifies_process_and_timeout_as_provider_unavailable() {
@@ -1132,5 +1236,45 @@ mod tests {
         assert!(!can_retry_cold_start(context, Some("login")));
         assert!(!can_retry_cold_start(context, Some("status")));
         assert!(!can_retry_cold_start(context, None));
+    }
+
+    #[test]
+    fn resyncs_when_the_last_attempt_is_missing_or_due() {
+        let std_now = std::time::Instant::now();
+        let now = Instant::from_std(std_now);
+        let old = Instant::from_std(std_now - Duration::from_secs(60));
+        assert!(should_resync(None, now, Duration::from_secs(60)));
+        assert!(!should_resync(Some(now), now, Duration::from_secs(60)));
+        assert!(should_resync(Some(old), now, Duration::from_secs(60)));
+        assert!(should_resync(Some(now), now, Duration::ZERO));
+    }
+
+    #[test]
+    fn retries_login_only_after_a_nonzero_sync_exit() {
+        assert!(!should_retry_login_after_sync(&BwRunError::Timeout(
+            Vec::new()
+        )));
+        assert!(!should_retry_login_after_sync(&BwRunError::Process(
+            std::io::Error::other("process"),
+            Vec::new(),
+        )));
+        assert!(!should_retry_login_after_sync(&BwRunError::CreateDir(
+            std::io::Error::other("directory"),
+        )));
+
+        #[cfg(unix)]
+        let status = std::process::Command::new("sh")
+            .args(["-c", "exit 1"])
+            .status()
+            .expect("spawn shell");
+        #[cfg(windows)]
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "exit", "1"])
+            .status()
+            .expect("spawn command shell");
+        assert!(should_retry_login_after_sync(&BwRunError::NonZeroExit(
+            status,
+            Vec::new(),
+        )));
     }
 }

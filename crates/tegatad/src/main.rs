@@ -1486,9 +1486,15 @@ async fn handle_request(
     }
     if request.method.starts_with("admin_") {
         if !peer.allows_admin_rpc(operator_uids) {
-            if let PeerIdentity::Sid { origin, .. } = peer {
+            if let PeerIdentity::Sid {
+                origin,
+                elevated,
+                administrator,
+                ..
+            } = peer
+            {
                 eprintln!(
-                    "tegatad: admin rpc refused: peer origin {}",
+                    "tegatad: admin rpc refused: peer origin {} (elevated={elevated}, administrator={administrator})",
                     origin.as_str()
                 );
             }

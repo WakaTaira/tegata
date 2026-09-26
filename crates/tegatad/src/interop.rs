@@ -35,52 +35,86 @@ pub(crate) enum AncestryTermination {
     DepthLimit,
 }
 
+impl AncestryTermination {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientMissing => "client_missing",
+            Self::ParentMissing => "parent_missing",
+            Self::Root => "root",
+            Self::Cycle => "cycle",
+            Self::CreationTimeReversed => "creation_time_reversed",
+            Self::DepthLimit => "depth_limit",
+        }
+    }
+}
+
+/// 監査に記録する祖先走査の結末です。
+///
+/// プロセス表を取得できず走査に至らなかった場合を、走査の終了理由と区別して表します。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OriginWalk {
+    Terminated(AncestryTermination),
+    SnapshotFailed,
+}
+
+impl OriginWalk {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminated(termination) => termination.as_str(),
+            Self::SnapshotFailed => "snapshot_failed",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AncestryTrace {
-    pub(crate) pids: Vec<u32>,
+pub(crate) struct AncestryTrace<'a> {
+    pub(crate) chain: Vec<&'a ProcEntry>,
     pub(crate) termination: AncestryTermination,
 }
 
-pub(crate) fn trace_ancestry(client_pid: u32, table: &[ProcEntry]) -> AncestryTrace {
+pub(crate) fn trace_ancestry(client_pid: u32, table: &[ProcEntry]) -> AncestryTrace<'_> {
+    // Toolhelp の表には PID 0 の System Idle Process（ppid 0）が含まれる。PID 0 をそのまま
+    // 探すと Root で走査を終えて Native と判定され、PID を取得できなかった caller が
+    // 管理 RPC を通る（fail-open）。これを防ぐため、client が表に無い場合と同じく扱う。
     if client_pid == 0 {
         return AncestryTrace {
-            pids: Vec::new(),
+            chain: Vec::new(),
             termination: AncestryTermination::ClientMissing,
         };
     }
 
     let mut current_pid = client_pid;
-    let mut pids = Vec::new();
+    let mut chain: Vec<&ProcEntry> = Vec::new();
 
     for _ in 0..=MAX_ANCESTRY_DEPTH {
         let Some(current) = table.iter().find(|entry| entry.pid == current_pid) else {
             return AncestryTrace {
-                termination: if pids.is_empty() {
+                termination: if chain.is_empty() {
                     AncestryTermination::ClientMissing
                 } else {
                     AncestryTermination::ParentMissing
                 },
-                pids,
+                chain,
             };
         };
-        pids.push(current.pid);
+        chain.push(current);
         if current.ppid == 0 {
             return AncestryTrace {
-                pids,
+                chain,
                 termination: AncestryTermination::Root,
             };
         }
         // Windows は PID を再利用するため、終了済みの祖先の PID が別プロセスに割り当てられ、
         // 親の連鎖が循環することがある。循環は正規の経路でも生じるため、終了条件として扱う。
-        if pids.contains(&current.ppid) {
+        if chain.iter().any(|entry| entry.pid == current.ppid) {
             return AncestryTrace {
-                pids,
+                chain,
                 termination: AncestryTermination::Cycle,
             };
         }
         let Some(parent) = table.iter().find(|entry| entry.pid == current.ppid) else {
             return AncestryTrace {
-                pids,
+                chain,
                 termination: AncestryTermination::ParentMissing,
             };
         };
@@ -90,7 +124,7 @@ pub(crate) fn trace_ancestry(client_pid: u32, table: &[ProcEntry]) -> AncestryTr
             && parent_created > child_created
         {
             return AncestryTrace {
-                pids,
+                chain,
                 termination: AncestryTermination::CreationTimeReversed,
             };
         }
@@ -98,7 +132,7 @@ pub(crate) fn trace_ancestry(client_pid: u32, table: &[ProcEntry]) -> AncestryTr
     }
 
     AncestryTrace {
-        pids,
+        chain,
         termination: AncestryTermination::DepthLimit,
     }
 }
@@ -107,17 +141,15 @@ pub(crate) fn trace_ancestry(client_pid: u32, table: &[ProcEntry]) -> AncestryTr
 ///
 /// client 自身が表に無い場合のみ `Unknown` とする。親の終了や PID 再利用による
 /// 打ち切りは正規の経路でも常に生じるため、それまでの鎖で判定する。
-pub(crate) fn classify_ancestry(client_pid: u32, table: &[ProcEntry]) -> Origin {
-    let trace = trace_ancestry(client_pid, table);
+pub(crate) fn classify_ancestry(trace: &AncestryTrace<'_>) -> Origin {
     if trace.termination == AncestryTermination::ClientMissing {
         return Origin::Unknown;
     }
-    if trace.pids.iter().any(|pid| {
-        table
-            .iter()
-            .find(|entry| entry.pid == *pid)
-            .is_some_and(|entry| is_wsl_interop_executable(&entry.exe))
-    }) {
+    if trace
+        .chain
+        .iter()
+        .any(|entry| is_wsl_interop_executable(&entry.exe))
+    {
         Origin::WslInterop
     } else {
         Origin::Native
@@ -170,7 +202,10 @@ mod tests {
             entry(30, 40, "pwsh.exe", 10),
         ];
 
-        assert_eq!(classify_ancestry(10, &table), Origin::WslInterop);
+        assert_eq!(
+            classify_ancestry(&trace_ancestry(10, &table)),
+            Origin::WslInterop
+        );
     }
 
     #[test]
@@ -182,7 +217,10 @@ mod tests {
             entry(40, 50, "svchost.exe", 10),
         ];
 
-        assert_eq!(classify_ancestry(10, &table), Origin::WslInterop);
+        assert_eq!(
+            classify_ancestry(&trace_ancestry(10, &table)),
+            Origin::WslInterop
+        );
     }
 
     #[test]
@@ -192,7 +230,10 @@ mod tests {
             entry(20, 30, "explorer.exe", 20),
         ];
 
-        assert_eq!(classify_ancestry(10, &table), Origin::Native);
+        assert_eq!(
+            classify_ancestry(&trace_ancestry(10, &table)),
+            Origin::Native
+        );
         assert_eq!(
             trace_ancestry(10, &table).termination,
             AncestryTermination::ParentMissing
@@ -203,7 +244,20 @@ mod tests {
     fn missing_client_pid_is_unknown() {
         let table = [entry(20, 0, "explorer.exe", 20)];
 
-        assert_eq!(classify_ancestry(10, &table), Origin::Unknown);
+        assert_eq!(
+            classify_ancestry(&trace_ancestry(10, &table)),
+            Origin::Unknown
+        );
+    }
+
+    #[test]
+    fn zero_client_pid_is_unknown_despite_idle_process() {
+        let table = [entry(0, 0, "[System Process]", 0)];
+
+        assert_eq!(
+            classify_ancestry(&trace_ancestry(0, &table)),
+            Origin::Unknown
+        );
     }
 
     #[test]
@@ -214,7 +268,10 @@ mod tests {
             entry(30, 0, "wsl.exe", 10),
         ];
 
-        assert_eq!(classify_ancestry(10, &table), Origin::Native);
+        assert_eq!(
+            classify_ancestry(&trace_ancestry(10, &table)),
+            Origin::Native
+        );
         assert_eq!(
             trace_ancestry(10, &table).termination,
             AncestryTermination::CreationTimeReversed
@@ -228,7 +285,10 @@ mod tests {
             entry(20, 30, "WSL.EXE", 10),
         ];
 
-        assert_eq!(classify_ancestry(10, &table), Origin::WslInterop);
+        assert_eq!(
+            classify_ancestry(&trace_ancestry(10, &table)),
+            Origin::WslInterop
+        );
     }
 
     #[test]
@@ -239,7 +299,10 @@ mod tests {
             .collect();
         table.push(entry_without_creation(depth + 2, 0, "wsl.exe"));
 
-        assert_eq!(classify_ancestry(1, &table), Origin::Native);
+        assert_eq!(
+            classify_ancestry(&trace_ancestry(1, &table)),
+            Origin::Native
+        );
         assert_eq!(
             trace_ancestry(1, &table).termination,
             AncestryTermination::DepthLimit
@@ -258,7 +321,10 @@ mod tests {
             entry_without_creation(1676, 2228, "svchost.exe"),
         ];
 
-        assert_eq!(classify_ancestry(23564, &table), Origin::Native);
+        assert_eq!(
+            classify_ancestry(&trace_ancestry(23564, &table)),
+            Origin::Native
+        );
         assert_eq!(
             trace_ancestry(23564, &table).termination,
             AncestryTermination::Cycle

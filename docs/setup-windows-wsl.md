@@ -25,9 +25,10 @@ gate also rejects a caller whose verified process ancestry contains a WSL intero
 executable. A missing client PID or failed process snapshot is classified as
 unknown and refused. A missing parent, root process, cycle, creation-time
 reversal, or depth limit ends the verified walk; without an interop executable
-in that walk, the caller is classified as native. The protected files stay
-protected, and the administrative RPC surface remains unavailable to an interop
-caller.
+in that walk, the caller is classified as native. An interop launch whose host
+process has already exited — a detached start — is therefore not detected, so
+the ancestry check is defense in depth and the startup procedure below is the
+primary defense. The protected files stay protected either way.
 
 Start the distro from a non-elevated interactive session: the user's own
 terminal, or an at-logon task with the interactive logon type ("run only when
@@ -400,8 +401,11 @@ be elevated, belong to the local Administrators group, and have `peer_origin`
 contains a WSL interop executable and `unknown` when the client PID is absent or
 the process snapshot fails; both origins are intentionally refused. A walk that
 ends at a missing parent, root process, cycle, creation-time reversal, or depth
-limit remains `native` when no interop executable was seen. The daemon's stderr
-also reports `tegatad: admin rpc refused: peer origin <origin>`. See [How the
+limit remains `native` when no interop executable was seen; `peer_origin_walk`
+records which of these ended the walk, or `snapshot_failed`. The daemon's stderr
+also reports
+`tegatad: admin rpc refused: peer origin <origin> (elevated=<bool>, administrator=<bool>)`.
+See [How the
 distro is started matters](#how-the-distro-is-started-matters) and keep the
 distro on a non-elevated interactive token.
 

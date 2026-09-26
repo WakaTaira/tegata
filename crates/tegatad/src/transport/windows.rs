@@ -28,7 +28,10 @@ use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::mpsc;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_NO_MORE_FILES, FILETIME, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    LocalFree,
+};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GAA_FLAG_INCLUDE_PREFIX, GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
 };
@@ -41,16 +44,23 @@ use windows_sys::Win32::Security::{
     SECURITY_ATTRIBUTES, SECURITY_NT_AUTHORITY, TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY,
     TOKEN_USER, TokenElevation, TokenUser,
 };
-use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
+use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient};
 use windows_sys::Win32::System::SystemServices::{
     DOMAIN_ALIAS_RID_ADMINS, SECURITY_BUILTIN_DOMAIN_RID,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentThread, GetProcessTimes, OpenProcess, OpenThreadToken,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
 use super::{
     Accepted, CdpPortResolver, ClientStream, ListenConfig, PeerAuthenticator, PeerIdentity,
     TcpTransport, Transport,
 };
+use crate::interop::{MAX_ANCESTRY_DEPTH, Origin, ProcEntry, classify_ancestry};
 
 /// Configuration keys owned by this transport.
 #[derive(Clone, Debug, Deserialize)]
@@ -188,6 +198,8 @@ struct ClientIdentity {
     sid: String,
     elevated: bool,
     administrator: bool,
+    pid: u32,
+    origin: Origin,
 }
 
 struct OwnedHandle(HANDLE);
@@ -294,7 +306,9 @@ async fn validate_client(
     if !matches!(read, Ok(Ok(1))) {
         return None;
     }
-    let identity = client_identity(&connected).ok()?;
+    let client_pid = client_process_id(&connected).unwrap_or(0);
+    let origin = process_origin(client_pid);
+    let identity = client_identity(&connected, client_pid, origin).ok()?;
     let normal_allowed = allowed_sids.iter().any(|sid| sid == &identity.sid);
     if !normal_allowed && !(identity.administrator && identity.elevated) {
         return None;
@@ -305,6 +319,8 @@ async fn validate_client(
             elevated: identity.elevated,
             administrator: identity.administrator,
             normal_allowed,
+            pid: identity.pid,
+            origin: identity.origin,
         },
         PrefixedStream::new(prefix[0], connected),
     ))
@@ -408,6 +424,107 @@ fn valid_sid(sid: &str) -> bool {
         })
 }
 
+fn client_process_id(pipe: &NamedPipeServer) -> io::Result<u32> {
+    let mut pid = 0_u32;
+    // SAFETY: 接続済みのパイプハンドルおよび有効な出力ポインターを渡します。
+    if unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid) } == 0 || pid == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(pid)
+}
+
+fn process_origin(client_pid: u32) -> Origin {
+    if client_pid == 0 {
+        return Origin::Unknown;
+    }
+    let mut table = match process_table() {
+        Ok(table) => table,
+        Err(_) => return Origin::Unknown,
+    };
+    fill_creation_times(client_pid, &mut table);
+    classify_ancestry(client_pid, &table)
+}
+
+fn process_table() -> io::Result<Vec<ProcEntry>> {
+    // SAFETY: 出力ポインターを使わず、システム全体のプロセス表を要求します。
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let snapshot = OwnedHandle::new(snapshot)?;
+    let mut process = PROCESSENTRY32W {
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `snapshot` は有効なプロセススナップショットであり、`process` は必要なサイズです。
+    if unsafe { Process32FirstW(snapshot.get(), &mut process) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut table = Vec::new();
+    loop {
+        table.push(ProcEntry {
+            pid: process.th32ProcessID,
+            ppid: process.th32ParentProcessID,
+            // SAFETY: `szExeFile` はスナップショットが保持する固定長の NUL 終端フィールドです。
+            exe: unsafe { wide_string(process.szExeFile.as_ptr()) },
+            created: None,
+        });
+        // SAFETY: `snapshot` は有効なプロセススナップショットであり、`process` は有効な出力バッファーです。
+        if unsafe { Process32NextW(snapshot.get(), &mut process) } != 0 {
+            continue;
+        }
+        // SAFETY: 直前の API 呼び出しが設定したエラー値を読み取ります。
+        if unsafe { GetLastError() } != ERROR_NO_MORE_FILES {
+            return Err(io::Error::last_os_error());
+        }
+        break;
+    }
+    Ok(table)
+}
+
+fn fill_creation_times(client_pid: u32, table: &mut [ProcEntry]) {
+    let mut current_pid = client_pid;
+    let mut visited = Vec::new();
+    for _ in 0..=MAX_ANCESTRY_DEPTH {
+        let Some(index) = table.iter().position(|entry| entry.pid == current_pid) else {
+            return;
+        };
+        let pid = table[index].pid;
+        let ppid = table[index].ppid;
+        table[index].created = process_creation_time(pid);
+        if ppid == 0 || ppid == pid || visited.contains(&ppid) {
+            return;
+        }
+        visited.push(pid);
+        current_pid = ppid;
+    }
+}
+
+fn process_creation_time(pid: u32) -> Option<u64> {
+    // SAFETY: 要求するアクセス権はプロセス情報の照会に限定されています。
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    let process = OwnedHandle::new(process).ok()?;
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    // SAFETY: プロセス時刻の全出力ポインターは初期化済み領域を参照します。
+    if unsafe {
+        GetProcessTimes(
+            process.get(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    } == 0
+    {
+        return None;
+    }
+    Some((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+}
+
 /// Establishes the identity of the connected client from its access token.
 ///
 /// The token is taken by impersonating the client, because a daemon that runs
@@ -415,7 +532,7 @@ fn valid_sid(sid: &str) -> bool {
 /// belongs to another account. Impersonation is bound to the calling thread,
 /// so the token is opened and the impersonation reverted without an
 /// intervening suspension point.
-fn client_identity(pipe: &NamedPipeServer) -> io::Result<ClientIdentity> {
+fn client_identity(pipe: &NamedPipeServer, pid: u32, origin: Origin) -> io::Result<ClientIdentity> {
     let handle = pipe.as_raw_handle();
     // SAFETY: `handle` belongs to a connected named pipe whose client has already sent data.
     if unsafe { ImpersonateNamedPipeClient(handle) } == 0 {
@@ -445,10 +562,20 @@ fn client_identity(pipe: &NamedPipeServer) -> io::Result<ClientIdentity> {
     }
     // The impersonation token doubles as the membership token: it carries the
     // filtered groups of a client that runs without elevation.
-    query_token_identity(token.get(), token.get())
+    let (sid, elevated, administrator) = query_token_identity(token.get(), token.get())?;
+    Ok(ClientIdentity {
+        sid,
+        elevated,
+        administrator,
+        pid,
+        origin,
+    })
 }
 
-fn query_token_identity(token: HANDLE, administrator_token: HANDLE) -> io::Result<ClientIdentity> {
+fn query_token_identity(
+    token: HANDLE,
+    administrator_token: HANDLE,
+) -> io::Result<(String, bool, bool)> {
     let user = token_information(token, TokenUser)?;
     let token_user = unsafe {
         // SAFETY: `token_information` stores the buffer in an 8-byte-aligned region.
@@ -462,11 +589,7 @@ fn query_token_identity(token: HANDLE, administrator_token: HANDLE) -> io::Resul
         (*elevation.as_ptr().cast::<TOKEN_ELEVATION>()).TokenIsElevated != 0
     };
     let administrator = is_administrator(administrator_token)?;
-    Ok(ClientIdentity {
-        sid,
-        elevated,
-        administrator,
-    })
+    Ok((sid, elevated, administrator))
 }
 
 fn token_information(

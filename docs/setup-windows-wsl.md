@@ -20,9 +20,10 @@ that includes its elevation. A distro started by a scheduled task set to "run
 whether user is logged on or not" runs with the user's full token — high
 integrity, `Administrators` enabled — even when the task is marked "run with
 limited privileges", because that logon type never receives the UAC split token.
-The daemon's elevation gate then accepts `token issue` and `seal` from inside
-WSL. The protected files stay protected; what opens up is the administrative RPC
-surface, which lets the agent side re-seal the password or invalidate the token.
+The daemon's elevation gate still requires both properties, and its named-pipe
+gate also rejects a caller whose process ancestry contains a WSL interop
+executable. The protected files stay protected, and the administrative RPC
+surface remains unavailable to that interop caller.
 
 Start the distro from a non-elevated interactive session: the user's own
 terminal, or an at-logon task with the interactive logon type ("run only when
@@ -167,10 +168,12 @@ an opt-in for a deployment that provides its own helper.
 
 Each of the first three takes `--pipe <name>` if the pipe was renamed.
 
-Elevation is not a convention here — the administrative RPCs are refused unless the
-calling peer is both elevated and a member of the local administrators group, and
-they are refused outright over the TCP front, which carries no operating system
-identity.
+Elevation is not a convention here — the administrative RPCs are refused unless
+the calling pipe peer is both elevated, a member of the local administrators
+group, and classified as a native Windows process. A WSL interop ancestry is
+refused even with an otherwise valid elevated token; unknown ancestry is refused
+as well. Administrative RPCs are refused outright over the TCP front, which
+carries no operating system identity.
 
 ### Running a second instance
 
@@ -387,10 +390,14 @@ Issue a new peer with `tegatad.exe token issue` or `tegatad.exe peer issue`; thi
 adds a peer and leaves existing tokens valid. Invalidate a token with
 `tegatad.exe peer revoke <peer_id>`.
 
-**`token issue` or `seal` succeeds from inside WSL without elevation.** The
-distro was started from an elevated context, so every interop process carries
-the full administrator token. See [How the distro is started
-matters](#how-the-distro-is-started-matters).
+**`ADMIN_REQUIRED` from a named-pipe administrative command.** The caller must
+be elevated, belong to the local Administrators group, and have `peer_origin`
+`native`. The audit record reports `wsl_interop` when the process ancestry
+contains a WSL interop executable and `unknown` when the ancestry cannot be
+verified; both origins are intentionally refused. The daemon's stderr also
+reports `tegatad: admin rpc refused: peer origin <origin>`. See [How the distro
+is started matters](#how-the-distro-is-started-matters) and keep the distro on a
+non-elevated interactive token.
 
 **The daemon starts but no credential resolves.** The master password has not been
 sealed on this machine, or was sealed by a different account. DPAPI blobs are

@@ -80,6 +80,15 @@ agent inside WSL inverts the trust direction — the standard `\\wsl.localhost\`
 problem, where Windows can read the distro as root, works in tegata's favour
 because the side that must be protected is the Windows side.
 
+Named-pipe administrative RPCs add a process-origin check. Before impersonating
+the pipe client, the daemon obtains its PID and follows up to 32 parent processes
+from a process snapshot. An ancestry containing `wsl.exe`, `wslhost.exe`,
+`wslservice.exe`, `wslrelay.exe`, or `wslg.exe` is classified as `wsl_interop`
+and is refused even when the token is elevated and belongs to the Administrators
+group. Missing or inconsistent ancestry is `unknown` and is refused as well.
+This is a heuristic and fails closed; the non-elevated WSL startup procedure in
+the preceding guidance remains the primary defense for issue #12.
+
 Running the daemon *inside* the same WSL distro as the agent is possible with the
 systemd boundary, but only if interop is disabled or `.exe` execution is denied.
 Otherwise the agent launches `powershell.exe` and reads back into the distro as
@@ -321,8 +330,9 @@ credential value by construction.
 
 **The peer field names the caller in the vocabulary of the transport that
 authenticated it.** On Linux that is `peer_uid`. On Windows a named pipe client
-contributes `peer_sid` together with `elevated` and `administrator`, so the log
-shows not just who called an administrative RPC but on what authority; a
+contributes `peer_sid` together with `elevated`, `administrator`, `peer_pid`, and
+`peer_origin` (`native`, `wsl_interop`, or `unknown`), so the log shows not just
+who called an administrative RPC but on what authority and process path; a
 token-authenticated TCP client contributes `peer_token`.
 
 **The daemon audits its own actions too.** Not everything worth recording is

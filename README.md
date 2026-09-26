@@ -250,7 +250,9 @@ the daemon's own session and vault events; named tokens and shared sessions —
 one browser per credential and caller, leased to several agents on the same
 machine, with an owner on every session; the container boundary — the daemon on
 the host, reached from a containerized agent through `tegata-bridge` and a named
-token; and prebuilt release binaries and bundles for non-Nix deployments,
+token; OAuth device-flow approval — the daemon logs in and approves a
+device-code grant the agent's own tool started, without handing out a browser;
+and prebuilt release binaries and bundles for non-Nix deployments,
 published from tags on the
 [releases page](https://github.com/WakaTaira/tegata/releases).
 
@@ -259,9 +261,6 @@ Planned, tracked in the
 
 - **CDP isolation** — the browser in its own network namespace, reachable only
   through the daemon's authenticated relay
-- **OAuth device-flow approval**
-  ([#8](https://github.com/WakaTaira/tegata/issues/8)) — the daemon logs in
-  and approves a device-code grant the agent's own tool started
 - **Injection proxy** ([#14](https://github.com/WakaTaira/tegata/issues/14)) —
   API calls with the operator's identity for agents that must not hold a token
 - **Windows approval hook**

@@ -1631,7 +1631,10 @@ async fn append_audit(
     .map_err(AppendAuditError::Open)?;
     file.write_all(&bytes)
         .await
-        .map_err(AppendAuditError::Write)
+        .map_err(AppendAuditError::Write)?;
+    // tokio の File は write を裏のブロッキングタスクへ渡した時点で完了を返す。
+    // flush で書き込みの完了を待たないと、監査行がファイルに現れる前に応答が届きうる。
+    file.flush().await.map_err(AppendAuditError::Write)
 }
 
 async fn handle_request(

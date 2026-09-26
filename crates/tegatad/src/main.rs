@@ -70,12 +70,23 @@ struct RpcContext {
 
 tokio::task_local! {
     static RPC_CONTEXT: RpcContext;
+    static STARTUP_CONTEXT: ();
 }
 
 static NEXT_RPC_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn current_rpc_id() -> Option<u64> {
     RPC_CONTEXT.try_with(|context| context.id).ok()
+}
+
+/// 診断行の `rpc_id` に載せる値を返す。RPC 内では連番、起動処理では `"startup"`、
+/// reaper などそれ以外の RPC 外の背景タスクでは `"background"` とする。
+pub(crate) fn current_diagnostic_rpc_id() -> Value {
+    match current_rpc_id() {
+        Some(rpc_id) => json!(rpc_id),
+        None if STARTUP_CONTEXT.try_with(|()| ()).is_ok() => json!("startup"),
+        None => json!("background"),
+    }
 }
 
 pub(crate) fn current_rpc_method() -> Option<String> {
@@ -950,7 +961,7 @@ async fn build_state(
                     sealed_blob_path: sealed_blob_path.clone(),
                 });
                 if !version_logged {
-                    provider.log_version().await;
+                    STARTUP_CONTEXT.scope((), provider.log_version()).await;
                     version_logged = true;
                 }
                 Arc::new(Mutex::new(provider))

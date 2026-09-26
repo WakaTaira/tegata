@@ -52,15 +52,19 @@ if [ "\${1:-}" = "config" ] && [ "\${2:-}" = "server" ]; then
 fi
 
 if [ "\${1:-}" = "login" ] && [ "\${2:-}" = "--check" ]; then
+  printf 'You are not logged in as %s.\\n' "$FAKE_BW_EMAIL" >&2
   exit 1
 fi
 
 if [ "\${1:-}" = "login" ] || [ "\${1:-}" = "unlock" ]; then
+  # 診断行のマスク経路を通すため、email・master password・払い出す session key を stderr に混ぜる。
+  printf 'debug: %s %s %s\\n' "$FAKE_BW_EMAIL" "\${BW_PASSWORD:-}" "$FAKE_BW_SESSION" >&2
   printf '%s\\n' "$FAKE_BW_SESSION"
   exit 0
 fi
 
 if [ "\${1:-}" = "status" ]; then
+  printf 'debug: session %s\\n' "\${BW_SESSION:-}" >&2
   printf '%s\\n' '{"status":"unlocked"}'
   exit 0
 fi
@@ -84,6 +88,7 @@ if [ "\${1:-}" = "list" ] && [ "\${2:-}" = "items" ]; then
   if [ -f "$state_file" ]; then
     mode=$(sed -n '1p' "$state_file")
   fi
+  printf 'debug: %s session %s\\n' "$FAKE_BW_EMAIL" "\${BW_SESSION:-}" >&2
   case "$mode" in
     always-fail)
       exit 1
@@ -223,6 +228,7 @@ export async function startColdStartDaemon(opts: {
       FAKE_BW_LIST_COUNT_FILE: listCountPath,
       FAKE_BW_SERVER_URL: opts.serverUrl,
       FAKE_BW_SESSION: opts.canaries.sessionKey,
+      FAKE_BW_EMAIL: opts.canaries.email,
       FAKE_BW_ITEMS_JSON: JSON.stringify([item]),
       FAKE_BW_ITEM_JSON: JSON.stringify(item),
     },

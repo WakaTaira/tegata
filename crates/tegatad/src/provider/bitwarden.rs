@@ -170,7 +170,7 @@ impl BwRunError {
 
     fn failure(&self) -> &'static str {
         match self {
-            Self::CreateDir(_) => "spawn",
+            Self::CreateDir(_) => "create_dir",
             Self::Process(_, _) => "spawn",
             Self::NonZeroExit(_, _) => "exit",
             Self::Timeout(_) => "timeout",
@@ -192,10 +192,6 @@ fn classify_bw_run_error(error: &BwRunError) -> ErrorCode {
         }
         BwRunError::CreateDir(_) => ErrorCode::Internal,
     }
-}
-
-fn log_bw_error(operation: &str, error: &BwRunError) {
-    eprintln!("tegatad: bw {operation} failed: {error}");
 }
 
 fn log_bw_parse_error(operation: &str) {
@@ -351,7 +347,7 @@ impl BitwardenCliProvider {
             Ok(output) => output,
             Err(_) => return,
         };
-        let version = String::from_utf8(output.stdout.clone())
+        let version = std::str::from_utf8(&output.stdout)
             .ok()
             .and_then(|value| value.lines().next().map(str::trim).map(ToOwned::to_owned))
             .filter(|value| !value.is_empty());
@@ -380,6 +376,23 @@ impl BitwardenCliProvider {
         password: Option<&Secret>,
         context: BwAttemptContext,
     ) -> Result<BwOutput, BwRunError> {
+        self.run_bw_unreported(args, session, password, context)
+            .await
+            .map_err(|(error, diagnostic)| {
+                emit_bw_diag(diagnostic, Some(error.failure()), None);
+                error
+            })
+    }
+
+    /// 失敗時の診断行を出さずに、失敗と診断の材料を呼び出し側へ返す。失敗が正常な回答を
+    /// 意味する呼び出し（`login --check` の exit 1 など）は、呼び出し側の意味論で診断行を出す。
+    async fn run_bw_unreported(
+        &self,
+        args: &[String],
+        session: Option<&Secret>,
+        password: Option<&Secret>,
+        context: BwAttemptContext,
+    ) -> Result<BwOutput, (BwRunError, BwDiagnosticBase)> {
         let started_at = Instant::now();
         if let Err(error) = tokio::fs::create_dir_all(&self.appdata_dir).await {
             let error = BwRunError::CreateDir(error);
@@ -393,8 +406,7 @@ impl BitwardenCliProvider {
                 stderr: error.stderr(),
                 issued_secrets: &[],
             });
-            emit_bw_diag(diagnostic, Some(error.failure()), None);
-            return Err(error);
+            return Err((error, diagnostic));
         }
         let mut command_args = args.to_vec();
         if password.is_some() {
@@ -521,18 +533,14 @@ impl BitwardenCliProvider {
                     stderr: error.stderr(),
                     issued_secrets: &[],
                 });
-                emit_bw_diag(diagnostic, Some(error.failure()), None);
-                Err(error)
+                Err((error, diagnostic))
             }
         }
     }
 
     fn diagnostic_base(&self, input: BwDiagnosticInput<'_>) -> BwDiagnosticBase {
         BwDiagnosticBase {
-            rpc_id: crate::current_rpc_id().map_or_else(
-                || serde_json::json!("startup"),
-                |rpc_id| serde_json::json!(rpc_id),
-            ),
+            rpc_id: crate::current_diagnostic_rpc_id(),
             namespace: self.namespace.clone(),
             cold_start: input.context.cold_start,
             op: operation_name(input.args),
@@ -631,10 +639,7 @@ impl BitwardenCliProvider {
         let mut session = self
             .run_bw_with_context(login_args, None, Some(password), context)
             .await
-            .map_err(|error| {
-                log_bw_error("login or unlock", &error);
-                classify_bw_run_error(&error)
-            })?;
+            .map_err(|error| classify_bw_run_error(&error))?;
         let value = session_key_from_stdout(&std::mem::take(&mut session.stdout));
         match value {
             Some(value) => {
@@ -658,10 +663,7 @@ impl BitwardenCliProvider {
             .await
         {
             Ok(output) => output,
-            Err(error) => {
-                log_bw_error("status", &error);
-                return Err(classify_bw_run_error(&error));
-            }
+            Err(error) => return Err(classify_bw_run_error(&error)),
         };
         match serde_json::from_slice::<BitwardenStatus>(&output.stdout) {
             Ok(status) => {
@@ -702,14 +704,22 @@ impl BitwardenCliProvider {
 
     async fn login_check(&self, context: BwAttemptContext) -> Result<bool, ErrorCode> {
         let args = vec!["login".to_owned(), "--check".to_owned()];
-        match self.run_bw_with_context(&args, None, None, context).await {
+        match self.run_bw_unreported(&args, None, None, context).await {
             Ok(output) => {
-                output.finish(None, None);
+                output.finish(None, Some("logged_in"));
                 Ok(true)
             }
-            Err(BwRunError::NonZeroExit(_, _)) => Ok(false),
-            Err(error) => {
-                log_bw_error("login check", &error);
+            // exit 1 は「未ログイン」という正常な回答であり、障害として診断行に載せない。
+            Err((error @ BwRunError::NonZeroExit(_, _), diagnostic)) => {
+                if error.exit_code() == Some(1) {
+                    emit_bw_diag(diagnostic, None, Some("logged_out"));
+                } else {
+                    emit_bw_diag(diagnostic, Some(error.failure()), None);
+                }
+                Ok(false)
+            }
+            Err((error, diagnostic)) => {
+                emit_bw_diag(diagnostic, Some(error.failure()), None);
                 Err(classify_bw_run_error(&error))
             }
         }
@@ -743,26 +753,16 @@ impl BitwardenCliProvider {
                 output.finish(None, None);
                 current_server
             }
-            Err(error) => {
-                log_bw_error("config server", &error);
-                if matches!(
-                    classify_bw_run_error(&error),
-                    ErrorCode::ProviderUnavailable
-                ) {
-                    return Err(ErrorCode::ProviderUnavailable);
-                }
-                None
-            }
+            Err(error) => return Err(classify_bw_run_error(&error)),
         };
         if current_server.as_deref() != Some(self.server_url.as_str()) {
             // If the server differs, the login state must be discarded before changing the configuration.
             let logged_in = self.login_check(context).await?;
-            if logged_in
-                && let Err(error) = self
+            if logged_in {
+                // logout の失敗は従来どおり致命としない。失敗は診断行にのみ残して続行する。
+                let _ = self
                     .run_bw_with_context(&["logout".to_owned()], None, None, context)
-                    .await
-            {
-                log_bw_error("logout", &error);
+                    .await;
             }
             self.run_bw_with_context(
                 &[
@@ -775,10 +775,7 @@ impl BitwardenCliProvider {
                 context,
             )
             .await
-            .map_err(|error| {
-                log_bw_error("config server", &error);
-                ErrorCode::Internal
-            })?;
+            .map_err(|_| ErrorCode::Internal)?;
         }
         let logged_in = self.login_check(context).await?;
         let login_args = if logged_in {
@@ -789,19 +786,16 @@ impl BitwardenCliProvider {
         self.establish_session(&login_args, &password, context)
             .await?;
         drop(password);
-        if let Err(error) = self
+        if self
             .run_bw_with_context(&["sync".to_owned()], self.session.as_ref(), None, context)
             .await
+            .is_err()
         {
-            log_bw_error("sync", &error);
             self.session = None;
             self.unlocked_at = None;
-            if let Err(error) = self
+            let _ = self
                 .run_bw_with_context(&["logout".to_owned()], None, None, context)
-                .await
-            {
-                log_bw_error("logout", &error);
-            }
+                .await;
 
             let password = self.password().await?;
             let login_args = vec!["login".to_owned(), self.email.clone(), "--raw".to_owned()];
@@ -812,7 +806,6 @@ impl BitwardenCliProvider {
                 .run_bw_with_context(&["sync".to_owned()], self.session.as_ref(), None, context)
                 .await
             {
-                log_bw_error("sync", &error);
                 self.session = None;
                 self.unlocked_at = None;
                 return Err(classify_bw_run_error(&error));
@@ -828,10 +821,7 @@ impl BitwardenCliProvider {
             self.run_bw(&["lock".to_owned()], Some(session), None)
                 .await
                 .map(|_| ())
-                .map_err(|error| {
-                    log_bw_error("lock", &error);
-                    classify_bw_run_error(&error)
-                })
+                .map_err(|error| classify_bw_run_error(&error))
         } else {
             Ok(())
         };
@@ -864,10 +854,7 @@ impl BitwardenCliProvider {
                 context,
             )
             .await
-            .map_err(|error| {
-                log_bw_error("list items", &error);
-                classify_bw_run_error(&error)
-            })?;
+            .map_err(|error| classify_bw_run_error(&error))?;
         match serde_json::from_slice::<Vec<BitwardenItem>>(&output.stdout) {
             Ok(items) => {
                 output.finish(None, None);
@@ -892,10 +879,7 @@ impl BitwardenCliProvider {
                 context,
             )
             .await
-            .map_err(|error| {
-                log_bw_error("get item", &error);
-                ErrorCode::InvalidCredential
-            })?;
+            .map_err(|_| ErrorCode::InvalidCredential)?;
         match serde_json::from_slice::<BitwardenItem>(&output.stdout) {
             Ok(item) => {
                 output.finish(None, None);
@@ -922,7 +906,9 @@ impl BitwardenCliProvider {
                 })
                 .collect());
         }
-        let context = BwAttemptContext::new(self.catalog.is_empty() && !self.locked, 1);
+        // cold start は、ロックされておらず catalog がまだ一度も埋まっていない状態を指す。
+        // ロック中は直前の分岐で返しているため、ここでは catalog の空判定のみで足りる。
+        let context = BwAttemptContext::new(self.catalog.is_empty(), 1);
         let method = crate::current_rpc_method();
         let retry_cold_start = can_retry_cold_start(context, method.as_deref());
         let items = match self.list_items(context).await {

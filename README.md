@@ -43,7 +43,7 @@ rate-limited to one per 30 seconds and written to the audit log.
 ┌───────────────────────────▼─────────────────────────────────────┐
 │ Broker — packages/tegata-mcp                                    │
 │ Runs as the agent's own user. Holds no secrets. Forwards        │
-│ five tools to the daemon and returns classified errors.         │
+│ six tools to the daemon and returns classified errors.          │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
 ════════════════════════════╪═════════════════════════════════════
@@ -164,7 +164,7 @@ deployment without Nix — is in the setup guides:
 
 ## MCP tools
 
-The agent-facing surface is five tools. Nothing else crosses the boundary.
+The agent-facing surface is six tools. Nothing else crosses the boundary.
 
 | Tool | Input | Output |
 | --- | --- | --- |
@@ -244,7 +244,7 @@ they are meant to be read as the specification of what the boundary guarantees.
 
 Implemented today: the systemd and Windows service boundaries; three credential
 backends behind the provider trait — Bitwarden CLI, age-encrypted file, and GNU
-pass — usable together; the Playwright form executor; the five MCP tools;
+pass — usable together; the Playwright form executor; the six MCP tools;
 human-in-the-loop login approval; an audit log covering both agent calls and
 the daemon's own session and vault events; named tokens and shared sessions —
 one browser per credential and caller, leased to several agents on the same

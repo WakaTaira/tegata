@@ -45,8 +45,8 @@ use zeroize::Zeroize;
 #[cfg(feature = "mock-provider")]
 use crate::provider::StaticProvider;
 use crate::provider::{
-    BitwardenCliConfig, BitwardenCliProvider, CredentialProvider, FileProvider, FileProviderConfig,
-    ResolvedCredential,
+    BitwardenCliConfig, BitwardenCliProvider, CredentialProvider, CredentialRef, FileProvider,
+    FileProviderConfig, ResolvedCredential,
 };
 #[cfg(unix)]
 use crate::provider::{PassProvider, PassProviderConfig};
@@ -1232,7 +1232,7 @@ async fn serve_connection<S>(
         let parsed = serde_json::from_str::<RpcRequest>(&line);
         let (request, response, outcome, fields) = match parsed {
             Ok(request) => {
-                let fields = audit_fields(&request.params);
+                let fields = audit_fields(&request.method, &request.params);
                 let handled = handle_request(
                     &request,
                     state.clone(),
@@ -1943,28 +1943,12 @@ async fn credential_metadata(
     state: &SharedState,
     cred_id: &str,
 ) -> Result<Option<CredentialMetadata>, ErrorCode> {
-    let Some((namespace, entry_id)) = cred_id.split_once(':') else {
+    let Some((_, entry_id)) = cred_id.split_once(':') else {
         return Ok(None);
     };
-    let provider = {
-        let daemon = state.lock().await;
-        let Some(provider) = daemon
-            .providers
-            .iter()
-            .find(|provider| provider.namespace == namespace)
-        else {
-            return Ok(None);
-        };
-        provider.provider.clone()
+    let Some((refs, _)) = credential_refs(state, cred_id).await? else {
+        return Ok(None);
     };
-    let mut provider = provider.lock().await;
-    let refs_result = provider.list_refs().await;
-    let autolocked = provider.take_autolock_event();
-    drop(provider);
-    if autolocked {
-        audit_provider_autolock(state, namespace.to_owned()).await;
-    }
-    let refs = refs_result?;
     Ok(refs
         .into_iter()
         .find(|credential| credential.id == entry_id)
@@ -1973,42 +1957,11 @@ async fn credential_metadata(
         }))
 }
 
-fn http_origin(value: &str) -> Option<String> {
-    let (scheme, remainder) = value.split_once("://")?;
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
-        return None;
-    }
-    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
-    let authority = &remainder[..authority_end];
-    if authority.is_empty()
-        || authority
-            .chars()
-            .any(|character| character.is_ascii_control() || character.is_ascii_whitespace())
-    {
-        return None;
-    }
-    Some(format!("{}://{authority}", scheme.to_ascii_lowercase()))
-}
-
-fn valid_authorize_steps(steps: Option<&[tegata_core::wire::LoginStep]>) -> bool {
-    steps.is_none_or(|steps| {
-        steps.iter().all(|step| match step.action.as_str() {
-            "click" => step.value.is_none(),
-            "fill" => matches!(
-                step.value.as_deref(),
-                Some("{{username}}")
-                    | Some("{{password}}")
-                    | Some("{{totp}}")
-                    | Some("{{user_code}}")
-            ),
-            _ => false,
-        })
-    })
-}
-
-#[cfg(unix)]
-async fn credential_state(state: &SharedState, cred_id: &str) -> Result<Option<bool>, ErrorCode> {
-    let Some((namespace, entry_id)) = cred_id.split_once(':') else {
+async fn credential_refs(
+    state: &SharedState,
+    cred_id: &str,
+) -> Result<Option<(Vec<CredentialRef>, bool)>, ErrorCode> {
+    let Some((namespace, _)) = cred_id.split_once(':') else {
         return Ok(None);
     };
     let provider = {
@@ -2031,6 +1984,66 @@ async fn credential_state(state: &SharedState, cred_id: &str) -> Result<Option<b
         audit_provider_autolock(state, namespace.to_owned()).await;
     }
     let refs = refs_result?;
+    Ok(Some((refs, locked)))
+}
+
+fn http_origin(value: &str) -> Option<String> {
+    let (scheme, remainder) = value.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let authority = &remainder[..authority_end];
+    if authority.is_empty()
+        || authority
+            .chars()
+            .any(|character| character.is_ascii_control() || character.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some(format!("{}://{authority}", scheme.to_ascii_lowercase()))
+}
+
+fn audit_target_url(value: &str) -> Option<String> {
+    let origin = http_origin(value)?;
+    let (_, remainder) = value.split_once("://")?;
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let path = if remainder[authority_end..].starts_with('/') {
+        let path_end = remainder[authority_end..]
+            .find(['?', '#'])
+            .map(|offset| authority_end + offset)
+            .unwrap_or(remainder.len());
+        &remainder[authority_end..path_end]
+    } else {
+        ""
+    };
+    Some(format!("{origin}{path}"))
+}
+
+fn valid_authorize_steps(steps: Option<&[tegata_core::wire::LoginStep]>) -> bool {
+    steps.is_none_or(|steps| {
+        steps.iter().all(|step| match step.action.as_str() {
+            "click" => step.value.is_none(),
+            "fill" => matches!(
+                step.value.as_deref(),
+                Some("{{username}}")
+                    | Some("{{password}}")
+                    | Some("{{totp}}")
+                    | Some("{{user_code}}")
+            ),
+            _ => false,
+        })
+    })
+}
+
+#[cfg(unix)]
+async fn credential_state(state: &SharedState, cred_id: &str) -> Result<Option<bool>, ErrorCode> {
+    let Some((_, entry_id)) = cred_id.split_once(':') else {
+        return Ok(None);
+    };
+    let Some((refs, locked)) = credential_refs(state, cred_id).await? else {
+        return Ok(None);
+    };
     if refs.iter().any(|credential| credential.id == entry_id) {
         return Ok(Some(false));
     }
@@ -2999,17 +3012,24 @@ fn optional_namespace(params: &Value) -> Result<Option<String>, ErrorCode> {
     }
 }
 
-fn audit_fields(params: &Value) -> AuditFields {
+fn audit_fields(method: &str, params: &Value) -> AuditFields {
+    let target_url = match method {
+        "login" => params
+            .get("target_url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        "authorize_device" => params
+            .get("verification_url")
+            .and_then(Value::as_str)
+            .and_then(audit_target_url),
+        _ => None,
+    };
     AuditFields {
         cred_id: params
             .get("cred_id")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
-        target_url: params
-            .get("target_url")
-            .and_then(Value::as_str)
-            .or_else(|| params.get("verification_url").and_then(Value::as_str))
-            .map(ToOwned::to_owned),
+        target_url,
         session_id: params
             .get("session_id")
             .and_then(Value::as_str)

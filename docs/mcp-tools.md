@@ -59,7 +59,7 @@ unexpected daemon response cannot smuggle text out through the error path.
 | --- | --- |
 | `INVALID_CREDENTIAL` | The credential does not exist, or the site rejected the login |
 | `MFA_REQUIRED` | The login needs a TOTP code and the credential has no seed |
-| `SELECTOR_NOT_FOUND` | A step's selector did not resolve within the step timeout |
+| `SELECTOR_NOT_FOUND` | A login step's selector did not resolve within the step timeout |
 | `DEVICE_CODE_REJECTED` | The device authorization page rejected the user code |
 | `VAULT_LOCKED` | The provider holding this credential is locked |
 | `RATE_LIMITED` | A second `get_totp` for the same credential within 30 seconds |
@@ -286,10 +286,11 @@ Explicit steps have the same placeholder restriction as `login`, with
 **Output**: `{"ok": true}`
 
 The browser is dedicated to this call, closes when it completes, and never
-returns a CDP channel. Login failures use `INVALID_CREDENTIAL`, `MFA_REQUIRED`,
-or `SELECTOR_NOT_FOUND`; a matching `failure_selector` returns
-`DEVICE_CODE_REJECTED`. Other failures return `INTERNAL`. Approval hooks can
-also return `APPROVAL_DENIED` or `APPROVAL_TIMEOUT`.
+returns a CDP channel. Login-stage failures use `INVALID_CREDENTIAL`,
+`MFA_REQUIRED`, or `SELECTOR_NOT_FOUND`. After `verification_url` is opened,
+selector and timeout failures return `INTERNAL`; a matching `failure_selector`
+returns `DEVICE_CODE_REJECTED`. Approval hooks can also return `APPROVAL_DENIED`
+or `APPROVAL_TIMEOUT`.
 
 ## `get_totp`
 

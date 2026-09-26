@@ -245,23 +245,18 @@ function handleRequest(
   response: ServerResponse,
   credentials: Credentials,
 ): void {
-  if (request.method === "GET" && request.url === "/ua-gated/") {
-    if (request.headers["user-agent"]?.includes("HeadlessChrome") === true) {
+  if (
+    request.method === "GET" &&
+    (request.url === "/" || request.url === "/ua-gated/")
+  ) {
+    if (
+      request.url === "/ua-gated/" &&
+      request.headers["user-agent"]?.includes("HeadlessChrome") === true
+    ) {
       response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
       response.end("headless user agent is forbidden");
       return;
     }
-    const session = sessionFrom(request);
-    writePage(
-      response,
-      session !== undefined && sessions.has(session)
-        ? loggedInPage()
-        : loginForm(false, credentials.totp_seed !== undefined),
-    );
-    return;
-  }
-
-  if (request.method === "GET" && request.url === "/") {
     const session = sessionFrom(request);
     writePage(
       response,

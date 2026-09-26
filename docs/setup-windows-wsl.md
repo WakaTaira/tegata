@@ -21,9 +21,13 @@ whether user is logged on or not" runs with the user's full token — high
 integrity, `Administrators` enabled — even when the task is marked "run with
 limited privileges", because that logon type never receives the UAC split token.
 The daemon's elevation gate still requires both properties, and its named-pipe
-gate also rejects a caller whose process ancestry contains a WSL interop
-executable. The protected files stay protected, and the administrative RPC
-surface remains unavailable to that interop caller.
+gate also rejects a caller whose verified process ancestry contains a WSL interop
+executable. A missing client PID or failed process snapshot is classified as
+unknown and refused. A missing parent, root process, cycle, creation-time
+reversal, or depth limit ends the verified walk; without an interop executable
+in that walk, the caller is classified as native. The protected files stay
+protected, and the administrative RPC surface remains unavailable to an interop
+caller.
 
 Start the distro from a non-elevated interactive session: the user's own
 terminal, or an at-logon task with the interactive logon type ("run only when
@@ -393,11 +397,13 @@ adds a peer and leaves existing tokens valid. Invalidate a token with
 **`ADMIN_REQUIRED` from a named-pipe administrative command.** The caller must
 be elevated, belong to the local Administrators group, and have `peer_origin`
 `native`. The audit record reports `wsl_interop` when the process ancestry
-contains a WSL interop executable and `unknown` when the ancestry cannot be
-verified; both origins are intentionally refused. The daemon's stderr also
-reports `tegatad: admin rpc refused: peer origin <origin>`. See [How the distro
-is started matters](#how-the-distro-is-started-matters) and keep the distro on a
-non-elevated interactive token.
+contains a WSL interop executable and `unknown` when the client PID is absent or
+the process snapshot fails; both origins are intentionally refused. A walk that
+ends at a missing parent, root process, cycle, creation-time reversal, or depth
+limit remains `native` when no interop executable was seen. The daemon's stderr
+also reports `tegatad: admin rpc refused: peer origin <origin>`. See [How the
+distro is started matters](#how-the-distro-is-started-matters) and keep the
+distro on a non-elevated interactive token.
 
 **The daemon starts but no credential resolves.** The master password has not been
 sealed on this machine, or was sealed by a different account. DPAPI blobs are

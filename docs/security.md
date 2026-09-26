@@ -280,7 +280,7 @@ environment variables:
 | Variable | Contents |
 | --- | --- |
 | `TEGATA_CRED_ID` | The namespaced credential reference being requested |
-| `TEGATA_TARGET_URL` | The login destination, or the device verification URL |
+| `TEGATA_TARGET_URL` | The login destination, or for `authorize_device` the verification URL with its query, fragment, and userinfo removed |
 | `TEGATA_METHOD` | `login` or `authorize_device` |
 | `TEGATA_PEER` | The calling peer's uid, in decimal |
 

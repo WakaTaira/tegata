@@ -2,7 +2,7 @@
 //! only exist on UNIX targets.
 #![cfg(unix)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
@@ -103,26 +103,32 @@ impl Daemon {
     /// Starts the daemon with a fake node executor written into the test
     /// directory; the executor records its PID in `executor.js.pid`.
     fn start_with_executor(script: &str) -> Self {
-        Self::start_inner_with_options(Some(script), false, None)
+        Self::start_inner_with_options(Some(script), None, None)
     }
 
     fn start_with_executor_and_approval(script: &str) -> Self {
-        Self::start_inner_with_options(Some(script), true, None)
+        Self::start_inner_with_options(Some(script), Some(approve_once), None)
+    }
+
+    /// Starts the daemon with an `approve_cmd` that records the hook
+    /// environment into `approval.env` and approves.
+    fn start_with_executor_and_recording_approval(script: &str) -> Self {
+        Self::start_inner_with_options(Some(script), Some(approve_and_record), None)
     }
 
     fn start_with_executor_and_ttl(script: &str, ttl_secs: u64) -> Self {
-        Self::start_inner_with_options(Some(script), false, Some(ttl_secs))
+        Self::start_inner_with_options(Some(script), None, Some(ttl_secs))
     }
 
     #[allow(clippy::zombie_processes)]
     fn start_inner(executor_script: Option<&str>) -> Self {
-        Self::start_inner_with_options(executor_script, false, None)
+        Self::start_inner_with_options(executor_script, None, None)
     }
 
     #[allow(clippy::zombie_processes)]
     fn start_inner_with_options(
         executor_script: Option<&str>,
-        require_approval: bool,
+        approve_cmd: Option<fn(&Path) -> String>,
         session_ttl_secs: Option<u64>,
     ) -> Self {
         let directory = std::env::temp_dir().join(format!("tegatad-test-{}", Uuid::new_v4()));
@@ -139,13 +145,9 @@ impl Daemon {
                 format!("executor_entry = {script_path:?}\n")
             })
             .unwrap_or_default();
-        let approval_line = if require_approval {
-            let approval_path = directory.join("approval.once");
-            let command = format!("test ! -e {:?} && touch {:?}", approval_path, approval_path);
-            format!("approve_cmd = {command:?}\n")
-        } else {
-            String::new()
-        };
+        let approval_line = approve_cmd
+            .map(|approve_cmd| format!("approve_cmd = {:?}\n", approve_cmd(&directory)))
+            .unwrap_or_default();
         let ttl_line = session_ttl_secs
             .map(|value| format!("session_ttl_secs = {value}\n"))
             .unwrap_or_default();
@@ -195,6 +197,18 @@ impl Daemon {
             sleep(Duration::from_millis(20));
         }
     }
+}
+
+/// Approves the first request only.
+fn approve_once(directory: &Path) -> String {
+    let approval_path = directory.join("approval.once");
+    format!("test ! -e {:?} && touch {:?}", approval_path, approval_path)
+}
+
+/// Approves every request after recording the hook environment.
+fn approve_and_record(directory: &Path) -> String {
+    let env_path = directory.join("approval.env");
+    format!("env | grep '^TEGATA_' > {env_path:?}")
 }
 
 impl Drop for Daemon {
@@ -266,6 +280,119 @@ fn authorize_device_audit_uses_verification_url_without_query_or_spoofed_target(
     assert_eq!(record["target_url"], json!("https://example.test/device"));
     assert!(!audit.contains("secret-device-code"));
     assert!(!audit.contains("attacker.test"));
+}
+
+#[test]
+fn authorize_device_audit_ignores_keys_the_method_does_not_accept() {
+    let daemon = Daemon::start_with_executor(AUTHORIZE_SUCCESS_EXECUTOR);
+    let response = rpc(
+        &daemon.socket_path,
+        "authorize_device",
+        json!({
+            "cred_id": "mock:site",
+            "verification_url": "https://user:secret-userinfo@example.test/device",
+            "user_code": "secret-device-code",
+            "success_selector": "#device-ok",
+            "session_id": "forged-session",
+            "namespace": "forged-namespace"
+        }),
+    );
+    assert_eq!(response["result"], json!({ "ok": true }));
+
+    let audit =
+        std::fs::read_to_string(daemon.directory.join("state/audit.log")).expect("read audit log");
+    let record = audit
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("parse audit record"))
+        .find(|record| record["method"] == "authorize_device")
+        .expect("authorize_device audit record");
+    assert_eq!(record["cred_id"], json!("mock:site"));
+    assert_eq!(record["target_url"], json!("https://example.test/device"));
+    assert!(record["session_id"].is_null());
+    assert_eq!(record["namespace"], json!("mock"));
+    assert!(!audit.contains("forged-session"));
+    assert!(!audit.contains("forged-namespace"));
+    assert!(!audit.contains("secret-userinfo"));
+}
+
+#[test]
+fn failed_login_audit_ignores_a_caller_supplied_session_id() {
+    let daemon = Daemon::start_with_executor(FAILING_EXECUTOR);
+    let response = rpc(
+        &daemon.socket_path,
+        "login",
+        json!({
+            "cred_id": "mock:site",
+            "target_url": "http://127.0.0.1",
+            "session_id": "forged-session",
+            "namespace": "forged-namespace"
+        }),
+    );
+    error_message(&response, "INVALID_CREDENTIAL");
+
+    let audit =
+        std::fs::read_to_string(daemon.directory.join("state/audit.log")).expect("read audit log");
+    let record = audit
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("parse audit record"))
+        .find(|record| record["method"] == "login")
+        .expect("login audit record");
+    assert!(record["session_id"].is_null());
+    assert_eq!(record["namespace"], json!("mock"));
+    assert!(!audit.contains("forged-session"));
+    assert!(!audit.contains("forged-namespace"));
+}
+
+#[test]
+fn login_audit_derives_namespace_from_cred_id() {
+    let daemon = Daemon::start_with_executor(FAILING_EXECUTOR);
+    let response = rpc(
+        &daemon.socket_path,
+        "login",
+        json!({
+            "cred_id": "mock:site",
+            "target_url": "http://127.0.0.1"
+        }),
+    );
+    error_message(&response, "INVALID_CREDENTIAL");
+
+    let audit =
+        std::fs::read_to_string(daemon.directory.join("state/audit.log")).expect("read audit log");
+    let record = audit
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("parse audit record"))
+        .find(|record| record["method"] == "login")
+        .expect("login audit record");
+    assert_eq!(record["namespace"], json!("mock"));
+}
+
+#[test]
+fn authorize_device_approval_hook_receives_verification_url_without_query() {
+    let daemon = Daemon::start_with_executor_and_recording_approval(AUTHORIZE_SUCCESS_EXECUTOR);
+    let response = rpc(
+        &daemon.socket_path,
+        "authorize_device",
+        json!({
+            "cred_id": "mock:site",
+            "verification_url": "https://user:secret-userinfo@example.test/device?user_code=secret-device-code#fragment",
+            "user_code": "secret-device-code",
+            "success_selector": "#device-ok"
+        }),
+    );
+    assert_eq!(response["result"], json!({ "ok": true }));
+
+    let env = std::fs::read_to_string(daemon.directory.join("approval.env"))
+        .expect("read approval environment");
+    assert!(
+        env.lines()
+            .any(|line| line == "TEGATA_TARGET_URL=https://example.test/device")
+    );
+    assert!(
+        env.lines()
+            .any(|line| line == "TEGATA_METHOD=authorize_device")
+    );
+    assert!(!env.contains("secret-device-code"));
+    assert!(!env.contains("secret-userinfo"));
 }
 
 #[test]

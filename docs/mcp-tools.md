@@ -289,7 +289,8 @@ The browser is dedicated to this call, closes when it completes, and never
 returns a CDP channel. Login-stage failures use `INVALID_CREDENTIAL`,
 `MFA_REQUIRED`, or `SELECTOR_NOT_FOUND`. After `verification_url` is opened,
 selector and timeout failures return `INTERNAL`; a matching `failure_selector`
-returns `DEVICE_CODE_REJECTED`. Approval hooks can also return `APPROVAL_DENIED`
+returns `DEVICE_CODE_REJECTED`, including when it renders while a step is still
+waiting for its selector. Approval hooks can also return `APPROVAL_DENIED`
 or `APPROVAL_TIMEOUT`.
 
 ## `get_totp`

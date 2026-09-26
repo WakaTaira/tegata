@@ -1,5 +1,7 @@
 #[cfg(windows)]
 mod dpapi;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod interop;
 mod peers;
 mod provider;
 mod secure_fs;
@@ -1484,6 +1486,12 @@ async fn handle_request(
     }
     if request.method.starts_with("admin_") {
         if !peer.allows_admin_rpc(operator_uids) {
+            if let PeerIdentity::Sid { origin, .. } = peer {
+                eprintln!(
+                    "tegatad: admin rpc refused: peer origin {}",
+                    origin.as_str()
+                );
+            }
             return classified(request.id.clone(), ErrorCode::AdminRequired);
         }
         return match request.method.as_str() {

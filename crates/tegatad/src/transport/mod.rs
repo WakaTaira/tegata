@@ -15,6 +15,7 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
+use crate::interop::Origin;
 use std::future::Future;
 use std::io;
 
@@ -77,6 +78,8 @@ pub(crate) enum PeerIdentity {
         elevated: bool,
         administrator: bool,
         normal_allowed: bool,
+        pid: u32,
+        origin: Origin,
     },
     /// TCP client that presented a valid preamble token.
     Peer { peer_id: String, label: String },
@@ -100,8 +103,9 @@ impl PeerIdentity {
             Self::Sid {
                 elevated,
                 administrator,
+                origin,
                 ..
-            } => *elevated && *administrator,
+            } => *elevated && *administrator && *origin == Origin::Native,
             Self::Peer { .. } => false,
             Self::System => false,
         }
@@ -121,18 +125,22 @@ impl PeerIdentity {
 /// flattened into the audit record.
 impl serde::Serialize for PeerIdentity {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(5))?;
+        let mut map = serializer.serialize_map(Some(7))?;
         match self {
             Self::Uid(uid) => map.serialize_entry("peer_uid", uid)?,
             Self::Sid {
                 sid,
                 elevated,
                 administrator,
+                pid,
+                origin,
                 ..
             } => {
                 map.serialize_entry("peer_sid", sid)?;
                 map.serialize_entry("elevated", elevated)?;
                 map.serialize_entry("administrator", administrator)?;
+                map.serialize_entry("peer_pid", pid)?;
+                map.serialize_entry("peer_origin", &origin.as_str())?;
             }
             Self::Peer { peer_id, label } => {
                 map.serialize_entry("peer_token", &true)?;

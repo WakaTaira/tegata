@@ -3682,11 +3682,16 @@ fn spawn_executor_reaper(
 }
 
 #[cfg(unix)]
+fn kill_process_group_id(process_group_id: u32) {
+    unsafe {
+        libc::kill(-(process_group_id as libc::pid_t), libc::SIGKILL);
+    }
+}
+
+#[cfg(unix)]
 fn kill_process_group(child: &Child) {
-    if let Some(pid) = child.id() {
-        unsafe {
-            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-        }
+    if let Some(process_group_id) = child.id() {
+        kill_process_group_id(process_group_id);
     }
 }
 

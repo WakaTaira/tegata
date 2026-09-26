@@ -16,6 +16,7 @@ use crate::UnlockMode;
 const BW_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const BW_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
 const BW_RESYNC_INTERVAL: Duration = Duration::from_secs(60);
+const BW_PROCESS_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) struct BitwardenCliProvider {
     namespace: String,
@@ -505,83 +506,100 @@ impl BitwardenCliProvider {
             command.as_std_mut().process_group(0);
         }
         let result = match command.spawn() {
-            Ok(mut child) => match (child.stdout.take(), child.stderr.take()) {
-                (Some(mut stdout), Some(mut stderr)) => {
-                    let mut stdout_output = Vec::new();
-                    let mut stderr_output = Vec::new();
-                    match timeout(command_timeout, async {
-                        let (status, stdout_result, stderr_result) = tokio::join!(
-                            child.wait(),
-                            stdout.read_to_end(&mut stdout_output),
-                            stderr.read_to_end(&mut stderr_output),
-                        );
-                        let status = match status {
-                            Ok(status) => status,
-                            Err(error) => {
+            Ok(mut child) => {
+                #[cfg(unix)]
+                let process_group_id = child.id();
+                match (child.stdout.take(), child.stderr.take()) {
+                    (Some(mut stdout), Some(mut stderr)) => {
+                        let mut stdout_output = Vec::new();
+                        let mut stderr_output = Vec::new();
+                        match timeout(command_timeout, async {
+                            let (status, stdout_result, stderr_result) = tokio::join!(
+                                child.wait(),
+                                stdout.read_to_end(&mut stdout_output),
+                                stderr.read_to_end(&mut stderr_output),
+                            );
+                            let status = match status {
+                                Ok(status) => status,
+                                Err(error) => {
+                                    return Err(BwRunError::Process(
+                                        error,
+                                        std::mem::take(&mut stderr_output),
+                                    ));
+                                }
+                            };
+                            if let Err(error) = stdout_result {
                                 return Err(BwRunError::Process(
                                     error,
                                     std::mem::take(&mut stderr_output),
                                 ));
                             }
-                        };
-                        if let Err(error) = stdout_result {
-                            return Err(BwRunError::Process(
-                                error,
-                                std::mem::take(&mut stderr_output),
-                            ));
+                            if let Err(error) = stderr_result {
+                                return Err(BwRunError::Process(
+                                    error,
+                                    std::mem::take(&mut stderr_output),
+                                ));
+                            }
+                            if status.success() {
+                                Ok((
+                                    std::mem::take(&mut stdout_output),
+                                    std::mem::take(&mut stderr_output),
+                                    status.code(),
+                                ))
+                            } else {
+                                Err(BwRunError::NonZeroExit(
+                                    status,
+                                    std::mem::take(&mut stderr_output),
+                                ))
+                            }
+                        })
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                #[cfg(unix)]
+                                if let Some(process_group_id) = process_group_id {
+                                    crate::kill_process_group_id(process_group_id);
+                                }
+                                #[cfg(windows)]
+                                let _ = child.start_kill();
+                                let _ = timeout(BW_PROCESS_CLEANUP_TIMEOUT, async {
+                                    let _ = tokio::join!(
+                                        child.wait(),
+                                        stdout.read_to_end(&mut stdout_output),
+                                        stderr.read_to_end(&mut stderr_output),
+                                    );
+                                })
+                                .await;
+                                Err(BwRunError::Timeout(stderr_output))
+                            }
                         }
-                        if let Err(error) = stderr_result {
-                            return Err(BwRunError::Process(
-                                error,
-                                std::mem::take(&mut stderr_output),
-                            ));
+                    }
+                    (stdout, stderr) => {
+                        #[cfg(unix)]
+                        if let Some(process_group_id) = process_group_id {
+                            crate::kill_process_group_id(process_group_id);
                         }
-                        if status.success() {
-                            Ok((
-                                std::mem::take(&mut stdout_output),
-                                std::mem::take(&mut stderr_output),
-                                status.code(),
-                            ))
-                        } else {
-                            Err(BwRunError::NonZeroExit(
-                                status,
-                                std::mem::take(&mut stderr_output),
-                            ))
-                        }
-                    })
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            #[cfg(unix)]
-                            crate::kill_process_group(&child);
-                            #[cfg(windows)]
-                            let _ = child.start_kill();
+                        #[cfg(windows)]
+                        let _ = child.start_kill();
+                        let mut stderr_output = Vec::new();
+                        let _ = timeout(BW_PROCESS_CLEANUP_TIMEOUT, async {
                             let _ = child.wait().await;
-                            let _ = stderr.read_to_end(&mut stderr_output).await;
-                            Err(BwRunError::Timeout(stderr_output))
-                        }
+                            if let Some(mut stderr) = stderr {
+                                let _ = stderr.read_to_end(&mut stderr_output).await;
+                            }
+                        })
+                        .await;
+                        let message = if stdout.is_none() {
+                            "bw stdout was not piped"
+                        } else {
+                            "bw stderr was not piped"
+                        };
+                        let error = io::Error::new(io::ErrorKind::BrokenPipe, message);
+                        Err(BwRunError::Process(error, stderr_output))
                     }
                 }
-                (stdout, stderr) => {
-                    #[cfg(unix)]
-                    crate::kill_process_group(&child);
-                    #[cfg(windows)]
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    let mut stderr_output = Vec::new();
-                    if let Some(mut stderr) = stderr {
-                        let _ = stderr.read_to_end(&mut stderr_output).await;
-                    }
-                    let message = if stdout.is_none() {
-                        "bw stdout was not piped"
-                    } else {
-                        "bw stderr was not piped"
-                    };
-                    let error = io::Error::new(io::ErrorKind::BrokenPipe, message);
-                    Err(BwRunError::Process(error, stderr_output))
-                }
-            },
+            }
             Err(error) => Err(BwRunError::Process(error, Vec::new())),
         };
         match result {
@@ -912,9 +930,7 @@ impl BitwardenCliProvider {
             if let Err(error) = self.sync_session(context).await {
                 self.session = None;
                 self.unlocked_at = None;
-                return Err(BwOperationError::NoColdStartRetry(classify_bw_run_error(
-                    &error,
-                )));
+                return Err(classify_second_sync_failure(&error));
             }
         }
         self.unlocked_at = Some(Instant::now());
@@ -1093,6 +1109,15 @@ fn should_retry_login_after_sync(error: &BwRunError) -> bool {
     matches!(error, BwRunError::NonZeroExit(_, _))
 }
 
+fn classify_second_sync_failure(error: &BwRunError) -> BwOperationError {
+    let error_code = classify_bw_run_error(error);
+    if should_retry_login_after_sync(error) {
+        BwOperationError::Normal(error_code)
+    } else {
+        BwOperationError::NoColdStartRetry(error_code)
+    }
+}
+
 impl CredentialProvider for BitwardenCliProvider {
     fn list_refs(&mut self) -> ProviderFuture<'_, Vec<CredentialRef>> {
         Box::pin(self.list_refs_inner())
@@ -1130,8 +1155,9 @@ impl CredentialProvider for BitwardenCliProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        BwAttemptContext, BwRunError, can_retry_cold_start, classify_bw_run_error,
-        issued_session_secrets, sanitize_stderr, should_resync, should_retry_login_after_sync,
+        BwAttemptContext, BwOperationError, BwRunError, can_retry_cold_start,
+        classify_bw_run_error, classify_second_sync_failure, issued_session_secrets,
+        sanitize_stderr, should_resync, should_retry_login_after_sync,
     };
     use crate::ErrorCode;
     use std::path::Path;
@@ -1276,5 +1302,35 @@ mod tests {
             status,
             Vec::new(),
         )));
+    }
+
+    #[test]
+    fn classifies_second_sync_failure_by_failure_kind() {
+        assert!(matches!(
+            classify_second_sync_failure(&BwRunError::Timeout(Vec::new())),
+            BwOperationError::NoColdStartRetry(ErrorCode::ProviderUnavailable)
+        ));
+        assert!(matches!(
+            classify_second_sync_failure(&BwRunError::Process(
+                std::io::Error::other("process"),
+                Vec::new(),
+            )),
+            BwOperationError::NoColdStartRetry(ErrorCode::ProviderUnavailable)
+        ));
+
+        #[cfg(unix)]
+        let status = std::process::Command::new("sh")
+            .args(["-c", "exit 1"])
+            .status()
+            .expect("spawn shell");
+        #[cfg(windows)]
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "exit", "1"])
+            .status()
+            .expect("spawn command shell");
+        assert!(matches!(
+            classify_second_sync_failure(&BwRunError::NonZeroExit(status, Vec::new())),
+            BwOperationError::Normal(ErrorCode::ProviderUnavailable)
+        ));
     }
 }

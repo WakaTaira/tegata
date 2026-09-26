@@ -63,14 +63,23 @@ const EXECUTOR_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 const EXECUTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const PASSWORD_FILE_DIR: &str = ".bw-passwords";
 
+struct RpcContext {
+    id: u64,
+    method: String,
+}
+
 tokio::task_local! {
-    pub(crate) static RPC_ID: u64;
+    static RPC_CONTEXT: RpcContext;
 }
 
 static NEXT_RPC_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn current_rpc_id() -> Option<u64> {
-    RPC_ID.try_with(|rpc_id| *rpc_id).ok()
+    RPC_CONTEXT.try_with(|context| context.id).ok()
+}
+
+pub(crate) fn current_rpc_method() -> Option<String> {
+    RPC_CONTEXT.try_with(|context| context.method.clone()).ok()
 }
 
 type ReadySender = Arc<std::sync::Mutex<Option<std::sync::mpsc::SyncSender<Result<(), String>>>>>;
@@ -1251,9 +1260,12 @@ async fn serve_connection<S>(
         let (request, response, outcome, fields) = match parsed {
             Ok(request) => {
                 let fields = audit_fields(&request.method, &request.params);
-                let handled = RPC_ID
+                let handled = RPC_CONTEXT
                     .scope(
-                        rpc_id,
+                        RpcContext {
+                            id: rpc_id,
+                            method: request.method.clone(),
+                        },
                         handle_request(
                             &request,
                             state.clone(),

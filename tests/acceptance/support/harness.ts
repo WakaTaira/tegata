@@ -41,6 +41,7 @@ export const ERROR_CODES = [
   "APPROVAL_DENIED",
   "APPROVAL_TIMEOUT",
   "DEVICE_CODE_REJECTED",
+  "PROVIDER_UNAVAILABLE",
   "INTERNAL",
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];

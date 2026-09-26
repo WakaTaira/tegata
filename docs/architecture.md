@@ -78,7 +78,11 @@ The executor consumes a secret and produces an authenticated session, then hands
 out a connection to it. It runs on the isolated side and returns a channel
 reference, never the material it consumed.
 
-`packages/tegata-executor` is the implemented executor: a Playwright form login.
+`packages/tegata-executor` is the implemented executor: a Playwright form login
+and device-flow approval. Device-flow approval always uses a dedicated browser,
+closes it on completion, and returns no CDP channel. The daemon passes the
+verification URL and user code only to the isolated executor; the token is
+received directly by the agent's device-flow tool and is not held by tegata.
 The daemon spawns it as `node <entry>` per login and writes one JSON line to its
 stdin — target URL, steps, and the resolved secret. Nothing goes through `argv` or
 the environment. It launches its own headless Chromium with a remote debugging
@@ -154,7 +158,7 @@ in a process argument list or an environment block.
 ## The RPC layer
 
 The daemon speaks newline-delimited JSON-RPC 2.0. Method dispatch is an explicit
-allowlist — `status`, `list_credentials`, `login`, `logout`, `get_totp`,
+allowlist — `status`, `list_credentials`, `login`, `authorize_device`, `logout`, `get_totp`,
 `lock_vault`, plus `admin_seal` and `admin_token_issue` on Windows. Anything else
 returns method-not-found. There is deliberately no method that executes something
 arbitrary on the isolated side.
@@ -181,7 +185,9 @@ The peer key is whatever the transport established — `peer_uid`, `peer_sid` (w
 `elevated` and `administrator` alongside it), or `peer_token` — so the record is
 written in the vocabulary of the boundary that actually authenticated the caller.
 `session_id` and `namespace` are `null` on calls they do not apply to. `outcome`
-is `ok` or the classification code. Only references are recorded; no value is.
+is `ok` or the classification code. For `authorize_device`, `target_url` is the
+`verification_url`. Only references are recorded; no value is, and the
+`user_code` is not recorded.
 
 Daemon-initiated events use `"peer_system": true` in place of a caller:
 `session_expired` when a session reaches its TTL, `vault_autolocked` when a

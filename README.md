@@ -170,6 +170,7 @@ The agent-facing surface is five tools. Nothing else crosses the boundary.
 | --- | --- | --- |
 | `list_credentials` | `{namespace?}` | Catalog entries: `id`, `name`, `uri`, `kind`, `source`, `status`. No values. |
 | `login` | `{cred_id, target_url, steps?, success_selector?, failure_selector?, exclusive?: boolean (dedicated browser)}` | `{session_id, target_id, channel: {kind: "cdp", endpoint}}` |
+| `authorize_device` | `{cred_id, verification_url, user_code, steps?, success_selector, failure_selector?}` | `{ok: true}` — approves a device-code grant in a dedicated browser |
 | `logout` | `{session_id}` | `{ok}` — destroys the session and its browser |
 | `get_totp` | `{cred_id}` | `{code, expires_in}` — opt-in entries only, rate-limited |
 | `lock_vault` | `{namespace?}` | `{ok}` — locks one provider, or all of them |

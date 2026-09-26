@@ -60,6 +60,7 @@ unexpected daemon response cannot smuggle text out through the error path.
 | `INVALID_CREDENTIAL` | The credential does not exist, or the site rejected the login |
 | `MFA_REQUIRED` | The login needs a TOTP code and the credential has no seed |
 | `SELECTOR_NOT_FOUND` | A step's selector did not resolve within the step timeout |
+| `DEVICE_CODE_REJECTED` | The device authorization page rejected the user code |
 | `VAULT_LOCKED` | The provider holding this credential is locked |
 | `RATE_LIMITED` | A second `get_totp` for the same credential within 30 seconds |
 | `TOTP_NOT_EXPOSABLE` | The credential is not marked `totp_exposable`, or has no seed |
@@ -255,6 +256,40 @@ the daemon does not disclose whether the session exists.
 
 Call it when finished. The CDP endpoint stops being connectable and the browser
 takes its cookies with it.
+
+## `authorize_device`
+
+Acts as the human approval step for a device-code grant started by an agent tool
+such as `gh auth login` or a cloud CLI. tegata opens a dedicated browser, logs in
+with the credential, enters the user code at the verification URL, and approves
+the grant. The agent's tool receives the token directly; tegata never holds it.
+
+**Input**
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `cred_id` | string | yes | An `id` from `list_credentials` |
+| `verification_url` | string | yes | The device authorization page to open |
+| `user_code` | string | yes | The short-lived code to enter; it is not recorded in logs or audit |
+| `steps` | array | no | Explicit steps; omitted means the default device-flow procedure |
+| `success_selector` | string | yes | A selector that appears when authorization succeeds |
+| `failure_selector` | string | no | A selector that appears when the device code is rejected |
+
+When `steps` is omitted, tegata uses the credential's login heuristic, opens
+`verification_url`, fills the first matching input among
+`input[name=user_code]`, `input[autocomplete=one-time-code]`, and
+`input[type=text]`, submits with `button[type=submit]`, clicks the first matching
+`Authorize`, `Continue`, or `Approve` button, and waits for `success_selector`.
+Explicit steps have the same placeholder restriction as `login`, with
+`{{user_code}}` additionally allowed.
+
+**Output**: `{"ok": true}`
+
+The browser is dedicated to this call, closes when it completes, and never
+returns a CDP channel. Login failures use `INVALID_CREDENTIAL`, `MFA_REQUIRED`,
+or `SELECTOR_NOT_FOUND`; a matching `failure_selector` returns
+`DEVICE_CODE_REJECTED`. Other failures return `INTERNAL`. Approval hooks can
+also return `APPROVAL_DENIED` or `APPROVAL_TIMEOUT`.
 
 ## `get_totp`
 

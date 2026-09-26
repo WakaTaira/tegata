@@ -61,6 +61,34 @@ rl.on("line", (line) => {
 rl.on("close", () => { setInterval(() => {}, 1000); });
 "#;
 
+const AUTHORIZE_SUCCESS_EXECUTOR: &str = r#"
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.op === "authorize_device") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true, endpoint: "ws://127.0.0.1:38999/devtools/browser/test" }) + "\n");
+  } else if (request.op === "shutdown") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true }) + "\n");
+    process.exit(0);
+  }
+});
+"#;
+
+const AUTHORIZE_REJECTED_EXECUTOR: &str = r#"
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.op === "authorize_device") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: "DEVICE_CODE_REJECTED" }) + "\n");
+  } else if (request.op === "shutdown") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true }) + "\n");
+    process.exit(0);
+  }
+});
+"#;
+
 struct Daemon {
     child: Child,
     directory: PathBuf,
@@ -190,6 +218,46 @@ fn status_returns_ok() {
     assert_eq!(response["result"]["ok"], json!(true));
     assert_eq!(response["result"]["browsers"], json!(0));
     assert_eq!(response["result"]["leases"], json!(0));
+}
+
+#[test]
+fn authorize_device_returns_only_ok_and_does_not_create_a_session() {
+    let daemon = Daemon::start_with_executor(AUTHORIZE_SUCCESS_EXECUTOR);
+    let response = rpc(
+        &daemon.socket_path,
+        "authorize_device",
+        json!({
+            "cred_id": "mock:site",
+            "verification_url": "https://example.test/device",
+            "user_code": "secret-device-code",
+            "success_selector": "#device-ok"
+        }),
+    );
+    assert_eq!(response["result"], json!({ "ok": true }));
+    assert!(response["result"].get("endpoint").is_none());
+    let status = rpc(&daemon.socket_path, "status", json!({}));
+    assert_eq!(status["result"]["browsers"], json!(0));
+    assert_eq!(status["result"]["leases"], json!(0));
+}
+
+#[test]
+fn authorize_device_propagates_device_code_rejected() {
+    let daemon = Daemon::start_with_executor(AUTHORIZE_REJECTED_EXECUTOR);
+    let response = rpc(
+        &daemon.socket_path,
+        "authorize_device",
+        json!({
+            "cred_id": "mock:site",
+            "verification_url": "https://example.test/device",
+            "user_code": "unissued-device-code",
+            "success_selector": "#device-ok",
+            "failure_selector": "#device-error"
+        }),
+    );
+    error_message(&response, "DEVICE_CODE_REJECTED");
+    let status = rpc(&daemon.socket_path, "status", json!({}));
+    assert_eq!(status["result"]["browsers"], json!(0));
+    assert_eq!(status["result"]["leases"], json!(0));
 }
 
 #[test]

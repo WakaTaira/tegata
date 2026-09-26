@@ -26,6 +26,9 @@ jobs:
       - name: Install npm dependencies
         run: nix develop -c npm ci
 
+      - name: Run unit tests
+        run: nix develop -c npm run test:unit
+
       - name: Run acceptance tests
         run: nix develop -c npm run test:acceptance
 

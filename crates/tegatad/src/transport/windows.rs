@@ -60,7 +60,7 @@ use super::{
     Accepted, CdpPortResolver, ClientStream, ListenConfig, PeerAuthenticator, PeerIdentity,
     TcpTransport, Transport,
 };
-use crate::interop::{MAX_ANCESTRY_DEPTH, Origin, ProcEntry, classify_ancestry};
+use crate::interop::{Origin, ProcEntry, classify_ancestry, trace_ancestry};
 
 /// Configuration keys owned by this transport.
 #[derive(Clone, Debug, Deserialize)]
@@ -200,6 +200,12 @@ struct ClientIdentity {
     administrator: bool,
     pid: u32,
     origin: Origin,
+}
+
+struct TokenIdentity {
+    sid: String,
+    elevated: bool,
+    administrator: bool,
 }
 
 struct OwnedHandle(HANDLE);
@@ -484,20 +490,12 @@ fn process_table() -> io::Result<Vec<ProcEntry>> {
 }
 
 fn fill_creation_times(client_pid: u32, table: &mut [ProcEntry]) {
-    let mut current_pid = client_pid;
-    let mut visited = Vec::new();
-    for _ in 0..=MAX_ANCESTRY_DEPTH {
-        let Some(index) = table.iter().position(|entry| entry.pid == current_pid) else {
-            return;
-        };
-        let pid = table[index].pid;
-        let ppid = table[index].ppid;
-        table[index].created = process_creation_time(pid);
-        if ppid == 0 || ppid == pid || visited.contains(&ppid) {
-            return;
+    let ancestry = trace_ancestry(client_pid, table);
+    for pid in ancestry.pids {
+        let created = process_creation_time(pid);
+        if let Some(entry) = table.iter_mut().find(|entry| entry.pid == pid) {
+            entry.created = created;
         }
-        visited.push(pid);
-        current_pid = ppid;
     }
 }
 
@@ -562,7 +560,11 @@ fn client_identity(pipe: &NamedPipeServer, pid: u32, origin: Origin) -> io::Resu
     }
     // The impersonation token doubles as the membership token: it carries the
     // filtered groups of a client that runs without elevation.
-    let (sid, elevated, administrator) = query_token_identity(token.get(), token.get())?;
+    let TokenIdentity {
+        sid,
+        elevated,
+        administrator,
+    } = query_token_identity(token.get(), token.get())?;
     Ok(ClientIdentity {
         sid,
         elevated,
@@ -572,10 +574,7 @@ fn client_identity(pipe: &NamedPipeServer, pid: u32, origin: Origin) -> io::Resu
     })
 }
 
-fn query_token_identity(
-    token: HANDLE,
-    administrator_token: HANDLE,
-) -> io::Result<(String, bool, bool)> {
+fn query_token_identity(token: HANDLE, administrator_token: HANDLE) -> io::Result<TokenIdentity> {
     let user = token_information(token, TokenUser)?;
     let token_user = unsafe {
         // SAFETY: `token_information` stores the buffer in an 8-byte-aligned region.
@@ -589,7 +588,11 @@ fn query_token_identity(
         (*elevation.as_ptr().cast::<TOKEN_ELEVATION>()).TokenIsElevated != 0
     };
     let administrator = is_administrator(administrator_token)?;
-    Ok((sid, elevated, administrator))
+    Ok(TokenIdentity {
+        sid,
+        elevated,
+        administrator,
+    })
 }
 
 fn token_information(

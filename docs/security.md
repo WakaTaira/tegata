@@ -82,12 +82,16 @@ because the side that must be protected is the Windows side.
 
 Named-pipe administrative RPCs add a process-origin check. Before impersonating
 the pipe client, the daemon obtains its PID and follows up to 32 parent processes
-from a process snapshot. An ancestry containing `wsl.exe`, `wslhost.exe`,
-`wslservice.exe`, `wslrelay.exe`, or `wslg.exe` is classified as `wsl_interop`
-and is refused even when the token is elevated and belongs to the Administrators
-group. Missing or inconsistent ancestry is `unknown` and is refused as well.
-This is a heuristic and fails closed; the non-elevated WSL startup procedure in
-the preceding guidance remains the primary defense for issue #12.
+from a process snapshot. The walk ends at a missing parent, a root process, a
+cycle, a parent whose creation time is later than the child's when both are
+available, or the depth limit. Among the verified entries, an ancestry containing
+`wsl.exe`, `wslhost.exe`, `wslservice.exe`, `wslrelay.exe`, or `wslg.exe` is
+classified as `wsl_interop` and is refused even when the token is elevated and
+belongs to the Administrators group. A client PID missing from the snapshot or a
+failed snapshot is `unknown` and is refused; the other walk termination cases are
+`native` when no interop executable was seen. This is a heuristic and fails
+closed; the [non-elevated WSL startup procedure](setup-windows-wsl.md#how-the-distro-is-started-matters)
+remains the primary defense for issue #12.
 
 Running the daemon *inside* the same WSL distro as the agent is possible with the
 systemd boundary, but only if interop is disabled or `.exe` execution is denied.

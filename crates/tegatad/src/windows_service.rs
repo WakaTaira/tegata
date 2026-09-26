@@ -403,10 +403,12 @@ fn firewall_rule_command(rule_name: &str, tcp_port: u16) -> String {
     )
 }
 
+// 規則が存在しない場合も成功とする。Windows PowerShell の -Command は、最後のパイプラインが
+// エラーを記録すると終了コード 1 を返すため、初回インストールの事前削除が失敗しないよう明示的に分岐する。
 fn remove_firewall_rule(name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let rule_name = firewall_rule_name(name);
     run_powershell(&format!(
-        "Get-NetFirewallRule -DisplayName '{}' -ErrorAction SilentlyContinue | Remove-NetFirewallRule",
+        "$rules = @(Get-NetFirewallRule -DisplayName '{}' -ErrorAction SilentlyContinue); if ($rules.Count -gt 0) {{ $rules | Remove-NetFirewallRule -ErrorAction Stop }}; exit 0",
         rule_name
     ))
 }

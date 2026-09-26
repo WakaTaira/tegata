@@ -117,8 +117,10 @@ to container peers as well: sessions owned by another principal return
 ### 3. Only a thin, allowlisted RPC crosses the boundary
 
 Eight methods exist: `status`, `list_credentials`, `login`, `authorize_device`,
-`open_api_proxy`, `logout`, `get_totp`, `lock_vault`, plus two administrative
-methods on Windows. Anything else is answered with a JSON-RPC method-not-found
+`open_api_proxy`, `logout`, `get_totp`, `lock_vault`, plus the administrative
+methods `admin_peer_issue`, `admin_peer_revoke`, `admin_peer_list`, and
+`admin_token_issue`, and on Windows `admin_seal`, `admin_approval_list`, and
+`admin_approval_decide`. Anything else is answered with a JSON-RPC method-not-found
 error. There is no generic "run this on the isolated side" call, because such a
 call would be the boundary's own bypass.
 
@@ -322,8 +324,8 @@ What an agent cannot forge, on this host, is passage through the administrative
 RPC gate: elevated, a member of the local Administrators group, and not a WSL
 interop caller. That gate already exists to protect `peer issue`, `peer revoke`,
 and `seal`. `approve_operator = true` puts the approval decision behind the same
-gate instead of behind a command. Every `login` and `authorize_device` registers
-a pending approval — at the same point in the call, after the credential is
+gate instead of behind a command. Every `login`, `authorize_device`, and
+`open_api_proxy` registers a pending approval — at the same point in the call, after the credential is
 confirmed to exist and before any value is resolved — and a human decides it
 from an elevated PowerShell with `tegatad.exe approval list` / `approval allow
 <id>` / `approval deny <id>`, which reach the daemon through `admin_approval_list` and

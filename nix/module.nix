@@ -8,6 +8,8 @@ let
     if builtins.isString value then builtins.toJSON value
     else if builtins.isBool value then if value then "true" else "false"
     else if builtins.isInt value then builtins.toString value
+    else if builtins.isAttrs value then
+      "{ ${lib.concatStringsSep ", " (map (name: "${name} = ${tomlValue (builtins.getAttr name value)}") (lib.attrNames value))} }"
     else if builtins.isList value then
       "[${lib.concatStringsSep ", " (map tomlValue value)}]"
     else throw "services.tegata: unsupported TOML value";
@@ -31,13 +33,24 @@ let
       + lib.concatStringsSep "" (map renderEntry provider.entries);
 
   renderApiProxy = name: proxy:
-    "[[api_proxy]]\n${renderAssignments {
+    "[[api_proxy]]\n${renderAssignments (lib.filterAttrs (_: value: value != null) {
       inherit name;
       cred_id = proxy.credId;
       upstream = proxy.upstream;
       header = proxy.header;
       value = proxy.value;
-    }}";
+    })}"
+    + lib.optionalString (proxy.oauth != null) "\n[api_proxy.oauth]\n${renderAssignments (lib.filterAttrs (_: value: value != null) {
+      client_id = proxy.oauth.clientId;
+      device_authorization_url = proxy.oauth.deviceAuthorizationUrl;
+      token_url = proxy.oauth.tokenUrl;
+      revocation_url = proxy.oauth.revocationUrl;
+      scope = proxy.oauth.scope;
+      login_cred_id = proxy.oauth.loginCredId;
+      steps = proxy.oauth.steps;
+      success_selector = proxy.oauth.successSelector;
+      failure_selector = proxy.oauth.failureSelector;
+    })}";
 
   baseConfig = {
     executor_socket = "/run/tegata-executor/executor.sock";
@@ -186,7 +199,8 @@ in
       type = lib.types.attrsOf (lib.types.submodule {
         options = {
           credId = lib.mkOption {
-            type = lib.types.str;
+            type = lib.types.nullOr lib.types.str;
+            default = null;
             description = "The namespaced credential reference whose value is injected.";
           };
           upstream = lib.mkOption {
@@ -202,6 +216,23 @@ in
             type = lib.types.str;
             default = "Bearer {{secret}}";
             description = "The header value template; {{secret}} is replaced with the credential's password.";
+          };
+          oauth = lib.mkOption {
+            type = lib.types.nullOr (lib.types.submodule {
+              options = {
+                clientId = lib.mkOption { type = lib.types.str; };
+                deviceAuthorizationUrl = lib.mkOption { type = lib.types.str; };
+                tokenUrl = lib.mkOption { type = lib.types.str; };
+                revocationUrl = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
+                scope = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
+                loginCredId = lib.mkOption { type = lib.types.str; };
+                steps = lib.mkOption { type = lib.types.nullOr (lib.types.listOf lib.types.attrs); default = null; };
+                successSelector = lib.mkOption { type = lib.types.str; };
+                failureSelector = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
+              };
+            });
+            default = null;
+            description = "OAuth device-flow client configuration for the proxy.";
           };
         };
       });
@@ -253,7 +284,10 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    assertions = [
+    assertions = lib.mapAttrsToList (name: proxy: {
+      assertion = (proxy.credId == null) != (proxy.oauth == null);
+      message = "services.tegata.apiProxies.${name} must set exactly one of credId and oauth.";
+    }) cfg.apiProxies ++ [
       {
         assertion = cfg.listen.tcp == null
           || !(builtins.elem cfg.listen.tcp.bind [ "0.0.0.0" "::" "auto" ]);

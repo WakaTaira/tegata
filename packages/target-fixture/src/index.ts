@@ -16,6 +16,22 @@ interface Credentials {
 
 const sessions = new Map<string, true>();
 const deviceCodes = new Map<string, boolean>();
+interface OAuthDeviceCode {
+  userCode: string;
+  expiresAt: number;
+  consumed: boolean;
+}
+
+const oauthDeviceCodes = new Map<string, OAuthDeviceCode>();
+const oauthAccessTokens = new Map<string, number>();
+const oauthRefreshTokens = new Map<string, string>();
+const oauthAccessTokenValues: string[] = [];
+const oauthRefreshTokenValues: string[] = [];
+const oauthRevokedTokens = new Set<string>();
+const oauthGrantCounts = { device_code: 0, refresh_token: 0 };
+let oauthIssued = 0;
+let oauthExpiresIn = 3600;
+let oauthDeny = false;
 let observedSecChUa: string | null = null;
 
 function usageError(message: string): never {
@@ -169,6 +185,75 @@ function writePage(
     ...headers,
   });
   response.end(body);
+}
+
+function writeJson(
+  response: ServerResponse,
+  status: number,
+  body: Record<string, unknown>,
+): void {
+  response.writeHead(status, { "Content-Type": "application/json" });
+  response.end(JSON.stringify(body));
+}
+
+function requestOrigin(request: IncomingMessage): string {
+  return `http://${request.headers.host ?? "127.0.0.1"}`;
+}
+
+function newOAuthToken(): string {
+  return randomBytes(32).toString("hex");
+}
+
+function issueOAuthTokens(): {
+  access_token: string;
+  refresh_token: string;
+} {
+  const accessToken = newOAuthToken();
+  const refreshToken = newOAuthToken();
+  oauthAccessTokens.set(accessToken, Date.now() + oauthExpiresIn * 1000);
+  oauthRefreshTokens.set(refreshToken, accessToken);
+  oauthAccessTokenValues.push(accessToken);
+  oauthRefreshTokenValues.push(refreshToken);
+  oauthIssued += 1;
+  return { access_token: accessToken, refresh_token: refreshToken };
+}
+
+function markOAuthTokenRevoked(token: string): void {
+  oauthRevokedTokens.add(token);
+}
+
+function revokeOAuthAccessToken(token: string): void {
+  if (oauthAccessTokens.delete(token)) markOAuthTokenRevoked(token);
+}
+
+function revokeOAuthRefreshToken(token: string): void {
+  const accessToken = oauthRefreshTokens.get(token);
+  if (accessToken === undefined) return;
+  oauthRefreshTokens.delete(token);
+  markOAuthTokenRevoked(token);
+  revokeOAuthAccessToken(accessToken);
+}
+
+function validOAuthAccessToken(token: string): boolean {
+  const expiresAt = oauthAccessTokens.get(token);
+  if (expiresAt === undefined) return false;
+  if (expiresAt <= Date.now()) {
+    oauthAccessTokens.delete(token);
+    return false;
+  }
+  return true;
+}
+
+function readRequestBody(
+  request: IncomingMessage,
+  callback: (body: string) => void,
+): void {
+  let body = "";
+  request.setEncoding("utf8");
+  request.on("data", (chunk: string) => {
+    body += chunk;
+  });
+  request.on("end", () => callback(body));
 }
 
 function loginForm(error = false, totpEnabled = false): string {
@@ -398,6 +483,174 @@ function handleRequest(
         );
       }
     });
+    return;
+  }
+
+  if (
+    request.method === "POST" &&
+    request.url === "/oauth/device_authorization"
+  ) {
+    readRequestBody(request, (body) => {
+      const form = new URLSearchParams(body);
+      if (form.get("client_id") === null || form.get("client_id") === "") {
+        writeJson(response, 400, { error: "invalid_request" });
+        return;
+      }
+      const userCode = newDeviceCode();
+      const deviceCode = newOAuthToken();
+      deviceCodes.set(userCode, false);
+      oauthDeviceCodes.set(deviceCode, {
+        userCode,
+        expiresAt: Date.now() + 300_000,
+        consumed: false,
+      });
+      writeJson(response, 200, {
+        device_code: deviceCode,
+        user_code: userCode,
+        verification_uri: `${requestOrigin(request)}/device`,
+        expires_in: 300,
+        interval: 1,
+      });
+    });
+    return;
+  }
+
+  if (request.method === "POST" && request.url === "/oauth/token") {
+    readRequestBody(request, (body) => {
+      const form = new URLSearchParams(body);
+      const grantType = form.get("grant_type");
+      if (grantType === "urn:ietf:params:oauth:grant-type:device_code") {
+        const deviceCode = form.get("device_code");
+        const grant =
+          deviceCode === null ? undefined : oauthDeviceCodes.get(deviceCode);
+        if (grant === undefined) {
+          writeJson(response, 400, { error: "invalid_grant" });
+          return;
+        }
+        if (grant.expiresAt <= Date.now()) {
+          writeJson(response, 400, { error: "expired_token" });
+          return;
+        }
+        if (oauthDeny) {
+          writeJson(response, 400, { error: "access_denied" });
+          return;
+        }
+        if (grant.consumed) {
+          writeJson(response, 400, { error: "invalid_grant" });
+          return;
+        }
+        if (deviceCodes.get(grant.userCode) !== true) {
+          writeJson(response, 400, { error: "authorization_pending" });
+          return;
+        }
+        grant.consumed = true;
+        oauthGrantCounts.device_code += 1;
+        writeJson(response, 200, {
+          ...issueOAuthTokens(),
+          token_type: "Bearer",
+          expires_in: oauthExpiresIn,
+        });
+        return;
+      }
+
+      if (grantType === "refresh_token") {
+        const refreshToken = form.get("refresh_token");
+        const oldAccessToken =
+          refreshToken === null
+            ? undefined
+            : oauthRefreshTokens.get(refreshToken);
+        if (refreshToken === null || oldAccessToken === undefined) {
+          writeJson(response, 400, { error: "invalid_grant" });
+          return;
+        }
+        revokeOAuthRefreshToken(refreshToken);
+        oauthGrantCounts.refresh_token += 1;
+        writeJson(response, 200, {
+          ...issueOAuthTokens(),
+          token_type: "Bearer",
+          expires_in: oauthExpiresIn,
+        });
+        return;
+      }
+
+      writeJson(response, 400, { error: "unsupported_grant_type" });
+    });
+    return;
+  }
+
+  if (request.method === "POST" && request.url === "/oauth/revoke") {
+    readRequestBody(request, (body) => {
+      const token = new URLSearchParams(body).get("token");
+      if (token === null || token === "") {
+        writeJson(response, 400, { error: "invalid_request" });
+        return;
+      }
+      if (oauthAccessTokens.has(token)) revokeOAuthAccessToken(token);
+      else revokeOAuthRefreshToken(token);
+      writeJson(response, 200, {});
+    });
+    return;
+  }
+
+  if (request.method === "GET" && request.url === "/oauth/state") {
+    writeJson(response, 200, {
+      grants: oauthGrantCounts,
+      issued: oauthIssued,
+      revoked: oauthRevokedTokens.size,
+      access_tokens: oauthAccessTokenValues,
+      refresh_tokens: oauthRefreshTokenValues,
+    });
+    return;
+  }
+
+  if (request.method === "POST" && request.url === "/oauth/config") {
+    readRequestBody(request, (body) => {
+      let value: unknown;
+      try {
+        value = JSON.parse(body);
+      } catch {
+        writeJson(response, 400, { error: "invalid_request" });
+        return;
+      }
+      if (typeof value !== "object" || value === null) {
+        writeJson(response, 400, { error: "invalid_request" });
+        return;
+      }
+      const config = value as Record<string, unknown>;
+      if ("expires_in" in config) {
+        if (
+          typeof config.expires_in !== "number" ||
+          !Number.isInteger(config.expires_in) ||
+          config.expires_in <= 0
+        ) {
+          writeJson(response, 400, { error: "invalid_request" });
+          return;
+        }
+        oauthExpiresIn = config.expires_in;
+      }
+      if ("deny" in config) {
+        if (typeof config.deny !== "boolean") {
+          writeJson(response, 400, { error: "invalid_request" });
+          return;
+        }
+        oauthDeny = config.deny;
+      }
+      writeJson(response, 200, {});
+    });
+    return;
+  }
+
+  if (request.method === "GET" && request.url === "/api/me") {
+    const authorization = request.headers.authorization;
+    const token =
+      authorization?.startsWith("Bearer ") === true
+        ? authorization.slice("Bearer ".length)
+        : undefined;
+    if (token !== undefined && validOAuthAccessToken(token)) {
+      writeJson(response, 200, { user: "fixture" });
+    } else {
+      writeJson(response, 401, { error: "unauthorized" });
+    }
     return;
   }
 

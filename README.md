@@ -259,9 +259,10 @@ machine, with an owner on every session; the container boundary — the daemon o
 the host, reached from a containerized agent through `tegata-bridge` and a named
 token; OAuth device-flow approval — the daemon logs in and approves a
 device-code grant the agent's own tool started, without handing out a browser;
-an injection proxy for static API tokens — `open_api_proxy` hands the agent a
-loopback base URL and adds the stored token to every request for one configured
-upstream, so the agent never holds it; an experimental Herdr integration in
+an injection proxy for static API tokens and tokens tegata obtains itself through
+the OAuth device-code grant — `open_api_proxy` hands the agent a loopback base
+URL and adds the token to every request for one configured upstream, so the agent
+never holds it; an experimental Herdr integration in
 [`integrations/herdr`](integrations/herdr) that shows a logged-in session in a
 Herdr browser pane;
 and prebuilt release binaries and bundles for non-Nix deployments,
@@ -273,9 +274,9 @@ Planned, tracked in the
 
 - **CDP isolation** — the browser in its own network namespace, reachable only
   through the daemon's authenticated relay
-- **Injection proxy, remaining parts**
-  ([#20](https://github.com/WakaTaira/tegata/issues/20)) — a tegata-owned OAuth
-  client and hosted stdio MCP servers
+- **Injection proxy, remaining part**
+  ([#20](https://github.com/WakaTaira/tegata/issues/20)) — hosted stdio MCP
+  servers
 - **Approved privilege escalation**
   ([#39](https://github.com/WakaTaira/tegata/issues/39)) — running an elevated
   command behind the same out-of-band approval, without handing the agent a

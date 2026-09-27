@@ -19,12 +19,21 @@ export type ApiProxyOptions = {
 export type ApiProxy = {
   port: number;
   secret: string;
+  /** 以後の要求に注入する値を差し替える。不正なヘッダ値は例外とし、現在の値を保つ。 */
+  setHeaderValue: (value: string) => void;
+  /** 以後の要求を上流へ送らず 503 で応答させる。 */
+  markUnavailable: () => void;
   close: () => Promise<void>;
 };
 
 export type SecretPathMatch =
   | { matched: true; path: string; query: string }
   | { matched: false; path: string };
+
+type InjectionState = {
+  headerValue: string;
+  unavailable: boolean;
+};
 
 type Upstream = {
   url: URL;
@@ -152,6 +161,11 @@ function respondNotFound(response: http.ServerResponse): void {
   response.end("not found");
 }
 
+function respondUnavailable(response: http.ServerResponse): void {
+  response.writeHead(503, { "Content-Type": "text/plain; charset=utf-8" });
+  response.end("service unavailable");
+}
+
 function respondBadGateway(response: http.ServerResponse): void {
   if (response.headersSent) {
     response.destroy();
@@ -166,6 +180,7 @@ function forward(
   response: http.ServerResponse,
   upstream: Upstream,
   options: ApiProxyOptions,
+  headerValue: string,
   target: { path: string; query: string },
   record: (status: number) => void,
 ): void {
@@ -174,7 +189,7 @@ function forward(
     request.rawHeaders,
     new Set(["host", injected]),
   );
-  headers.push("Host", upstream.url.host, options.header, options.headerValue);
+  headers.push("Host", upstream.url.host, options.header, headerValue);
 
   const path = `${upstream.basePath}${target.path}`;
   const upstreamRequest = upstream.transport.request({
@@ -216,6 +231,7 @@ function handleRequest(
   upstream: Upstream,
   secret: string,
   options: ApiProxyOptions,
+  state: InjectionState,
 ): void {
   const match = matchSecretPath(request.url ?? "", secret);
   // secret を持たない要求は記録しない。loopback の任意の利用者が、リース所有者の名義で
@@ -225,6 +241,11 @@ function handleRequest(
     respondNotFound(response);
     return;
   }
+  if (state.unavailable) {
+    request.resume();
+    respondUnavailable(response);
+    return;
+  }
   const method = request.method ?? "";
   let recorded = false;
   const record = (status: number): void => {
@@ -232,7 +253,15 @@ function handleRequest(
     recorded = true;
     options.onRequest({ http_method: method, path: match.path, status });
   };
-  forward(request, response, upstream, options, match, record);
+  forward(
+    request,
+    response,
+    upstream,
+    options,
+    state.headerValue,
+    match,
+    record,
+  );
 }
 
 function listen(server: http.Server): Promise<number> {
@@ -256,8 +285,12 @@ export async function startApiProxy(
   http.validateHeaderValue(options.header, options.headerValue);
   const upstream = parseUpstream(options.upstream);
   const secret = randomBytes(16).toString("base64url");
+  const state: InjectionState = {
+    headerValue: options.headerValue,
+    unavailable: false,
+  };
   const server = http.createServer((request, response) => {
-    handleRequest(request, response, upstream, secret, options);
+    handleRequest(request, response, upstream, secret, options, state);
   });
 
   let port: number;
@@ -277,5 +310,12 @@ export async function startApiProxy(
     });
     return closing;
   };
-  return { port, secret, close };
+  const setHeaderValue = (value: string): void => {
+    http.validateHeaderValue(options.header, value);
+    state.headerValue = value;
+  };
+  const markUnavailable = (): void => {
+    state.unavailable = true;
+  };
+  return { port, secret, setHeaderValue, markUnavailable, close };
 }

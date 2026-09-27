@@ -134,6 +134,11 @@ audit record for the call records `INTERNAL`. This is defense in depth: if it ev
 fires, something above it is already broken, and the point is that the value still
 does not leave.
 
+For an OAuth injection proxy, the access and refresh tokens remain in the
+executor and live only for the proxy lease; they are never exposed to the
+daemon, agent, audit log, or logs. The agent can use the proxy while it holds
+`base_url`, but it cannot read the token itself.
+
 ### 4. Credentials stay behind the boundary; sessions do not
 
 `login` returns a raw CDP endpoint. The agent connects to a browser that is already

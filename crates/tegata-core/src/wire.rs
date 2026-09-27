@@ -52,7 +52,7 @@ pub struct AuthorizeDeviceParams {
     pub failure_selector: Option<String>,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LoginStep {
     pub action: String,
     pub selector: String,
@@ -161,8 +161,41 @@ pub struct ExecutorApiProxyStartRequest {
     pub id: u64,
     pub upstream: String,
     pub header: String,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_zeroizing"
+    )]
+    pub header_value: Option<Zeroizing<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_template: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<ExecutorApiProxyOAuth>,
+}
+
+/// `api_proxy_start` の OAuth 設定。
+#[derive(Serialize)]
+pub struct ExecutorApiProxyOAuth {
+    pub client_id: String,
+    pub device_authorization_url: String,
+    pub token_url: String,
+    pub revocation_url: Option<String>,
+    pub scope: Option<String>,
+    pub login_url: String,
+    pub steps: Option<Vec<LoginStep>>,
+    pub success_selector: String,
+    pub failure_selector: Option<String>,
+    pub secret: ExecutorApiProxyOAuthSecret,
+}
+
+/// OAuth のブラウザログイン資格。直列化後も秘密の保持領域をゼロ化する。
+#[derive(Serialize)]
+pub struct ExecutorApiProxyOAuthSecret {
     #[serde(serialize_with = "serialize_zeroizing")]
-    pub header_value: Zeroizing<String>,
+    pub username: Zeroizing<String>,
+    #[serde(serialize_with = "serialize_zeroizing")]
+    pub password: Zeroizing<String>,
+    #[serde(serialize_with = "serialize_optional_zeroizing")]
+    pub totp: Option<Zeroizing<String>>,
 }
 
 /// `Zeroizing<String>` を文字列として直列化する。zeroize の serde 機能に依存しないための変換である。
@@ -170,7 +203,17 @@ fn serialize_zeroizing<S: serde::Serializer>(
     value: &Zeroizing<String>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(value)
+    serializer.serialize_str(value.as_str())
+}
+
+fn serialize_optional_zeroizing<S: serde::Serializer>(
+    value: &Option<Zeroizing<String>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(value) => serializer.serialize_some(value.as_str()),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// `api_proxy_start` への応答。成功時は loopback のポートと path secret を持つ。
@@ -198,6 +241,13 @@ pub struct ExecutorApiProxyRequestEvent {
     pub http_method: String,
     pub path: String,
     pub status: u16,
+}
+
+/// OAuth トークンの状態変化を executor が書くイベント行。
+#[derive(Deserialize)]
+pub struct ExecutorApiProxyOAuthTokenEvent {
+    pub event: String,
+    pub action: String,
 }
 
 /// Preamble version understood by this build.

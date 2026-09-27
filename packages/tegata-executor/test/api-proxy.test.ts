@@ -488,6 +488,49 @@ describe("API proxy lifecycle", () => {
     ).rejects.toMatchObject({ code: "ECONNREFUSED" });
   });
 
+  test("injects a replaced header value into later requests", async () => {
+    const upstream = await startUpstream();
+    const { proxy } = await startProxy(upstream.url);
+
+    proxy.setHeaderValue("Bearer refreshed-token-value");
+    const response = await rawRequest(
+      proxy.port,
+      `/${proxy.secret}/api/whoami`,
+    );
+
+    expect(response.status).toBe(200);
+    expect(upstream.received[0].headers.authorization).toBe(
+      "Bearer refreshed-token-value",
+    );
+  });
+
+  test("keeps the current value when a replacement is not a valid header value", async () => {
+    const upstream = await startUpstream();
+    const { proxy } = await startProxy(upstream.url);
+
+    expect(() => proxy.setHeaderValue("bad\r\nvalue")).toThrow();
+    await rawRequest(proxy.port, `/${proxy.secret}/api/whoami`);
+
+    expect(upstream.received[0].headers.authorization).toBe(INJECTED);
+  });
+
+  test("answers 503 without contacting the upstream once unavailable", async () => {
+    const upstream = await startUpstream();
+    const { proxy, events } = await startProxy(upstream.url);
+
+    proxy.markUnavailable();
+    const response = await rawRequest(
+      proxy.port,
+      `/${proxy.secret}/api/whoami`,
+    );
+    const unmatched = await rawRequest(proxy.port, "/wrong/api/whoami");
+
+    expect(response.status).toBe(503);
+    expect(unmatched.status).toBe(404);
+    expect(upstream.received).toEqual([]);
+    expect(events).toEqual([]);
+  });
+
   test("rejects invalid header values before listening", async () => {
     await expect(
       startApiProxy({

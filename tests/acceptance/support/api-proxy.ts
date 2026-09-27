@@ -16,12 +16,24 @@ import {
 } from "./harness.js";
 
 /** `[[api_proxy]]` の受け入れテストで固定する設定形状。 */
+export interface ApiProxyOAuthSpec {
+  client_id: string;
+  device_authorization_url: string;
+  token_url: string;
+  revocation_url?: string;
+  scope?: string;
+  login_cred_id: string;
+  success_selector: string;
+  failure_selector?: string;
+}
+
 export interface ApiProxySpec {
   name: string;
-  cred_id: string;
+  cred_id?: string;
   upstream: string;
   header: string;
   value: string;
+  oauth?: ApiProxyOAuthSpec;
 }
 
 export interface ApiProxyFixture {
@@ -31,6 +43,7 @@ export interface ApiProxyFixture {
 }
 
 export interface ApiProxyDaemon extends ApiProxyDaemonLayout {
+  stderr(): string;
   stop(): Promise<void>;
 }
 
@@ -54,6 +67,7 @@ export interface ApiProxyDaemonOptions {
   tcpBind?: string;
   tcpPort?: number;
   operatorUids?: number[];
+  captureStderr?: boolean;
 }
 
 export interface ApiProxyStack {
@@ -153,15 +167,37 @@ export function renderApiProxyConfig(
   for (const entry of opts.entries) renderEntry(lines, entry);
 
   for (const proxy of opts.apiProxies) {
+    lines.push("", "[[api_proxy]]", `name = ${tomlString(proxy.name)}`);
+    if (proxy.cred_id !== undefined)
+      lines.push(`cred_id = ${tomlString(proxy.cred_id)}`);
     lines.push(
-      "",
-      "[[api_proxy]]",
-      `name = ${tomlString(proxy.name)}`,
-      `cred_id = ${tomlString(proxy.cred_id)}`,
       `upstream = ${tomlString(proxy.upstream)}`,
       `header = ${tomlString(proxy.header)}`,
       `value = ${tomlString(proxy.value)}`,
     );
+    if (proxy.oauth !== undefined) {
+      lines.push(
+        "",
+        "[api_proxy.oauth]",
+        `client_id = ${tomlString(proxy.oauth.client_id)}`,
+        `device_authorization_url = ${tomlString(proxy.oauth.device_authorization_url)}`,
+        `token_url = ${tomlString(proxy.oauth.token_url)}`,
+      );
+      if (proxy.oauth.revocation_url !== undefined)
+        lines.push(
+          `revocation_url = ${tomlString(proxy.oauth.revocation_url)}`,
+        );
+      if (proxy.oauth.scope !== undefined)
+        lines.push(`scope = ${tomlString(proxy.oauth.scope)}`);
+      lines.push(`login_cred_id = ${tomlString(proxy.oauth.login_cred_id)}`);
+      lines.push(
+        `success_selector = ${tomlString(proxy.oauth.success_selector)}`,
+      );
+      if (proxy.oauth.failure_selector !== undefined)
+        lines.push(
+          `failure_selector = ${tomlString(proxy.oauth.failure_selector)}`,
+        );
+    }
   }
   return `${lines.join("\n")}\n`;
 }
@@ -239,10 +275,17 @@ export async function startApiProxyDaemon(
 ): Promise<ApiProxyDaemon> {
   const layout = createDaemonLayout();
   writeDaemonConfig(layout, opts);
+  let stderr = "";
   const child = spawn(bins().tegatad, ["--config", layout.configPath], {
-    stdio: ["ignore", "inherit", "inherit"],
+    stdio: ["ignore", "inherit", opts.captureStderr ? "pipe" : "inherit"],
     cwd: layout.daemonDir,
   });
+  if (opts.captureStderr) {
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+  }
   try {
     await waitForDaemonSocket(child, layout.socketPath);
   } catch (error) {
@@ -256,6 +299,7 @@ export async function startApiProxyDaemon(
     stateDir: layout.stateDir,
     auditLogPath: layout.auditLogPath,
     tcpPort: opts.tcpPort,
+    stderr: () => stderr,
     stop: async () => {
       await stopChild(child);
       fs.rmSync(layout.daemonDir, { recursive: true, force: true });

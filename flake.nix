@@ -176,6 +176,17 @@
                       port = 21575;
                     };
                     operatorUids = [ 1000 ];
+                    apiProxies.gh = {
+                      upstream = "https://api.github.com";
+                      oauth = {
+                        clientId = "Iv1.test";
+                        deviceAuthorizationUrl = "https://github.com/login/device/code";
+                        tokenUrl = "https://github.com/login/oauth/access_token";
+                        loginCredId = "vault:gh";
+                        steps = [ { action = "fill"; selector = "#login_field"; value = "{{username}}"; } ];
+                        successSelector = "#device-ok";
+                      };
+                    };
                   };
                 }
               ];
@@ -201,6 +212,11 @@
             assert containsLine configText "bind = \"172.30.0.1\"";
             assert containsLine configText "port = 21575";
             assert containsLine configText "operator_uids = [1000]";
+            assert containsLine configText "[api_proxy.oauth]";
+            assert containsLine configText "client_id = \"Iv1.test\"";
+            assert containsLine configText "login_cred_id = \"vault:gh\"";
+            assert containsLine configText "steps = [{ action = \"fill\", selector = \"#login_field\", value = \"{{username}}\" }]";
+            assert builtins.replaceStrings [ "clientId" ] [ "" ] configText == configText;
             assert builtins.replaceStrings [ "socket_path" ] [ "" ] configText == configText;
             assert !(containsLine defaultConfigText "kind = \"tcp\"");
             pkgs.runCommand "tegata-module-eval" {} "touch $out";

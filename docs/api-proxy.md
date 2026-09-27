@@ -43,6 +43,44 @@ services.tegata.apiProxies.tailscale = {
 See [setup-linux.md](setup-linux.md#configuration-reference) for where
 `[[api_proxy]]` sits among the daemon's other configuration keys.
 
+## OAuth device flow
+
+An OAuth proxy lets tegata obtain an access token with a public OAuth device-code
+grant. The token stays inside the executor process: it is not exposed to the
+daemon, agent, audit log, or logs. The daemon refuses a proxy that sets both
+`cred_id` and `oauth`, or neither.
+
+```toml
+[[api_proxy]]
+name = "github"
+upstream = "https://api.github.com"
+value = "Bearer {{secret}}"
+[api_proxy.oauth]
+client_id = "Iv1.xxxx"
+device_authorization_url = "https://github.com/login/device/code"
+token_url = "https://github.com/login/oauth/access_token"
+scope = "repo"
+login_cred_id = "vw:github-login"
+steps = [ ... ]
+success_selector = "[data-testid=authorized]"
+```
+
+`login_cred_id` and `steps` use the same browser-login configuration as
+`authorize_device`; `success_selector` identifies successful approval and
+`failure_selector` can identify a rejected approval. tegata logs into the
+provider in a browser using the vault credential and approves the device grant.
+The grant lives exactly as long as the lease. On `logout`, `lock_vault`, or TTL
+expiry, tegata best-effort revokes it when `revocation_url` is configured, then
+closes the lease. Grants are not persisted and every lease obtains a new grant.
+
+When the remaining lifetime reaches `min(60 s, expires_in / 2)`, the executor
+uses a refresh-token grant. If there is no refresh token or refresh fails, later
+requests return `503`; the agent must open the proxy again. Client secrets and
+authorization-code grants are not supported. Grant failures return
+`OAUTH_GRANT_FAILED`; browser-stage failures use the same codes as
+`authorize_device`. Audit records use `api_proxy_oauth` with `oauth_action` set
+to `issued`, `refreshed`, `refresh_failed`, or `revoked`.
+
 ## Calling it
 
 ```json

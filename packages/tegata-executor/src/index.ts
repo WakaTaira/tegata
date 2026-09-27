@@ -12,6 +12,21 @@ import {
   type ApiProxyRequestRecord,
   startApiProxy,
 } from "./api-proxy.js";
+import {
+  abortableSleep,
+  type DeviceAuthorization,
+  OAUTH_REQUEST_TIMEOUT_MS,
+  OAuthGrantError,
+  OAuthProxySession,
+  type OAuthTokenAction,
+  pollForToken,
+  postForm,
+  renderValueTemplate,
+  requestDeviceAuthorization,
+  revokeTokens,
+  type TokenSet,
+  tokenPollDeadline,
+} from "./oauth.js";
 
 type FillStep = {
   action: "fill";
@@ -65,13 +80,39 @@ type LeaseRequest = { op: "lease"; id?: RequestId };
 
 type ReleaseRequest = { op: "release"; id?: RequestId; target_id: string };
 
-type ApiProxyStartRequest = {
+type StaticApiProxyStartRequest = {
   op: "api_proxy_start";
   id?: RequestId;
   upstream: string;
   header: string;
   header_value: string;
 };
+
+type OAuthRequestConfig = {
+  client_id: string;
+  device_authorization_url: string;
+  token_url: string;
+  revocation_url: string | null;
+  scope: string | null;
+  login_url: string;
+  steps: DeviceStep[] | null;
+  success_selector: string;
+  failure_selector: string | null;
+  secret: LoginRequest["secret"];
+};
+
+type OAuthApiProxyStartRequest = {
+  op: "api_proxy_start";
+  id?: RequestId;
+  upstream: string;
+  header: string;
+  value_template: string;
+  oauth: OAuthRequestConfig;
+};
+
+type ApiProxyStartRequest =
+  | StaticApiProxyStartRequest
+  | OAuthApiProxyStartRequest;
 
 type ApiProxyStopRequest = { op: "api_proxy_stop"; id?: RequestId };
 
@@ -94,6 +135,7 @@ type ErrorCode =
   | "TOTP_NOT_EXPOSABLE"
   | "DEVICE_CODE_REJECTED"
   | "LOGIN_RESULT_TIMEOUT"
+  | "OAUTH_GRANT_FAILED"
   | "INTERNAL";
 
 export class SelectorNotFoundError extends Error {
@@ -110,7 +152,12 @@ export class DeviceCodeRejectedError extends Error {}
 
 export class LoginResultTimeoutError extends Error {}
 
-type ExecutionStage = "login" | "device";
+type ExecutionStage = "login" | "device" | "oauth";
+
+type DiagnosticRequest =
+  | LoginRequest
+  | AuthorizeDeviceRequest
+  | ApiProxyStartRequest;
 
 function truncateUtf8(value: string, maxBytes: number): string {
   let bytes = 0;
@@ -147,21 +194,40 @@ function removeUrlQueryAndFragment(value: string): string {
   });
 }
 
+function requestSecrets(
+  request: DiagnosticRequest,
+): Array<string | null | undefined> {
+  if (request.op === "api_proxy_start") {
+    return "oauth" in request
+      ? [
+          request.oauth.secret.username,
+          request.oauth.secret.password,
+          request.oauth.secret.totp,
+        ]
+      : [request.header_value];
+  }
+  const loginSecrets = [
+    request.secret.username,
+    request.secret.password,
+    request.secret.totp,
+  ];
+  return request.op === "login"
+    ? loginSecrets
+    : [...loginSecrets, request.user_code];
+}
+
+/**
+ * 診断行を組み立てる。`runtimeSecrets` には要求に含まれず実行中に得た秘密
+ * （device code・user code・token 等）を渡し、要求由来の秘密と同じく置換する。
+ */
 export function formatExecutorErrorLine(
-  request: LoginRequest | AuthorizeDeviceRequest,
+  request: DiagnosticRequest,
   stage: ExecutionStage,
   code: ErrorCode,
   error: unknown,
+  runtimeSecrets: Array<string | null | undefined> = [],
 ): string {
-  const secrets =
-    request.op === "login"
-      ? [request.secret.username, request.secret.password, request.secret.totp]
-      : [
-          request.secret.username,
-          request.secret.password,
-          request.secret.totp,
-          request.user_code,
-        ];
+  const secrets = [...requestSecrets(request), ...runtimeSecrets];
   const rawMessage = error instanceof Error ? error.message : "";
   const message = truncateUtf8(
     removeUrlQueryAndFragment(
@@ -189,6 +255,9 @@ export function classifyError(
   error: unknown,
   stage: ExecutionStage,
 ): ErrorCode {
+  if (stage === "oauth") {
+    return error instanceof OAuthGrantError ? "OAUTH_GRANT_FAILED" : "INTERNAL";
+  }
   if (stage === "device") {
     return error instanceof DeviceCodeRejectedError
       ? "DEVICE_CODE_REJECTED"
@@ -231,16 +300,21 @@ function formatErrorResponse(error: ClassifiedExecutionError) {
 }
 
 function writeExecutorErrorLine(
-  request: LoginRequest | AuthorizeDeviceRequest,
+  request: DiagnosticRequest,
   stage: ExecutionStage,
   error: ClassifiedExecutionError,
   cause: unknown,
+  runtimeSecrets: Array<string | null | undefined> = [],
 ): void {
-  if (error.code !== "INTERNAL" && error.code !== "LOGIN_RESULT_TIMEOUT") {
+  if (
+    error.code !== "INTERNAL" &&
+    error.code !== "LOGIN_RESULT_TIMEOUT" &&
+    error.code !== "OAUTH_GRANT_FAILED"
+  ) {
     return;
   }
   process.stderr.write(
-    formatExecutorErrorLine(request, stage, error.code, cause),
+    formatExecutorErrorLine(request, stage, error.code, cause, runtimeSecrets),
   );
 }
 
@@ -248,7 +322,10 @@ let activeBrowser: Browser | undefined;
 let activeGuard: CdpGuard | undefined;
 let activeTempDir: string | undefined;
 let activeBrowserContextId: string | undefined;
-let activeApiProxy: ApiProxy | undefined;
+let activeApiProxy: { close: () => Promise<void> } | undefined;
+let activeOAuthStart:
+  | { controller: AbortController; done: Promise<void> }
+  | undefined;
 let shuttingDown = false;
 
 type CdpMessage = {
@@ -527,6 +604,115 @@ class InvalidRequestError extends Error {
   }
 }
 
+function isAbsent(value: unknown): value is null | undefined {
+  return value === undefined || value === null;
+}
+
+function isOptionalNullableString(
+  value: unknown,
+): value is string | null | undefined {
+  return value === undefined || isNullableString(value);
+}
+
+function isRequestSecret(value: unknown): value is {
+  username: string;
+  password: string;
+  totp?: string | null;
+} {
+  return (
+    isRecord(value) &&
+    typeof value.username === "string" &&
+    typeof value.password === "string" &&
+    isOptionalNullableString(value.totp)
+  );
+}
+
+function parseDeviceSteps(value: unknown, id?: RequestId): DeviceStep[] | null {
+  if (isAbsent(value)) return null;
+  if (!Array.isArray(value)) throw new InvalidRequestError(id);
+  return value.map((step): DeviceStep => {
+    if (!isRecord(step) || typeof step.selector !== "string") {
+      throw new InvalidRequestError(id);
+    }
+    if (step.action === "click") {
+      return { action: "click", selector: step.selector };
+    }
+    if (step.action === "fill" && isDevicePlaceholder(step.value)) {
+      return { action: "fill", selector: step.selector, value: step.value };
+    }
+    throw new InvalidRequestError(id);
+  });
+}
+
+function parseOAuthConfig(value: unknown, id?: RequestId): OAuthRequestConfig {
+  if (
+    !isRecord(value) ||
+    typeof value.client_id !== "string" ||
+    typeof value.device_authorization_url !== "string" ||
+    typeof value.token_url !== "string" ||
+    !isOptionalNullableString(value.revocation_url) ||
+    !isOptionalNullableString(value.scope) ||
+    typeof value.login_url !== "string" ||
+    typeof value.success_selector !== "string" ||
+    !isOptionalNullableString(value.failure_selector) ||
+    !isRequestSecret(value.secret)
+  ) {
+    throw new InvalidRequestError(id);
+  }
+  return {
+    client_id: value.client_id,
+    device_authorization_url: value.device_authorization_url,
+    token_url: value.token_url,
+    revocation_url: value.revocation_url ?? null,
+    scope: value.scope ?? null,
+    login_url: value.login_url,
+    steps: parseDeviceSteps(value.steps, id),
+    success_selector: value.success_selector,
+    failure_selector: value.failure_selector ?? null,
+    secret: {
+      username: value.secret.username,
+      password: value.secret.password,
+      totp: value.secret.totp ?? null,
+    },
+  };
+}
+
+/** 静的トークン（`header_value`）と OAuth（`value_template` + `oauth`）のどちらか一方のみを受け付ける。 */
+function parseApiProxyStart(
+  value: Record<string, unknown>,
+  id?: RequestId,
+): ApiProxyStartRequest {
+  if (typeof value.upstream !== "string" || typeof value.header !== "string") {
+    throw new InvalidRequestError(id);
+  }
+  const base = {
+    op: "api_proxy_start" as const,
+    id,
+    upstream: value.upstream,
+    header: value.header,
+  };
+  if (isAbsent(value.oauth)) {
+    if (
+      typeof value.header_value !== "string" ||
+      !isAbsent(value.value_template)
+    ) {
+      throw new InvalidRequestError(id);
+    }
+    return { ...base, header_value: value.header_value };
+  }
+  if (
+    !isAbsent(value.header_value) ||
+    typeof value.value_template !== "string"
+  ) {
+    throw new InvalidRequestError(id);
+  }
+  return {
+    ...base,
+    value_template: value.value_template,
+    oauth: parseOAuthConfig(value.oauth, id),
+  };
+}
+
 export function parseRequest(line: string): Request {
   let value: unknown;
   try {
@@ -543,22 +729,7 @@ export function parseRequest(line: string): Request {
   if (value.op === "shutdown") return { op: "shutdown", id };
   if (value.op === "lease") return { op: "lease", id };
   if (value.op === "api_proxy_stop") return { op: "api_proxy_stop", id };
-  if (value.op === "api_proxy_start") {
-    if (
-      typeof value.upstream !== "string" ||
-      typeof value.header !== "string" ||
-      typeof value.header_value !== "string"
-    ) {
-      throw new InvalidRequestError(id);
-    }
-    return {
-      op: "api_proxy_start",
-      id,
-      upstream: value.upstream,
-      header: value.header,
-      header_value: value.header_value,
-    };
-  }
+  if (value.op === "api_proxy_start") return parseApiProxyStart(value, id);
   if (value.op === "release") {
     if (typeof value.target_id !== "string") {
       throw new InvalidRequestError(id);
@@ -582,34 +753,13 @@ export function parseRequest(line: string): Request {
       throw new InvalidRequestError(id);
     }
 
-    let steps: DeviceStep[] | null = null;
-    if (value.steps !== undefined && value.steps !== null) {
-      if (!Array.isArray(value.steps)) throw new InvalidRequestError(id);
-      steps = value.steps.map((step): DeviceStep => {
-        if (!isRecord(step) || typeof step.selector !== "string") {
-          throw new InvalidRequestError(id);
-        }
-        if (step.action === "click") {
-          return { action: "click", selector: step.selector };
-        }
-        if (step.action === "fill" && isDevicePlaceholder(step.value)) {
-          return {
-            action: "fill",
-            selector: step.selector,
-            value: step.value,
-          };
-        }
-        throw new InvalidRequestError(id);
-      });
-    }
-
     return {
       op: "authorize_device",
       id,
       login_url: value.login_url,
       verification_url: value.verification_url,
       user_code: value.user_code,
-      steps,
+      steps: parseDeviceSteps(value.steps, id),
       success_selector: value.success_selector,
       failure_selector: value.failure_selector ?? null,
       secret: {
@@ -1521,8 +1671,16 @@ async function executeLogin(
   return { endpoint, targetId };
 }
 
+type ExecutionErrorWriter = (
+  stage: ExecutionStage,
+  classified: ClassifiedExecutionError,
+  cause: unknown,
+) => void;
+
 async function executeAuthorizeDevice(
   request: AuthorizeDeviceRequest,
+  writeError: ExecutionErrorWriter = (stage, classified, cause) =>
+    writeExecutorErrorLine(request, stage, classified, cause),
 ): Promise<ClassifiedExecutionError | undefined> {
   let stage: ExecutionStage = "login";
   try {
@@ -1544,7 +1702,7 @@ async function executeAuthorizeDevice(
     return undefined;
   } catch (error) {
     const classified = classifyExecutionError(error, stage);
-    writeExecutorErrorLine(request, stage, classified, error);
+    writeError(stage, classified, error);
     return classified;
   }
 }
@@ -1572,10 +1730,19 @@ function writeApiProxyEvent(record: ApiProxyRequestRecord): void {
   process.stdout.write(`${JSON.stringify(formatApiProxyEvent(record))}\n`);
 }
 
+export function formatOAuthTokenEvent(action: OAuthTokenAction): unknown {
+  return { event: "oauth_token", action };
+}
+
+function writeOAuthTokenEvent(action: OAuthTokenAction): void {
+  process.stdout.write(`${JSON.stringify(formatOAuthTokenEvent(action))}\n`);
+}
+
 function monitorGuardFailure(guard: CdpGuard): void {
   void guard.failure.then(undefined, async () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    await closeApiProxy();
     await cleanupResources();
     process.exit(1);
   });
@@ -1754,6 +1921,10 @@ async function handleApiProxyStart(
     );
     return;
   }
+  if ("oauth" in request) {
+    await handleOAuthApiProxyStart(request);
+    return;
+  }
 
   try {
     const proxy = await startApiProxy({
@@ -1775,6 +1946,207 @@ async function handleApiProxyStart(
   }
 }
 
+// 応答はデーモンの初回要求の上限（90 秒）の内側で返す必要がある。grant の各段はこの期限で打ち切り、
+// 残りを後始末（ブラウザの終了・token の失効）と応答に充てる。
+const OAUTH_GRANT_BUDGET_MS = 70_000;
+
+function toAuthorizeDeviceRequest(
+  request: OAuthApiProxyStartRequest,
+  device: DeviceAuthorization,
+): AuthorizeDeviceRequest {
+  const { oauth } = request;
+  return {
+    op: "authorize_device",
+    login_url: oauth.login_url,
+    verification_url: device.verificationUrl,
+    user_code: device.userCode,
+    steps: oauth.steps,
+    success_selector: oauth.success_selector,
+    failure_selector: oauth.failure_selector,
+    secret: oauth.secret,
+  };
+}
+
+/**
+ * device 承認をブラウザで行い、成否にかかわらずブラウザを閉じる。
+ * 期限超過または中断の場合は OAuthGrantError とし、以後に届く遅れた診断行は出力しない。
+ */
+async function authorizeDeviceInBrowser(
+  request: OAuthApiProxyStartRequest,
+  device: DeviceAuthorization,
+  deadline: number,
+  signal: AbortSignal,
+  runtimeSecrets: string[],
+): Promise<ClassifiedExecutionError | undefined> {
+  let settled = false;
+  const authorization = executeAuthorizeDevice(
+    toAuthorizeDeviceRequest(request, device),
+    (stage, classified, cause) => {
+      if (!settled) {
+        writeExecutorErrorLine(
+          request,
+          stage,
+          classified,
+          cause,
+          runtimeSecrets,
+        );
+      }
+    },
+  );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let onAbort: (() => void) | undefined;
+  const expired = new Promise<"expired">((resolve) => {
+    onAbort = () => resolve("expired");
+    timer = setTimeout(onAbort, Math.max(0, deadline - Date.now()));
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+  try {
+    const result = await Promise.race([authorization, expired]);
+    if (result === "expired") {
+      throw new OAuthGrantError(
+        "device authorization in the browser did not finish in time",
+      );
+    }
+    return result;
+  } finally {
+    settled = true;
+    if (timer !== undefined) clearTimeout(timer);
+    if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+    await cleanupResources();
+  }
+}
+
+/** device-code grant で access token を得る。ブラウザ段の失敗は分類済みの結果として返す。 */
+async function acquireOAuthTokens(
+  request: OAuthApiProxyStartRequest,
+  deadline: number,
+  signal: AbortSignal,
+  runtimeSecrets: string[],
+): Promise<{ tokens: TokenSet; issuedAt: number } | ClassifiedExecutionError> {
+  const { oauth } = request;
+  const device = await requestDeviceAuthorization(
+    oauth,
+    postForm,
+    Math.min(OAUTH_REQUEST_TIMEOUT_MS, deadline - Date.now()),
+    signal,
+  );
+  const receivedAt = Date.now();
+  runtimeSecrets.push(device.deviceCode, device.userCode);
+  const browserError = await authorizeDeviceInBrowser(
+    request,
+    device,
+    deadline,
+    signal,
+    runtimeSecrets,
+  );
+  if (browserError !== undefined) return browserError;
+  const tokens = await pollForToken(
+    oauth,
+    device,
+    {
+      receivedAt,
+      deadline: tokenPollDeadline({
+        receivedAt,
+        expiresIn: device.expiresIn,
+        pollStartedAt: Date.now(),
+        budgetDeadline: deadline,
+      }),
+    },
+    { post: postForm, now: Date.now, sleep: abortableSleep, signal },
+  );
+  runtimeSecrets.push(tokens.accessToken);
+  if (tokens.refreshToken !== null) runtimeSecrets.push(tokens.refreshToken);
+  return { tokens, issuedAt: Date.now() };
+}
+
+/** 取得した token でプロキシを起動する。起動できない場合は token を失効させてから例外を返す。 */
+async function startOAuthProxySession(
+  request: OAuthApiProxyStartRequest,
+  tokens: TokenSet,
+  issuedAt: number,
+) {
+  let proxy: ApiProxy;
+  try {
+    proxy = await startApiProxy({
+      upstream: request.upstream,
+      header: request.header,
+      headerValue: renderValueTemplate(
+        request.value_template,
+        tokens.accessToken,
+      ),
+      onRequest: writeApiProxyEvent,
+    });
+  } catch (error) {
+    // 応答より前にイベント行を出すとデーモンが応答として読むため、ここでは失効のみ行う。
+    await revokeTokens(request.oauth, tokens, postForm);
+    throw error;
+  }
+  const session = new OAuthProxySession({
+    endpoints: request.oauth,
+    proxy,
+    valueTemplate: request.value_template,
+    tokens,
+    issuedAt,
+    onEvent: writeOAuthTokenEvent,
+  });
+  return { port: proxy.port, secret: proxy.secret, session };
+}
+
+async function runOAuthApiProxyStart(
+  request: OAuthApiProxyStartRequest,
+  signal: AbortSignal,
+): Promise<void> {
+  if (activeBrowser !== undefined) {
+    const error = new Error("browser is already active");
+    const classified = classifyExecutionError(error, "oauth");
+    writeExecutorErrorLine(request, "oauth", classified, error);
+    writeResponse(formatErrorResponse(classified), request.id);
+    return;
+  }
+  const deadline = Date.now() + OAUTH_GRANT_BUDGET_MS;
+  const runtimeSecrets: string[] = [];
+  try {
+    const acquired = await acquireOAuthTokens(
+      request,
+      deadline,
+      signal,
+      runtimeSecrets,
+    );
+    if (!("tokens" in acquired)) {
+      writeResponse(formatErrorResponse(acquired), request.id);
+      return;
+    }
+    const { port, secret, session } = await startOAuthProxySession(
+      request,
+      acquired.tokens,
+      acquired.issuedAt,
+    );
+    activeApiProxy = session;
+    writeResponse({ ok: true, port, secret }, request.id);
+    // デーモンは初回要求の応答を最初の 1 行として読むため、イベント行は応答の後に出力する。
+    writeOAuthTokenEvent("issued");
+  } catch (error) {
+    const classified = classifyExecutionError(error, "oauth");
+    writeExecutorErrorLine(request, "oauth", classified, error, runtimeSecrets);
+    writeResponse(formatErrorResponse(classified), request.id);
+  }
+}
+
+/** 実行中の grant を記録し、shutdown が中断と完了待ちを行えるようにする。 */
+async function handleOAuthApiProxyStart(
+  request: OAuthApiProxyStartRequest,
+): Promise<void> {
+  const controller = new AbortController();
+  const done = runOAuthApiProxyStart(request, controller.signal);
+  activeOAuthStart = { controller, done };
+  try {
+    await done;
+  } finally {
+    activeOAuthStart = undefined;
+  }
+}
+
 async function handleApiProxyStop(request: ApiProxyStopRequest): Promise<void> {
   await closeApiProxy();
   writeResponse({ ok: true }, request.id);
@@ -1783,6 +2155,11 @@ async function handleApiProxyStop(request: ApiProxyStopRequest): Promise<void> {
 async function shutdown(request?: { id?: RequestId }): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
+  const oauthStart = activeOAuthStart;
+  if (oauthStart !== undefined) {
+    oauthStart.controller.abort();
+    await oauthStart.done;
+  }
   await closeApiProxy();
   await cleanupResources();
   if (request !== undefined) writeResponse({ ok: true }, request.id);

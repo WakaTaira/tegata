@@ -23,7 +23,6 @@ Everything below stays on the isolated side of the boundary, by construction:
 | The vault master password and session key | Entered into, or unsealed by, the isolated daemon only |
 | Usernames and passwords | Resolved in the daemon, written to the executor over a pipe |
 | TOTP seeds | Codes are computed on the isolated side; the seed is never serialized outward |
-| Traces, videos, HAR files, screenshots | The executor never enables them |
 
 What the agent *does* receive is a credential catalog with names but no values, a
 raw CDP (Chrome DevTools Protocol) endpoint for an authenticated browser. The agent
@@ -31,6 +30,9 @@ can extract cookies, storage, and page-held session tokens through CDP; these ar
 not protected by the RPC response leak scan. It also receives — for
 entries explicitly marked `totp_exposable` — the current six-digit TOTP code,
 rate-limited to one per 30 seconds and written to the audit log.
+
+The executor itself does not create traces, videos, HAR files, or screenshots. This
+guarantee does not cover artifacts the agent obtains through CDP.
 
 ## How it works
 

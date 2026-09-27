@@ -1325,19 +1325,7 @@ async fn expire_browser_at_deadline(state: &SharedState, browser_id: &str) {
         }
     };
     if let Some(browser) = browser {
-        terminate_expired_browser(state, browser).await;
-    }
-}
-
-async fn terminate_expired_browser(state: &SharedState, browser: sessions::Browser) {
-    let namespace = browser.key.namespace.clone();
-    let leases = browser.leases.into_iter().collect::<Vec<_>>();
-    for (_, lease) in &leases {
-        let _ = release_lease(&browser.executor, &lease.target).await;
-    }
-    shutdown_executor(browser.executor).await;
-    for (session_id, _) in leases {
-        audit_system_session(state, "session_expired", session_id, namespace.clone()).await;
+        terminate_browser(state, browser, "session_expired", false).await;
     }
 }
 
@@ -1410,7 +1398,10 @@ fn spawn_session_reaper(state: SharedState) {
                 (deadline_expired, expired)
             };
             for browser in deadline_expired {
-                terminate_expired_browser(&state, browser).await;
+                let state = state.clone();
+                tokio::spawn(async move {
+                    terminate_browser(&state, browser, "session_expired", false).await;
+                });
             }
             for (session_id, lease, executor, namespace, shutdown) in expired {
                 let release_failed = release_lease(&executor, &lease.target).await.is_err();
@@ -2010,19 +2001,20 @@ async fn join_browser(
     key: &sessions::BrowserKey,
     principal: &str,
 ) -> Option<Result<Value, ErrorCode>> {
-    let (browser_id, executor, endpoint, ttl, deadline) = {
+    let (browser_id, executor, endpoint, ttl, deadline_expired) = {
         let daemon = state.lock().await;
         let browser_id = daemon.shared_browsers.get(key)?.clone();
         let browser = daemon.browsers.get(&browser_id)?;
+        let now = Instant::now();
         (
             browser_id,
             browser.executor.clone(),
             browser.endpoint.clone(),
             daemon.session_ttl,
-            browser.deadline,
+            browser.deadline <= now,
         )
     };
-    if deadline <= Instant::now() {
+    if deadline_expired {
         expire_browser_at_deadline(state, &browser_id).await;
         return None;
     }
@@ -2044,9 +2036,9 @@ async fn join_browser(
         }
     };
     let session_id = Uuid::new_v4().to_string();
-    let now = Instant::now();
     let (joined, expired_browser) = {
         let mut daemon = state.lock().await;
+        let now = Instant::now();
         let browser_expired = daemon
             .browsers
             .get(&browser_id)
@@ -2080,7 +2072,7 @@ async fn join_browser(
     };
     if let Some(browser) = expired_browser {
         let _ = executor_release(&executor, target_id).await;
-        terminate_expired_browser(state, browser).await;
+        terminate_browser(state, browser, "session_expired", false).await;
         return None;
     }
     if !joined {
@@ -2140,6 +2132,7 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
         )
     };
     start_guard.record_attempt(Instant::now());
+    let browser_started_at = Instant::now();
     let (endpoint, target_id, mut executor) = match start_executor(
         &executor_entry,
         executor_socket.as_deref(),
@@ -2159,7 +2152,7 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
             return classified(request.id.clone(), error);
         }
     };
-    let deadline = Instant::now() + browser_max_lifetime;
+    let deadline = browser_started_at + browser_max_lifetime;
     let session_id = Uuid::new_v4().to_string();
     let reader = executor
         .take_reader()
@@ -2425,6 +2418,7 @@ async fn start_api_proxy_session(
     );
     drop(credential);
     start_guard.record_attempt(Instant::now());
+    let browser_started_at = Instant::now();
     let (port, secret, mut executor) = match start_api_proxy_executor(
         &executor_entry,
         executor_socket.as_deref(),
@@ -2444,7 +2438,7 @@ async fn start_api_proxy_session(
             return Err(error);
         }
     };
-    let deadline = Instant::now() + browser_max_lifetime;
+    let deadline = browser_started_at + browser_max_lifetime;
     drop(start_guard);
     let Some(reader) = executor.take_reader() else {
         stop_child(executor).await;
@@ -2909,25 +2903,36 @@ async fn terminate_browsers(state: &SharedState, browsers: Vec<sessions::Browser
     let mut tasks = JoinSet::new();
     for browser in browsers {
         let state = state.clone();
-        tasks.spawn(async move { terminate_browser(&state, browser).await });
+        tasks.spawn(async move {
+            terminate_browser(&state, browser, "session_terminated", true).await;
+        });
     }
     while tasks.join_next().await.is_some() {}
 }
 
-async fn terminate_browser(state: &SharedState, browser: sessions::Browser) {
+async fn terminate_browser(
+    state: &SharedState,
+    browser: sessions::Browser,
+    audit_method: &'static str,
+    release_leases: bool,
+) {
     let namespace = browser.key.namespace.clone();
     let leases = browser.leases.into_iter().collect::<Vec<_>>();
-    for (_, lease) in &leases {
-        if release_lease(&browser.executor, &lease.target)
-            .await
-            .is_err()
-        {
-            break;
+    // executor が応答しない場合に全リース分の待機を積み上げないよう、最初の失敗で個別解放を打ち切る。
+    // executor の停止でブラウザ全体が閉じるため、残りのタブは停止処理で回収される。
+    if release_leases {
+        for (_, lease) in &leases {
+            if release_lease(&browser.executor, &lease.target)
+                .await
+                .is_err()
+            {
+                break;
+            }
         }
     }
     shutdown_executor(browser.executor).await;
     for (session_id, _) in leases {
-        audit_system_session(state, "session_terminated", session_id, namespace.clone()).await;
+        audit_system_session(state, audit_method, session_id, namespace.clone()).await;
     }
 }
 

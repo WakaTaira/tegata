@@ -4,13 +4,16 @@ import {
   classifyError,
   DeviceCodeRejectedError,
   formatResponse,
+  guardTargetCommands,
   headfulUserAgent,
+  headfulUserAgentMetadata,
   InvalidCredentialError,
   MfaRequiredError,
   parseRequest,
   runSteps,
   SelectorNotFoundError,
   substituteSecrets,
+  withoutHeadlessBrands,
 } from "../src/index.js";
 
 describe("headfulUserAgent", () => {
@@ -23,6 +26,61 @@ describe("headfulUserAgent", () => {
   test("keeps a user agent without HeadlessChrome unchanged", () => {
     const userAgent = "Mozilla/5.0 Chrome/150.0.0.0 Safari/537.36";
     expect(headfulUserAgent(userAgent)).toBe(userAgent);
+  });
+});
+
+describe("headful user agent metadata", () => {
+  test("removes Headless brands from low and high entropy lists", () => {
+    const metadata = {
+      brands: [
+        { brand: "HeadlessChrome", version: "150" },
+        { brand: "Chromium", version: "150" },
+      ],
+      fullVersionList: [
+        { brand: "HeadlessChrome", version: "150.0.0.0" },
+        { brand: "Chromium", version: "150.0.0.0" },
+      ],
+      platform: "Linux",
+      platformVersion: "6.0.0",
+      architecture: "x86",
+      bitness: "64",
+      model: "",
+      mobile: false,
+    };
+
+    expect(withoutHeadlessBrands(metadata.brands)).toEqual([
+      { brand: "Chromium", version: "150" },
+    ]);
+    expect(headfulUserAgentMetadata(metadata)).toEqual({
+      ...metadata,
+      brands: [{ brand: "Chromium", version: "150" }],
+      fullVersionList: [{ brand: "Chromium", version: "150.0.0.0" }],
+    });
+  });
+});
+
+describe("guardTargetCommands", () => {
+  test("enables Fetch only for page and iframe targets", () => {
+    expect(guardTargetCommands("page")).toEqual([
+      "Fetch.enable",
+      "Target.setAutoAttach",
+      "Emulation.setUserAgentOverride",
+      "Runtime.runIfWaitingForDebugger",
+    ]);
+    expect(guardTargetCommands("iframe")).toEqual([
+      "Fetch.enable",
+      "Emulation.setUserAgentOverride",
+      "Runtime.runIfWaitingForDebugger",
+    ]);
+    expect(guardTargetCommands("worker")).toEqual([
+      "Runtime.runIfWaitingForDebugger",
+    ]);
+    expect(guardTargetCommands("shared_worker")).toEqual([
+      "Runtime.runIfWaitingForDebugger",
+    ]);
+    expect(guardTargetCommands("service_worker")).toEqual([
+      "Runtime.runIfWaitingForDebugger",
+    ]);
   });
 });
 

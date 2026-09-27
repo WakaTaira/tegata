@@ -173,6 +173,7 @@ type CdpGuard = {
   failure: Promise<never>;
   browserPid: number | undefined;
   assertOpen: () => void;
+  registerUserAgentOverride: (override: UserAgentOverride) => Promise<void>;
   waitForTargetReady: (targetId: string) => Promise<void>;
   send: (
     method: string,
@@ -198,12 +199,220 @@ const autoAttachParams = {
   flatten: true,
 };
 
+export type UserAgentBrand = {
+  brand: string;
+  version: string;
+};
+
+export type UserAgentMetadata = {
+  brands: UserAgentBrand[];
+  fullVersionList: UserAgentBrand[];
+  platform: string;
+  platformVersion: string;
+  architecture: string;
+  bitness: string;
+  model: string;
+  mobile: boolean;
+};
+
+export type UserAgentOverride = {
+  userAgent: string;
+  userAgentMetadata: UserAgentMetadata;
+};
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
 export function headfulUserAgent(ua: string): string {
   return ua.replaceAll("HeadlessChrome", "Chrome");
+}
+
+export function withoutHeadlessBrands(
+  brands: UserAgentBrand[],
+): UserAgentBrand[] {
+  return brands.filter(({ brand }) => !brand.includes("Headless"));
+}
+
+export function headfulUserAgentMetadata(
+  metadata: UserAgentMetadata,
+): UserAgentMetadata {
+  return {
+    ...metadata,
+    brands: withoutHeadlessBrands(metadata.brands),
+    fullVersionList: withoutHeadlessBrands(metadata.fullVersionList),
+  };
+}
+
+// 新規タブの初回ナビゲーションでは client hints がガードの接続前に確定しており、
+// Emulation.setUserAgentOverride が反映されません。そのため文書リクエストを捕捉し、
+// Headless ブランドを除いた client hints に書き換えてから継続します。
+const guardFetchPatterns = [
+  { urlPattern: "file://*", requestStage: "Request" },
+  { urlPattern: "*", resourceType: "Document", requestStage: "Request" },
+];
+
+const brandClientHintHeaders = new Set([
+  "sec-ch-ua",
+  "sec-ch-ua-full-version-list",
+]);
+
+function mustBlockPausedRequest(url: string): boolean {
+  try {
+    return new URL(url).protocol === "file:";
+  } catch {
+    return true;
+  }
+}
+
+function withoutHeadlessClientHintBrands(value: string): string {
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter((item) => !/^"[^"]*Headless[^"]*"/.test(item))
+    .join(", ");
+}
+
+function headfulClientHintHeaders(
+  headers: unknown,
+): Array<{ name: string; value: string }> | undefined {
+  if (!isRecord(headers)) return undefined;
+  let rewritten = false;
+  const entries = Object.entries(headers).flatMap(([name, value]) => {
+    if (typeof value !== "string") return [];
+    if (!brandClientHintHeaders.has(name.toLowerCase())) {
+      return [{ name, value }];
+    }
+    const headful = withoutHeadlessClientHintBrands(value);
+    if (headful !== value) rewritten = true;
+    return [{ name, value: headful }];
+  });
+  return rewritten ? entries : undefined;
+}
+
+function isPageOrIframeTarget(targetType: string): boolean {
+  return targetType === "page" || targetType === "iframe";
+}
+
+export function guardTargetCommands(
+  targetType: string,
+  userAgentOverrideRegistered = true,
+): string[] {
+  const commands: string[] = [];
+  const fileGuardTarget = isPageOrIframeTarget(targetType);
+  if (fileGuardTarget) {
+    commands.push("Fetch.enable");
+    if (targetType === "page") commands.push("Target.setAutoAttach");
+    if (userAgentOverrideRegistered) {
+      commands.push("Emulation.setUserAgentOverride");
+    }
+  }
+  commands.push("Runtime.runIfWaitingForDebugger");
+  return commands;
+}
+
+function isUserAgentBrand(value: unknown): value is UserAgentBrand {
+  return (
+    isRecord(value) &&
+    typeof value.brand === "string" &&
+    typeof value.version === "string"
+  );
+}
+
+function isUserAgentMetadata(value: unknown): value is UserAgentMetadata {
+  return (
+    isRecord(value) &&
+    Array.isArray(value.brands) &&
+    value.brands.every(isUserAgentBrand) &&
+    Array.isArray(value.fullVersionList) &&
+    value.fullVersionList.every(isUserAgentBrand) &&
+    typeof value.platform === "string" &&
+    typeof value.platformVersion === "string" &&
+    typeof value.architecture === "string" &&
+    typeof value.bitness === "string" &&
+    typeof value.model === "string" &&
+    typeof value.mobile === "boolean"
+  );
+}
+
+async function readNavigatorUserAgentData(
+  page: Page,
+): Promise<{ userAgent: string; metadata: UserAgentMetadata } | undefined> {
+  try {
+    const value = await page.evaluate(async () => {
+      const userAgentData = (
+        navigator as Navigator & {
+          userAgentData?: {
+            brands: UserAgentBrand[];
+            mobile: boolean;
+            getHighEntropyValues: (hints: string[]) => Promise<{
+              fullVersionList: UserAgentBrand[];
+              platform: string;
+              platformVersion: string;
+              architecture: string;
+              bitness: string;
+              model: string;
+            }>;
+          };
+        }
+      ).userAgentData;
+      if (userAgentData === undefined) return undefined;
+      const highEntropyValues = await userAgentData.getHighEntropyValues([
+        "fullVersionList",
+        "platformVersion",
+        "architecture",
+        "bitness",
+        "model",
+      ]);
+      return {
+        userAgent: navigator.userAgent,
+        metadata: {
+          brands: userAgentData.brands,
+          fullVersionList: highEntropyValues.fullVersionList,
+          platform: highEntropyValues.platform,
+          platformVersion: highEntropyValues.platformVersion,
+          architecture: highEntropyValues.architecture,
+          bitness: highEntropyValues.bitness,
+          model: highEntropyValues.model,
+          mobile: userAgentData.mobile,
+        },
+      };
+    });
+    if (
+      !isRecord(value) ||
+      typeof value.userAgent !== "string" ||
+      !isUserAgentMetadata(value.metadata)
+    ) {
+      return undefined;
+    }
+    return { userAgent: value.userAgent, metadata: value.metadata };
+  } catch {
+    return undefined;
+  }
+}
+
+function fallbackPlatform(): string {
+  if (process.platform === "linux") return "Linux";
+  if (process.platform === "win32") return "Windows";
+  if (process.platform === "darwin") return "macOS";
+  throw new Error(`unsupported browser platform: ${process.platform}`);
+}
+
+function fallbackUserAgentMetadata(product: string): UserAgentMetadata {
+  const version = product.match(/\/(\d+(?:\.\d+)*)/)?.[1];
+  if (version === undefined) {
+    throw new Error("browser product version was not returned");
+  }
+  return {
+    brands: [{ brand: "Chromium", version: version.split(".")[0] }],
+    fullVersionList: [{ brand: "Chromium", version }],
+    platform: fallbackPlatform(),
+    platformVersion: "",
+    architecture: "",
+    bitness: "",
+    model: "",
+    mobile: false,
+  };
 }
 
 function isNullableString(value: unknown): value is string | null {
@@ -409,6 +618,11 @@ async function openGuard(endpoint: string): Promise<CdpGuard> {
   let browserPid: number | undefined;
   const pending = new Map<number, PendingCdpCommand>();
   const targetReadiness = new Map<string, TargetReadiness>();
+  const attachedTargets = new Map<
+    string,
+    { targetType: string; sessionId: string }
+  >();
+  let userAgentOverride: UserAgentOverride | undefined;
   const failure = new Promise<never>((_resolve, reject) => {
     rejectFailure = reject;
   });
@@ -473,6 +687,24 @@ async function openGuard(endpoint: string): Promise<CdpGuard> {
       }
     });
 
+  const registerUserAgentOverride = async (
+    override: UserAgentOverride,
+  ): Promise<void> => {
+    userAgentOverride = override;
+    try {
+      await Promise.all(
+        [...attachedTargets.values()]
+          .filter(({ targetType }) => isPageOrIframeTarget(targetType))
+          .map(({ sessionId }) =>
+            send("Emulation.setUserAgentOverride", override, sessionId),
+          ),
+      );
+    } catch (error) {
+      fail(error);
+      throw error;
+    }
+  };
+
   const handleEvent = (message: CdpMessage): void => {
     if (message.method === "Target.attachedToTarget") {
       const params = message.params;
@@ -487,42 +719,96 @@ async function openGuard(endpoint: string): Promise<CdpGuard> {
         fail(new Error("invalid Target.attachedToTarget event"));
         return;
       }
-      const readiness = getTargetReadiness(targetInfo.targetId);
-      void send(
-        "Fetch.enable",
-        {
-          patterns: [{ urlPattern: "file://*", requestStage: "Request" }],
-        },
+      attachedTargets.set(targetInfo.targetId, {
+        targetType: targetInfo.type,
         sessionId,
-      )
-        .then(async () => {
+      });
+      const readiness = getTargetReadiness(targetInfo.targetId);
+      const fileGuardTarget = isPageOrIframeTarget(targetInfo.type);
+      void (async () => {
+        if (fileGuardTarget) {
+          await send(
+            "Fetch.enable",
+            { patterns: guardFetchPatterns },
+            sessionId,
+          );
           if (targetInfo.type === "page") {
             await send("Target.setAutoAttach", autoAttachParams, sessionId);
           }
-          await send("Runtime.runIfWaitingForDebugger", {}, sessionId);
-        })
+        }
+        // デバッガ待ちで停止中の target では、Emulation.setUserAgentOverride の応答が
+        // 再開まで返りません。そのため上書きの応答を待たずに再開命令を続けて送り、
+        // 両方の応答を待ちます。コマンドは送信順に処理されるため、User-Agent は
+        // 再開後の最初のリクエストから上書きされます（client hints は guardFetchPatterns を参照）。
+        const commands: Array<Promise<unknown>> = [];
+        if (fileGuardTarget && userAgentOverride !== undefined) {
+          commands.push(
+            send(
+              "Emulation.setUserAgentOverride",
+              userAgentOverride,
+              sessionId,
+            ),
+          );
+        }
+        commands.push(
+          send(
+            "Runtime.runIfWaitingForDebugger",
+            {},
+            sessionId,
+            fileGuardTarget,
+          ),
+        );
+        await Promise.all(commands);
+      })()
         .then(() => readiness.resolve())
         .catch((error) => {
-          readiness.reject(error);
-          fail(error);
+          if (fileGuardTarget) {
+            readiness.reject(error);
+            fail(error);
+          } else {
+            readiness.resolve();
+          }
         });
+      return;
+    }
+
+    if (message.method === "Target.detachedFromTarget") {
+      const targetId = message.params?.targetId;
+      if (typeof targetId === "string") attachedTargets.delete(targetId);
       return;
     }
 
     if (message.method === "Fetch.requestPaused") {
       const params = message.params;
+      const request = params?.request;
       if (
         typeof message.sessionId !== "string" ||
-        typeof params?.requestId !== "string"
+        typeof params?.requestId !== "string" ||
+        !isRecord(request) ||
+        typeof request.url !== "string"
       ) {
         fail(new Error("invalid Fetch.requestPaused event"));
         return;
       }
+      if (mustBlockPausedRequest(request.url)) {
+        void send(
+          "Fetch.failRequest",
+          { requestId: params.requestId, errorReason: "AccessDenied" },
+          message.sessionId,
+        ).catch(fail);
+        return;
+      }
+      const headers = headfulClientHintHeaders(request.headers);
+      // 継続の失敗は中断済みのナビゲーションで正常に起こりうるうえ、
+      // file:// 遮断にも影響しないため、ガード失敗として扱いません。
       void send(
-        "Fetch.failRequest",
-        { requestId: params.requestId, errorReason: "AccessDenied" },
+        "Fetch.continueRequest",
+        headers === undefined
+          ? { requestId: params.requestId }
+          : { requestId: params.requestId, headers },
         message.sessionId,
-      ).catch(fail);
+        false,
+      ).catch(() => undefined);
     }
   };
 
@@ -601,6 +887,7 @@ async function openGuard(endpoint: string): Promise<CdpGuard> {
     },
     failure,
     browserPid,
+    registerUserAgentOverride,
     assertOpen: () => {
       if (failureError !== undefined) throw failureError;
     },
@@ -1047,41 +1334,60 @@ async function openBrowserPage() {
   const browserSession = await withGuard(guard, () =>
     browser.newBrowserCDPSession(),
   );
-  let userAgent: string;
   try {
+    const page = await withGuard(guard, () => browser.newPage());
+    const pageSession = await withGuard(guard, () =>
+      page.context().newCDPSession(page),
+    );
+    const targetInfoResult = await withGuard(guard, () =>
+      pageSession.send("Target.getTargetInfo"),
+    );
+    const targetInfo = targetInfoResult.targetInfo;
+    if (
+      !isRecord(targetInfo) ||
+      typeof targetInfo.targetId !== "string" ||
+      typeof targetInfo.browserContextId !== "string"
+    ) {
+      throw new Error("CDP target information was not returned");
+    }
+    await waitForTargetReady(guard, targetInfo.targetId);
+
+    const pageUserAgent = await withGuard(guard, () =>
+      readNavigatorUserAgentData(page),
+    );
     const version = await withGuard(guard, () =>
       browserSession.send("Browser.getVersion"),
     );
-    if (typeof version.userAgent !== "string") {
-      throw new Error("browser user agent was not returned");
-    }
-    userAgent = headfulUserAgent(version.userAgent);
+    const userAgent = headfulUserAgent(
+      pageUserAgent?.userAgent ??
+        (typeof version.userAgent === "string"
+          ? version.userAgent
+          : (() => {
+              throw new Error("browser user agent was not returned");
+            })()),
+    );
+    const userAgentMetadata = headfulUserAgentMetadata(
+      pageUserAgent?.metadata ??
+        (typeof version.product === "string"
+          ? fallbackUserAgentMetadata(version.product)
+          : (() => {
+              throw new Error("browser product was not returned");
+            })()),
+    );
+    await withGuard(guard, () =>
+      guard.registerUserAgentOverride({ userAgent, userAgentMetadata }),
+    );
+
+    return {
+      endpoint,
+      page,
+      pageSession,
+      targetId: targetInfo.targetId,
+      browserContextId: targetInfo.browserContextId,
+    };
   } finally {
     await browserSession.detach().catch(() => undefined);
   }
-  const page = await withGuard(guard, () => browser.newPage({ userAgent }));
-  const pageSession = await withGuard(guard, () =>
-    page.context().newCDPSession(page),
-  );
-  const targetInfoResult = await withGuard(guard, () =>
-    pageSession.send("Target.getTargetInfo"),
-  );
-  const targetInfo = targetInfoResult.targetInfo;
-  if (
-    !isRecord(targetInfo) ||
-    typeof targetInfo.targetId !== "string" ||
-    typeof targetInfo.browserContextId !== "string"
-  ) {
-    throw new Error("CDP target information was not returned");
-  }
-  await waitForTargetReady(guard, targetInfo.targetId);
-  return {
-    endpoint,
-    page,
-    pageSession,
-    targetId: targetInfo.targetId,
-    browserContextId: targetInfo.browserContextId,
-  };
 }
 
 async function executeLogin(

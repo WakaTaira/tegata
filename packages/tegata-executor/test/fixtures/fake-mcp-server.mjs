@@ -7,7 +7,13 @@ const token = process.env.TOKEN ?? "";
 
 if (mode === "early-exit") process.exit(2);
 if (mode === "stubborn") process.on("SIGTERM", () => {});
-if (mode === "exit-later") setTimeout(() => process.exit(4), 1_500);
+if (mode === "exit-later") {
+  setTimeout(() => {
+    if (process.env.LOG !== undefined)
+      appendFileSync(process.env.LOG, "exiting\n");
+    process.exit(4);
+  }, 1_500);
+}
 
 function write(text) {
   process.stdout.write(text);
@@ -45,4 +51,5 @@ input.on("line", (line) => {
   const rest = space < 0 ? "" : line.slice(space + 1);
   commands[name]?.(rest);
 });
-if (mode === "stubborn") setInterval(() => {}, 1_000);
+// stubborn と ignore-eof は stdin の EOF 後も終了しない。
+if (mode === "stubborn" || mode === "ignore-eof") setInterval(() => {}, 1_000);

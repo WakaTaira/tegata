@@ -100,21 +100,26 @@ or `open_api_proxy` call for the same credential, also covers
 The server is a lease like a browser or an API proxy: it ends at `logout`,
 `lock_vault` for its namespace, its session TTL, or the deployment's
 `browser_max_lifetime_secs`, whichever comes first. The runner itself calls
-`logout` as soon as its own stdin closes or the relay connection drops, so
-closing the agent's MCP client tears down the server too. If the server exits
-on its own, its lease ends the same way. Either way the executor sends the
-server SIGTERM, then SIGKILL two seconds later if it has not exited (Windows:
-a plain kill).
+`logout` as soon as its own stdin closes, the relay connection drops, or it
+receives SIGTERM or SIGINT — the way an MCP client usually stops a stdio
+server. Independently of the runner, the executor stops the server as soon as
+the relay connection closes, since that connection is never re-established, so
+closing the agent's MCP client tears down the server too, even one that
+ignores the end of its stdin and even if the runner dies before it can log
+out. When the server exits on its own, or is stopped because its connection
+closed, the executor reports the exit and the daemon ends the lease. Stopping the server always means SIGTERM, then SIGKILL two seconds later
+if it has not exited (Windows: a plain kill).
 
 ## Leak containment, and its limits
 
 The executor reads the server's stdout one newline-delimited line at a time —
 matching how MCP stdio framing works — and checks each line for the
-credential values it injected (the password, and any `env` value that
-contained `{{secret}}`, `{{username}}`, or `{{totp}}`) before forwarding it.
-A line containing one of those values verbatim is dropped, the server is
-killed, and the connection is closed; the audit log records the leak instead
-of the line.
+credential values it injected before forwarding it: the password, and every
+`env` value that contained `{{secret}}` or `{{totp}}`, as it reads after
+substitution, each both verbatim and in its JSON-escaped form. An `env` value
+whose only placeholder is `{{username}}` is not scanned. A line containing one
+of those values is dropped, the server is killed, and the connection is
+closed; the audit log records the leak instead of the line.
 
 This is a substring check on the literal value, not a general secret
 detector. **Base64, URL-encoding, hex, whitespace-splitting across two lines,
@@ -133,7 +138,9 @@ The server's working directory and `HOME` are a per-session temporary
 directory, removed when the lease ends. Its environment is exactly the
 `PATH` the executor itself runs with, plus the `env` table from
 configuration — none of the executor's other environment variables are
-passed through.
+passed through. On Windows, `SYSTEMROOT` and `WINDIR` are also passed through
+when the executor has them, because Node and many other runtimes on Windows
+require `SYSTEMROOT`.
 
 ## Audit
 

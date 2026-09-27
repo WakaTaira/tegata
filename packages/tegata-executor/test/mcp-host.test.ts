@@ -10,12 +10,13 @@ import {
   formatMcpServerEvent,
   parseRequest,
 } from "../src/index.js";
+import { createLoopbackSecret } from "../src/loopback.js";
 import {
-  createStreamSecret,
   LineInspector,
   MCP_MAX_LINE_BYTES,
   type McpServerEvent,
   McpServerStartError,
+  serverEnvironment,
   startMcpServer,
 } from "../src/mcp-host.js";
 
@@ -55,13 +56,15 @@ type Started = {
   secret: string;
   events: McpServerEvent[];
   logPath: string;
+  releaseEvents: () => void;
   close: () => Promise<void>;
 };
 
-async function start(mode = "serve"): Promise<Started> {
+/** release が false の場合、起動応答前の状態を再現するためイベントの保留を解かずに返す。 */
+async function start(mode = "serve", release = true): Promise<Started> {
   const logDir = await mkdtemp(path.join(os.tmpdir(), "tegata-mcp-test-"));
   const logPath = path.join(logDir, "received.log");
-  const secret = createStreamSecret();
+  const secret = createLoopbackSecret();
   const events: McpServerEvent[] = [];
   const host = await startMcpServer({
     command: process.execPath,
@@ -75,7 +78,15 @@ async function start(mode = "serve"): Promise<Started> {
     await host.close();
     await rm(logDir, { recursive: true, force: true });
   });
-  return { port: host.port, secret, events, logPath, close: host.close };
+  if (release) host.releaseEvents();
+  return {
+    port: host.port,
+    secret,
+    events,
+    logPath,
+    releaseEvents: host.releaseEvents,
+    close: host.close,
+  };
 }
 
 type Client = {
@@ -266,6 +277,36 @@ describe("LineInspector", () => {
   });
 });
 
+describe("serverEnvironment", () => {
+  const inherited = {
+    PATH: "/bin",
+    SYSTEMROOT: "C:\\Windows",
+    WINDIR: "C:\\Windows",
+    OTHER: "x",
+  };
+
+  test("passes only PATH and HOME on non-Windows platforms", () => {
+    expect(serverEnvironment({ TOKEN }, "/tmp/h", "linux", inherited)).toEqual({
+      TOKEN,
+      PATH: "/bin",
+      HOME: "/tmp/h",
+    });
+  });
+
+  test("also passes SYSTEMROOT and WINDIR on Windows when present", () => {
+    expect(serverEnvironment({ TOKEN }, "C:\\h", "win32", inherited)).toEqual({
+      TOKEN,
+      PATH: "/bin",
+      HOME: "C:\\h",
+      SYSTEMROOT: "C:\\Windows",
+      WINDIR: "C:\\Windows",
+    });
+    expect(
+      serverEnvironment({ TOKEN }, "C:\\h", "win32", { PATH: "/bin" }),
+    ).toEqual({ TOKEN, PATH: "/bin", HOME: "C:\\h" });
+  });
+});
+
 describe("startMcpServer", () => {
   test("rejects a server that exits during startup", async () => {
     await expect(
@@ -274,7 +315,7 @@ describe("startMcpServer", () => {
         args: [FAKE_SERVER, "early-exit"],
         env: {},
         scan: [],
-        streamSecret: createStreamSecret(),
+        streamSecret: createLoopbackSecret(),
         onEvent: () => undefined,
       }),
     ).rejects.toBeInstanceOf(McpServerStartError);
@@ -286,7 +327,7 @@ describe("startMcpServer", () => {
       args: [],
       env: { TOKEN },
       scan: [TOKEN],
-      streamSecret: createStreamSecret(),
+      streamSecret: createLoopbackSecret(),
       onEvent: () => undefined,
     }).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(McpServerStartError);
@@ -446,7 +487,45 @@ describe("startMcpServer", () => {
     await waitFor(() => server.events.length === 1);
     client.socket.end();
     await waitFor(() => server.events.length === 2);
-    expect(server.events[1]).toEqual({ action: "exit", exit_code: 0 });
+    // EOF による自発的な終了と SIGTERM のどちらが先に効くかは競合するため、終了の通知のみを確かめる。
+    expect(server.events[1]).toMatchObject({ action: "exit" });
+  });
+
+  test("terminates a server that ignores EOF once the connection ends", async () => {
+    const server = await start("ignore-eof");
+    const client = await connect(server.port, `${server.secret}\npid\n`);
+    await waitFor(() => client.lines().length === 1);
+    const pid = Number(client.lines()[0]);
+
+    client.socket.end();
+    await waitFor(() => server.events.length === 2);
+    expect(server.events).toEqual([
+      { action: "connected" },
+      { action: "exit", exit_code: null },
+    ]);
+    expect(processExists(pid)).toBe(false);
+  });
+
+  test("escalates to SIGKILL after a disconnect for a server that ignores SIGTERM", async () => {
+    const server = await start("stubborn");
+    const client = await connect(server.port, `${server.secret}\npid\n`);
+    await waitFor(() => client.lines().length === 1);
+    const pid = Number(client.lines()[0]);
+
+    client.socket.end();
+    await waitFor(() => server.events.length === 2, 8_000);
+    expect(server.events[1]).toEqual({ action: "exit", exit_code: null });
+    expect(processExists(pid)).toBe(false);
+  }, 10_000);
+
+  test("holds events until the start response has been written", async () => {
+    const server = await start("exit-later", false);
+    await waitFor(() => readLog(server.logPath) === "exiting\n");
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(server.events).toEqual([]);
+
+    server.releaseEvents();
+    expect(server.events).toEqual([{ action: "exit", exit_code: 4 }]);
   });
 
   test("reports an exit that happens before any connection", async () => {

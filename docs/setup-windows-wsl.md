@@ -167,7 +167,7 @@ an opt-in for a deployment that provides its own helper.
 | `tegatad.exe peer list` | yes | List named client tokens |
 | `tegatad.exe token issue` | yes | Deprecated alias for `peer issue --label default`; removed in the next release |
 | `tegatad.exe seal` | yes | Seal the master password |
-| `tegatad.exe approval list` | yes | List pending `login`, `authorize_device`, and `open_api_proxy` approvals |
+| `tegatad.exe approval list` | yes | List pending `login`, `authorize_device`, `open_api_proxy`, and `open_mcp_server` approvals |
 | `tegatad.exe approval allow <id>` | yes | Let a pending request proceed |
 | `tegatad.exe approval deny <id>` | yes | Refuse a pending request |
 | `tegatad.exe service install --config <path>` | yes | Register and provision |
@@ -217,9 +217,9 @@ browsers_path   = "C:\\ProgramData\\tegata-rig\\browsers"
 | `audit_log_max_bytes` | integer | no | Rotate to `<path>.1` past this size, at most once per daemon process |
 | `unlock_mode` | string | no | `sealed` (default) or `askpass` |
 | `session_ttl_secs` | integer | no | Browser session lifetime; default `300` |
-| `browser_max_lifetime_secs` | integer | no | Absolute browser and API-proxy session lifetime from launch; must be at least `1`; default `3600` |
+| `browser_max_lifetime_secs` | integer | no | Absolute browser, API-proxy, and MCP-server session lifetime from launch; must be at least `1`; default `3600` |
 | `executor_entry` | string | no | Path to the executor's `index.js` |
-| `approve_operator` | boolean | no | Hold every `login`, `authorize_device`, and `open_api_proxy` for an operator decision; default `false` — see [The approval hook](#the-approval-hook) |
+| `approve_operator` | boolean | no | Hold every `login`, `authorize_device`, `open_api_proxy`, and `open_mcp_server` for an operator decision; default `false` — see [The approval hook](#the-approval-hook) |
 | `approve_timeout_secs` | integer | no | How long a pending approval waits for a decision; default `60` |
 | `approval_grant_ttl_secs` | integer | no | Approval grant lifetime in seconds; `0` asks every time |
 
@@ -293,13 +293,13 @@ When `approval_grant_ttl_secs` is positive, an approved `(principal, credential)
 pair can use the gated methods without another operator decision until the TTL
 expires. The grant also ends when `lock_vault` is called or the daemon restarts.
 
-With the hook enabled, every `login`, `authorize_device`, and `open_api_proxy`
-registers a pending approval at the same point `approve_cmd` would gate it —
+With the hook enabled, every `login`, `authorize_device`, `open_api_proxy`, and
+`open_mcp_server` registers a pending approval at the same point `approve_cmd` would gate it —
 after the credential is confirmed to exist, before any value is resolved or the
 executor starts — and then waits. For `authorize_device`, the target URL in the pending entry is the
 verification URL with its query, fragment, and userinfo removed, so the user
 code does not appear in the list; for `open_api_proxy`, it is the configured
-upstream of the API proxy. The daemon writes one line to its stderr —
+upstream of the API proxy; for `open_mcp_server`, it is `mcp:<name>`. The daemon writes one line to its stderr —
 visible through `TEGATA_LOG_FILE`, see [Troubleshooting](#troubleshooting) —
 when it does:
 

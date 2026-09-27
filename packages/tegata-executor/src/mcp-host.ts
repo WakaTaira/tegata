@@ -1,9 +1,10 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
-import net, { type AddressInfo } from "node:net";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { closeServer, listenLoopback } from "./loopback.js";
 
 /** 起動直後にこの時間内で終了したサーバーは起動失敗とみなす。 */
 export const MCP_STARTUP_GRACE_MS = 1_000;
@@ -34,6 +35,11 @@ export type McpServerOptions = {
 
 export type McpServerHost = {
   port: number;
+  /**
+   * 起動応答を書き終えた後に呼ぶ。それまでに生じたイベントは保留されており、ここで発生順に出す。
+   * 応答より先にイベント行が出ると、デーモンが未確立のリースへのイベントとして扱えないためである。
+   */
+  releaseEvents: () => void;
   close: () => Promise<void>;
 };
 
@@ -43,10 +49,6 @@ export type McpServerHost = {
  */
 export class McpServerStartError extends Error {
   override name = "McpServerStartError";
-}
-
-export function createStreamSecret(): string {
-  return randomBytes(16).toString("base64url");
 }
 
 export type LineInspection = { lines: Buffer[]; leaked: boolean };
@@ -185,11 +187,37 @@ function terminateChild(child: ChildProcess): Promise<void> {
   });
 }
 
+/** Windows でのみ引き継ぐ変数。Node などのランタイムは SYSTEMROOT が無いと起動・通信に失敗する。 */
+const WINDOWS_INHERITED_ENV = ["SYSTEMROOT", "WINDIR"] as const;
+
+/**
+ * サーバーへ渡す環境変数を組み立てる。executor の環境変数は PATH と、Windows の場合の
+ * SYSTEMROOT・WINDIR（存在する場合のみ）以外引き継がず、HOME はセッション用ディレクトリとする。
+ */
+export function serverEnvironment(
+  env: Record<string, string>,
+  home: string,
+  platform: NodeJS.Platform = process.platform,
+  inherited: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = {
+    ...env,
+    PATH: inherited.PATH,
+    HOME: home,
+  };
+  if (platform === "win32") {
+    for (const name of WINDOWS_INHERITED_ENV) {
+      const value = inherited[name];
+      if (value !== undefined) result[name] = value;
+    }
+  }
+  return result;
+}
+
 function spawnServer(options: McpServerOptions, dir: string): ChildProcess {
   try {
     return spawn(options.command, options.args, {
-      // executor の環境変数は PATH 以外引き継がない。
-      env: { ...options.env, PATH: process.env.PATH, HOME: dir },
+      env: serverEnvironment(options.env, dir),
       cwd: dir,
       stdio: ["pipe", "pipe", "ignore"],
       windowsHide: true,
@@ -198,22 +226,6 @@ function spawnServer(options: McpServerOptions, dir: string): ChildProcess {
     const code = (error as NodeJS.ErrnoException).code ?? "unknown";
     throw new McpServerStartError(`MCP server could not be spawned (${code})`);
   }
-}
-
-function listen(server: net.Server): Promise<number> {
-  return new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      server.removeListener("error", reject);
-      resolve((server.address() as AddressInfo).port);
-    });
-  });
-}
-
-function closeServer(server: net.Server): Promise<void> {
-  return new Promise((resolve) => {
-    server.close(() => resolve());
-  });
 }
 
 /**
@@ -231,6 +243,7 @@ class McpRelay {
   private readonly secret: Buffer;
   private termination: Promise<void> | undefined;
   private closing: Promise<void> | undefined;
+  private heldEvents: McpServerEvent[] | undefined = [];
   readonly server: net.Server;
 
   constructor(
@@ -290,6 +303,22 @@ class McpRelay {
     });
   }
 
+  /** 起動応答の前はイベントを保留し、releaseEvents 以後は即座に出す。 */
+  private emit(event: McpServerEvent): void {
+    if (this.heldEvents !== undefined) {
+      this.heldEvents.push(event);
+      return;
+    }
+    this.options.onEvent(event);
+  }
+
+  releaseEvents(): void {
+    const held = this.heldEvents;
+    if (held === undefined) return;
+    this.heldEvents = undefined;
+    for (const event of held) this.options.onEvent(event);
+  }
+
   private establish(socket: net.Socket, rest: Buffer): void {
     this.claimed = true;
     this.connection = socket;
@@ -305,9 +334,11 @@ class McpRelay {
       if (stdin !== null && !stdin.writableEnded) stdin.end();
       // 切断後の出力は捨てるため、backpressure で止めた読み取りを再開する。
       this.child.stdout?.resume();
+      // 接続は再成立しないため、EOF を無視するサーバーも残さず終了させる。終了は exit イベントとして通知される。
+      void this.terminate();
     });
     this.startReading();
-    this.options.onEvent({ action: "connected" });
+    this.emit({ action: "connected" });
   }
 
   private startReading(): void {
@@ -342,7 +373,7 @@ class McpRelay {
     this.child.stdout?.destroy();
     this.dropConnections();
     await this.terminate();
-    this.options.onEvent({ action: "leak" });
+    this.emit({ action: "leak" });
   }
 
   private handleExit(code: number | null): void {
@@ -353,7 +384,7 @@ class McpRelay {
     for (const socket of this.handshakes) socket.destroy();
     this.handshakes.clear();
     void closeServer(this.server);
-    this.options.onEvent({ action: "exit", exit_code: code });
+    this.emit({ action: "exit", exit_code: code });
   }
 
   private dropConnections(): void {
@@ -399,8 +430,12 @@ export async function startMcpServer(
     await waitForStartup(child);
     const relay = new McpRelay(child, dir, options);
     try {
-      const port = await listen(relay.server);
-      return { port, close: () => relay.close() };
+      const port = await listenLoopback(relay.server);
+      return {
+        port,
+        releaseEvents: () => relay.releaseEvents(),
+        close: () => relay.close(),
+      };
     } catch (error) {
       await relay.close();
       throw new McpServerStartError(

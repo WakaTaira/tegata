@@ -5,7 +5,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-type RpcResponse = {
+export type RpcResponse = {
   result?: unknown;
   error?: { message?: unknown; data?: unknown };
 };
@@ -226,8 +226,10 @@ type BridgeTunnel =
   | { localPort: number }
   | { failure: ReturnType<typeof internalError | typeof errorResult> };
 
-/** bridge にセッションのポートへのトンネルを開かせ、bridge 側のローカルポートを得る。
- * run.ts（tegata-mcp-run）が MCP サーバー中継の bridge トンネルにも同じ手順を使うため export する。 */
+/**
+ * bridge にセッションのポートへのトンネルを開かせ、bridge 側のローカルポートを得る。
+ * run.ts（tegata-mcp-run）が MCP サーバー中継の bridge トンネルにも同じ手順を使うため export する。
+ */
 export async function openBridgeTunnel(
   sessionId: string,
   port: number,

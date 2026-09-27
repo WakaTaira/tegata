@@ -277,7 +277,7 @@ the full option reference, the NixOS equivalent, and the residual risks.
 | `audit_log_max_bytes` | integer | no | Rotate to `<path>.1` past this size, at most once per daemon process. Unset means no rotation |
 | `max_pending_connections` | integer | no | Maximum unauthenticated concurrent TCP connections; default `8` |
 | `session_ttl_secs` | integer | no | Browser session lifetime; default `300` |
-| `browser_max_lifetime_secs` | integer | no | Absolute browser and API-proxy session lifetime from launch; must be at least `1`; default `3600` |
+| `browser_max_lifetime_secs` | integer | no | Absolute browser, API-proxy, and MCP-server session lifetime from launch; must be at least `1`; default `3600` |
 | `approve_cmd` | string | no | Command that must approve each `login`. Unset means no approval gate |
 | `approve_timeout_secs` | integer | no | How long to wait for that command; default `60` |
 | `executor_entry` | string | no | Path to the executor's `index.js`. May also come from `TEGATA_EXECUTOR_ENTRY` |
@@ -535,8 +535,8 @@ nothing else is passed — no credential value ever reaches the hook:
 | Variable | Contents |
 | --- | --- |
 | `TEGATA_CRED_ID` | The namespaced credential reference |
-| `TEGATA_TARGET_URL` | The login destination |
-| `TEGATA_METHOD` | The gated method: `login`, `authorize_device`, or `open_api_proxy` |
+| `TEGATA_TARGET_URL` | The login destination; the upstream for `open_api_proxy`; `mcp:<name>` for `open_mcp_server` |
+| `TEGATA_METHOD` | The gated method: `login`, `authorize_device`, `open_api_proxy`, or `open_mcp_server` |
 | `TEGATA_APPROVAL_CODE` | A two-digit number, 10–99, generated per request by the daemon |
 | `TEGATA_APPROVAL_GRANT_TTL_SECS` | The configured approval grant lifetime in seconds |
 | `TEGATA_PEER` | The calling peer: its uid in decimal, or its principal (such as `peer:<id>`) for a token peer |
@@ -559,8 +559,8 @@ user, so an approval prompt is not something the agent can draw, dismiss, or
 answer.
 
 When `approval_grant_ttl_secs` is positive, a successful approval grants the same
-`(principal, credential)` pair access to `login`, `open_api_proxy`, and
-`authorize_device` for that many seconds from the approval time. The grant expires
+`(principal, credential)` pair access to `login`, `open_api_proxy`,
+`open_mcp_server`, and `authorize_device` for that many seconds from the approval time. The grant expires
 when the TTL elapses, `lock_vault` is called, or the daemon restarts; refusals and
 timeouts never create one. The audit record identifies `approval_grant: "issued"`
 or `"reused"`. The default `0` asks every time, and `get_totp` is outside this gate.

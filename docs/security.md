@@ -283,8 +283,8 @@ legitimate `login` from one an injected instruction talked the agent into making
 both are the same call for a credential the agent is entitled to use. The answer to
 that is not a better boundary; it is a human.
 
-Setting `approve_cmd` gates every `login`, `authorize_device`, and
-`open_api_proxy` on an external command. The daemon runs
+Setting `approve_cmd` gates every `login`, `authorize_device`,
+`open_api_proxy`, and `open_mcp_server` on an external command. The daemon runs
 it through `sh -c` on the isolated side and reads the exit status as the verdict:
 zero approves, anything else denies with `APPROVAL_DENIED`. A command that has not
 answered within `approve_timeout_secs` — 60 by default — has its whole process
@@ -316,8 +316,8 @@ environment variables:
 | Variable | Contents |
 | --- | --- |
 | `TEGATA_CRED_ID` | The namespaced credential reference being requested |
-| `TEGATA_TARGET_URL` | The login destination, for `authorize_device` the verification URL with its query, fragment, and userinfo removed, or for `open_api_proxy` the API proxy's upstream |
-| `TEGATA_METHOD` | `login`, `authorize_device`, or `open_api_proxy` |
+| `TEGATA_TARGET_URL` | The login destination, for `authorize_device` the verification URL with its query, fragment, and userinfo removed, for `open_api_proxy` the API proxy's upstream, or for `open_mcp_server` `mcp:<name>` |
+| `TEGATA_METHOD` | `login`, `authorize_device`, `open_api_proxy`, or `open_mcp_server` |
 | `TEGATA_PEER` | The calling peer's uid, in decimal |
 
 That is enough for a human to make a decision — *which* account, at *which* site,
@@ -340,8 +340,8 @@ What an agent cannot forge, on this host, is passage through the administrative
 RPC gate: elevated, a member of the local Administrators group, and not a WSL
 interop caller. That gate already exists to protect `peer issue`, `peer revoke`,
 and `seal`. `approve_operator = true` puts the approval decision behind the same
-gate instead of behind a command. Every `login`, `authorize_device`, and
-`open_api_proxy` registers a pending approval — at the same point in the call, after the credential is
+gate instead of behind a command. Every `login`, `authorize_device`,
+`open_api_proxy`, and `open_mcp_server` registers a pending approval — at the same point in the call, after the credential is
 confirmed to exist and before any value is resolved — and a human decides it
 from an elevated PowerShell with `tegatad.exe approval list` / `approval allow
 <id>` / `approval deny <id>`, which reach the daemon through `admin_approval_list` and

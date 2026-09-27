@@ -30,11 +30,11 @@ use serde_json::{Value, json};
 use tegata_core::wire::{
     AuthorizeDeviceParams, ExecutorApiProxyOAuth, ExecutorApiProxyOAuthSecret,
     ExecutorApiProxyOAuthTokenEvent, ExecutorApiProxyRequestEvent, ExecutorApiProxyStartRequest,
-    ExecutorApiProxyStartResponse, ExecutorApiProxyStopRequest, ExecutorAuthorizeDeviceRequest,
-    ExecutorLeaseRequest, ExecutorLoginRequest, ExecutorMcpServerEvent,
-    ExecutorMcpServerStartRequest, ExecutorMcpServerStartResponse, ExecutorMcpServerStopRequest,
-    ExecutorReleaseRequest, ExecutorResponse, ExecutorSecret, LoginParams, OpenApiProxyParams,
-    OpenMcpServerParams, RpcError, RpcRequest, RpcResponse,
+    ExecutorApiProxyStartResponse, ExecutorAuthorizeDeviceRequest, ExecutorLeaseRequest,
+    ExecutorLoginRequest, ExecutorMcpServerEvent, ExecutorMcpServerStartRequest,
+    ExecutorMcpServerStartResponse, ExecutorReleaseRequest, ExecutorResponse, ExecutorSecret,
+    ExecutorServiceStopRequest, LoginParams, OpenApiProxyParams, OpenMcpServerParams, RpcError,
+    RpcRequest, RpcResponse,
 };
 #[cfg(unix)]
 use tegata_core::wire::{ExecutorHelloRequest, ExecutorHelloResponse};
@@ -343,6 +343,22 @@ fn validate_mcp_servers(servers: &[McpServerConfig]) -> Result<(), String> {
                 server.name
             ));
         }
+        if mcp_server_contains_nul(server) {
+            return Err(format!(
+                "mcp_server \"{}\": command, args, and env must not contain NUL",
+                server.name
+            ));
+        }
+        if server
+            .env
+            .keys()
+            .any(|key| key.is_empty() || key.contains('='))
+        {
+            return Err(format!(
+                "mcp_server \"{}\": env names must not be empty or contain '='",
+                server.name
+            ));
+        }
         if !server
             .env
             .values()
@@ -356,6 +372,15 @@ fn validate_mcp_servers(servers: &[McpServerConfig]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// command・args・env の名前と値のいずれかが NUL を含むかを判定する。
+/// executor は NUL を含む引数・環境変数で子プロセスを起動できず実行時に拒否するため、起動時に先取りする。
+fn mcp_server_contains_nul(server: &McpServerConfig) -> bool {
+    std::iter::once(&server.command)
+        .chain(&server.args)
+        .chain(server.env.iter().flat_map(|(key, value)| [key, value]))
+        .any(|value| value.contains('\0'))
 }
 
 /// 上流が `https://`、または loopback ホストの `http://` であるかを判定する。
@@ -1957,8 +1982,8 @@ async fn handle_request(
         "list_credentials" => list_credentials(request, state).await,
         "login" => login(request, state, peer).await,
         "authorize_device" => authorize_device(request, state, peer).await,
-        "open_api_proxy" => open_api_proxy(request, state, peer).await,
-        "open_mcp_server" => open_mcp_server(request, state, peer).await,
+        "open_api_proxy" => open_service::<ApiProxyConfig>(request, state, peer).await,
+        "open_mcp_server" => open_service::<McpServerConfig>(request, state, peer).await,
         "logout" => logout(request, state, peer).await,
         "get_totp" => get_totp(request, state).await,
         "lock_vault" => lock_vault(request, state).await,
@@ -2604,32 +2629,32 @@ async fn authorize_device(
     .with_audit_approval_grant(grant)
 }
 
-/// 設定済みの注入プロキシを専用の executor 接続で起動し、排他リースとして登録する。
+/// 設定済みのサービスを専用の executor 接続で起動し、排他リースとして登録する。
 ///
 /// 監査項目は agent が params に添えた値ではなく、名前で引いた設定の値から確定する。
-async fn open_api_proxy(
+async fn open_service<S: HostedService>(
     request: &RpcRequest,
     state: SharedState,
     peer: &PeerIdentity,
 ) -> HandledRequest {
-    let params = match parse_params::<OpenApiProxyParams>(&request.params) {
+    let params = match parse_params::<S::Params>(&request.params) {
         Ok(params) => params,
         Err(error) => return classified(request.id.clone(), error),
     };
-    let Some(proxy) = state.lock().await.api_proxies.get(&params.name).cloned() else {
+    let Some(service) = S::lookup(&*state.lock().await, &S::requested_name(&params)) else {
         return classified(request.id.clone(), ErrorCode::NotFound);
     };
-    let Some(cred_id) = api_proxy_cred_id(&proxy).map(ToOwned::to_owned) else {
+    let Some(cred_id) = service.cred_id().map(ToOwned::to_owned) else {
         return classified(request.id.clone(), ErrorCode::InvalidCredential);
     };
+    let target_url = service.target_url();
     let mut fields = AuditFields {
         cred_id: Some(cred_id.clone()),
-        target_url: Some(proxy.upstream.clone()),
+        target_url: Some(target_url.clone()),
         namespace: cred_id
             .split_once(':')
             .map(|(namespace, _)| namespace.to_owned()),
-        proxy: Some(proxy.name.clone()),
-        ..AuditFields::default()
+        ..S::KIND.named_audit_fields(service.name().to_owned())
     };
     let Some((namespace, _)) = cred_id.split_once(':') else {
         return classified(request.id.clone(), ErrorCode::InvalidCredential)
@@ -2637,16 +2662,16 @@ async fn open_api_proxy(
     };
     let namespace = namespace.to_owned();
     let grant =
-        match gate_on_approval(&state, &cred_id, &proxy.upstream, "open_api_proxy", peer).await {
+        match gate_on_approval(&state, &cred_id, &target_url, S::KIND.open_method(), peer).await {
             Ok(grant) => grant,
             Err(error) => return classified(request.id.clone(), error).with_audit_fields(fields),
         };
-    match start_api_proxy_session(&state, peer, proxy, cred_id, namespace).await {
-        Ok((session_id, base_url)) => {
+    match start_service_session(&state, peer, service, cred_id, namespace).await {
+        Ok((session_id, port, secret)) => {
             fields.session_id = Some(session_id.clone());
             success(
                 request.id.clone(),
-                json!({ "session_id": session_id, "base_url": base_url }),
+                S::open_result(&session_id, port, &secret),
             )
             .with_audit_fields(fields)
         }
@@ -2655,21 +2680,18 @@ async fn open_api_proxy(
     .with_audit_approval_grant(grant)
 }
 
-/// 承認ゲートを通過した注入プロキシを起動制御を経て起動し、リースを登録して
-/// `(session_id, base_url)` を返す。`cred_id` と `namespace` は承認対象から分割済みの値である。
-async fn start_api_proxy_session(
+/// 承認ゲートを通過したサービスを起動制御を経て起動し、リースを登録して
+/// `(session_id, port, secret)` を返す。`cred_id` と `namespace` は承認対象から分割済みの値である。
+async fn start_service_session<S: HostedService>(
     state: &SharedState,
     peer: &PeerIdentity,
-    proxy: ApiProxyConfig,
+    service: S,
     cred_id: String,
     namespace: String,
-) -> Result<(String, String), ErrorCode> {
+) -> Result<(String, u16, String), ErrorCode> {
     let start_gate = start_control(
         state,
-        sessions::StartKey::ApiProxy {
-            principal: peer.principal(),
-            name: proxy.name.clone(),
-        },
+        S::KIND.start_key(peer.principal(), service.name().to_owned()),
     )
     .await;
     let mut start_guard = start_gate.lock().await;
@@ -2678,24 +2700,11 @@ async fn start_api_proxy_session(
     }
     let credential = resolve_unlocked_credential(state, &cred_id).await?;
     let settings = service_launch_settings(state).await;
-    let options = if let Some(oauth) = &proxy.oauth {
-        build_oauth_start(&proxy.value, oauth, &credential)?
-    } else {
-        ApiProxyStartOptions {
-            value_template: None,
-            header_value: Some(Zeroizing::new(
-                proxy
-                    .value
-                    .replace(API_PROXY_SECRET_PLACEHOLDER, credential.password.as_str()),
-            )),
-            oauth: None,
-        }
-    };
+    let launch = service.build_launch(&credential)?;
     drop(credential);
     start_guard.record_attempt(Instant::now());
-    let browser_started_at = Instant::now();
-    let (port, secret, executor) = match start_api_proxy_executor(&settings, &proxy, options).await
-    {
+    let started_at = Instant::now();
+    let (port, secret, executor) = match service.start_executor(&settings, launch).await {
         Ok(result) => {
             start_guard.record_success();
             result
@@ -2705,15 +2714,15 @@ async fn start_api_proxy_session(
             return Err(error);
         }
     };
-    let deadline = browser_started_at + settings.browser_max_lifetime;
+    let deadline = started_at + settings.browser_max_lifetime;
     drop(start_guard);
     let session_id = register_service_lease(
         state,
         peer,
         executor,
         ServiceLease {
-            kind: ServiceKind::ApiProxy,
-            name: proxy.name,
+            kind: S::KIND,
+            name: service.name().to_owned(),
             cred_id,
             namespace,
             port,
@@ -2722,7 +2731,128 @@ async fn start_api_proxy_session(
         },
     )
     .await?;
-    Ok((session_id, format!("http://127.0.0.1:{port}/{secret}")))
+    Ok((session_id, port, secret))
+}
+
+/// executor 接続 1 本を占有するサービスの設定。`open_service` と `start_service_session` のうち、
+/// サービスの種類によって異なる部分（設定の引き方・承認対象・起動要求・応答の形）を与える。
+trait HostedService: Clone {
+    const KIND: ServiceKind;
+    /// RPC のパラメータ。agent は設定上の名前でのみ選ぶ。
+    type Params: for<'de> Deserialize<'de>;
+    /// 資格を解決した後に executor へ渡す起動値。解決済みの秘密を含む。
+    type Launch;
+
+    fn requested_name(params: &Self::Params) -> String;
+    fn lookup(daemon: &DaemonState, name: &str) -> Option<Self>;
+    fn name(&self) -> &str;
+    /// 承認と解決の対象とする資格。設定から定まらない場合は `None` とする。
+    fn cred_id(&self) -> Option<&str>;
+    /// 承認と監査に載せる対象。
+    fn target_url(&self) -> String;
+    fn build_launch(&self, credential: &ResolvedCredential) -> Result<Self::Launch, ErrorCode>;
+    /// executor 接続を 1 本開いてサービスを起動し、`(port, secret, executor)` を返す。
+    async fn start_executor(
+        &self,
+        settings: &ServiceLaunchSettings,
+        launch: Self::Launch,
+    ) -> Result<(u16, String, ExecutorHandle), ErrorCode>;
+    /// 起動に成功した場合の RPC の結果。
+    fn open_result(session_id: &str, port: u16, secret: &str) -> Value;
+}
+
+impl HostedService for ApiProxyConfig {
+    const KIND: ServiceKind = ServiceKind::ApiProxy;
+    type Params = OpenApiProxyParams;
+    type Launch = ApiProxyStartOptions;
+
+    fn requested_name(params: &Self::Params) -> String {
+        params.name.clone()
+    }
+
+    fn lookup(daemon: &DaemonState, name: &str) -> Option<Self> {
+        daemon.api_proxies.get(name).cloned()
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn cred_id(&self) -> Option<&str> {
+        api_proxy_cred_id(self)
+    }
+
+    fn target_url(&self) -> String {
+        self.upstream.clone()
+    }
+
+    fn build_launch(&self, credential: &ResolvedCredential) -> Result<Self::Launch, ErrorCode> {
+        if let Some(oauth) = &self.oauth {
+            return build_oauth_start(&self.value, oauth, credential);
+        }
+        Ok(ApiProxyStartOptions {
+            value_template: None,
+            header_value: Some(Zeroizing::new(
+                self.value
+                    .replace(API_PROXY_SECRET_PLACEHOLDER, credential.password.as_str()),
+            )),
+            oauth: None,
+        })
+    }
+
+    async fn start_executor(
+        &self,
+        settings: &ServiceLaunchSettings,
+        launch: Self::Launch,
+    ) -> Result<(u16, String, ExecutorHandle), ErrorCode> {
+        start_api_proxy_executor(settings, self, launch).await
+    }
+
+    fn open_result(session_id: &str, port: u16, secret: &str) -> Value {
+        json!({ "session_id": session_id, "base_url": format!("http://127.0.0.1:{port}/{secret}") })
+    }
+}
+
+impl HostedService for McpServerConfig {
+    const KIND: ServiceKind = ServiceKind::McpServer;
+    type Params = OpenMcpServerParams;
+    type Launch = McpServerLaunch;
+
+    fn requested_name(params: &Self::Params) -> String {
+        params.name.clone()
+    }
+
+    fn lookup(daemon: &DaemonState, name: &str) -> Option<Self> {
+        daemon.mcp_servers.get(name).cloned()
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn cred_id(&self) -> Option<&str> {
+        Some(&self.cred_id)
+    }
+
+    fn target_url(&self) -> String {
+        format!("mcp:{}", self.name)
+    }
+
+    fn build_launch(&self, credential: &ResolvedCredential) -> Result<Self::Launch, ErrorCode> {
+        build_mcp_server_launch(&self.env, credential)
+    }
+
+    async fn start_executor(
+        &self,
+        settings: &ServiceLaunchSettings,
+        launch: Self::Launch,
+    ) -> Result<(u16, String, ExecutorHandle), ErrorCode> {
+        start_mcp_server_executor(settings, self, launch).await
+    }
+
+    fn open_result(session_id: &str, port: u16, secret: &str) -> Value {
+        json!({ "session_id": session_id, "port": port, "stream_secret": secret })
+    }
 }
 
 /// executor 接続 1 本を占有するサービスの種類。リースの解放要求とイベント行の扱いを決める。
@@ -2737,6 +2867,43 @@ impl ServiceKind {
         match self {
             Self::ApiProxy => sessions::LeaseTarget::ApiProxy,
             Self::McpServer => sessions::LeaseTarget::McpServer,
+        }
+    }
+
+    /// サービスを開く RPC 名。承認ゲートへ渡す。
+    fn open_method(self) -> &'static str {
+        match self {
+            Self::ApiProxy => "open_api_proxy",
+            Self::McpServer => "open_mcp_server",
+        }
+    }
+
+    fn start_key(self, principal: String, name: String) -> sessions::StartKey {
+        match self {
+            Self::ApiProxy => sessions::StartKey::ApiProxy { principal, name },
+            Self::McpServer => sessions::StartKey::McpServer { principal, name },
+        }
+    }
+
+    /// 設定上の名前を、種類に応じた監査項目（`proxy` または `mcp_server`）に載せた値を返す。
+    fn named_audit_fields(self, name: String) -> AuditFields {
+        let name = Some(name);
+        let (proxy, mcp_server) = match self {
+            Self::ApiProxy => (name, None),
+            Self::McpServer => (None, name),
+        };
+        AuditFields {
+            proxy,
+            mcp_server,
+            ..AuditFields::default()
+        }
+    }
+
+    /// 停止要求の op と応答待ちの上限。
+    fn stop_request(self) -> (&'static str, Duration) {
+        match self {
+            Self::ApiProxy => ("api_proxy_stop", API_PROXY_STOP_TIMEOUT),
+            Self::McpServer => ("mcp_server_stop", MCP_SERVER_STOP_TIMEOUT),
         }
     }
 }
@@ -2830,114 +2997,6 @@ async fn register_service_lease(
         }),
     );
     Ok(session_id)
-}
-
-/// 設定済みの MCP サーバーを専用の executor 接続で起動し、排他リースとして登録する。
-///
-/// 監査項目は agent が params に添えた値ではなく、名前で引いた設定の値から確定する。
-async fn open_mcp_server(
-    request: &RpcRequest,
-    state: SharedState,
-    peer: &PeerIdentity,
-) -> HandledRequest {
-    let params = match parse_params::<OpenMcpServerParams>(&request.params) {
-        Ok(params) => params,
-        Err(error) => return classified(request.id.clone(), error),
-    };
-    let Some(server) = state.lock().await.mcp_servers.get(&params.name).cloned() else {
-        return classified(request.id.clone(), ErrorCode::NotFound);
-    };
-    let cred_id = server.cred_id.clone();
-    let target_url = format!("mcp:{}", server.name);
-    let mut fields = AuditFields {
-        cred_id: Some(cred_id.clone()),
-        target_url: Some(target_url.clone()),
-        namespace: cred_id
-            .split_once(':')
-            .map(|(namespace, _)| namespace.to_owned()),
-        mcp_server: Some(server.name.clone()),
-        ..AuditFields::default()
-    };
-    let Some((namespace, _)) = cred_id.split_once(':') else {
-        return classified(request.id.clone(), ErrorCode::InvalidCredential)
-            .with_audit_fields(fields);
-    };
-    let namespace = namespace.to_owned();
-    let grant = match gate_on_approval(&state, &cred_id, &target_url, "open_mcp_server", peer).await
-    {
-        Ok(grant) => grant,
-        Err(error) => return classified(request.id.clone(), error).with_audit_fields(fields),
-    };
-    match start_mcp_server_session(&state, peer, server, cred_id, namespace).await {
-        Ok((session_id, port, stream_secret)) => {
-            fields.session_id = Some(session_id.clone());
-            success(
-                request.id.clone(),
-                json!({ "session_id": session_id, "port": port, "stream_secret": stream_secret }),
-            )
-            .with_audit_fields(fields)
-        }
-        Err(error) => classified(request.id.clone(), error).with_audit_fields(fields),
-    }
-    .with_audit_approval_grant(grant)
-}
-
-/// 承認ゲートを通過した MCP サーバーを起動制御を経て起動し、リースを登録して
-/// `(session_id, port, stream_secret)` を返す。`cred_id` と `namespace` は承認対象から分割済みの値である。
-async fn start_mcp_server_session(
-    state: &SharedState,
-    peer: &PeerIdentity,
-    server: McpServerConfig,
-    cred_id: String,
-    namespace: String,
-) -> Result<(String, u16, String), ErrorCode> {
-    let start_gate = start_control(
-        state,
-        sessions::StartKey::McpServer {
-            principal: peer.principal(),
-            name: server.name.clone(),
-        },
-    )
-    .await;
-    let mut start_guard = start_gate.lock().await;
-    if start_guard.is_limited(Instant::now()) {
-        return Err(ErrorCode::RateLimited);
-    }
-    let credential = resolve_unlocked_credential(state, &cred_id).await?;
-    let settings = service_launch_settings(state).await;
-    let launch = build_mcp_server_launch(&server.env, &credential)?;
-    drop(credential);
-    start_guard.record_attempt(Instant::now());
-    let started_at = Instant::now();
-    let (port, stream_secret, executor) =
-        match start_mcp_server_executor(&settings, &server, launch).await {
-            Ok(result) => {
-                start_guard.record_success();
-                result
-            }
-            Err(error) => {
-                start_guard.record_failure(Instant::now());
-                return Err(error);
-            }
-        };
-    let deadline = started_at + settings.browser_max_lifetime;
-    drop(start_guard);
-    let session_id = register_service_lease(
-        state,
-        peer,
-        executor,
-        ServiceLease {
-            kind: ServiceKind::McpServer,
-            name: server.name,
-            cred_id,
-            namespace,
-            port,
-            ttl: settings.session_ttl,
-            deadline,
-        },
-    )
-    .await?;
-    Ok((session_id, port, stream_secret))
 }
 
 /// サービスの起動に用いる executor の起動経路とリースの寿命の設定。
@@ -4124,7 +4183,7 @@ fn parse_mcp_server_start_response(line: &str) -> Result<(u16, String), ErrorCod
         .ok_or(ErrorCode::Internal)?;
     let stream_secret = response
         .stream_secret
-        .filter(|secret| valid_api_proxy_secret(secret))
+        .filter(|secret| valid_base64url_secret(secret))
         .ok_or(ErrorCode::Internal)?;
     Ok((port, stream_secret))
 }
@@ -4156,13 +4215,17 @@ fn parse_api_proxy_start_response(
         .ok_or(ErrorCode::Internal)?;
     let secret = response
         .secret
-        .filter(|secret| valid_api_proxy_secret(secret))
+        .filter(|secret| valid_base64url_secret(secret))
         .ok_or(ErrorCode::Internal)?;
     Ok((port, secret))
 }
 
-/// path secret は base_url の 1 セグメントとしてそのまま埋め込むため、base64url の文字だけを受け入れる。
-fn valid_api_proxy_secret(secret: &str) -> bool {
+/// executor が返す秘密値が、空でない base64url の文字列であるかを判定する。
+///
+/// 注入プロキシの path secret は base_url の 1 セグメントとして、MCP サーバーの stream secret は
+/// 中継への接続でランナーが最初に送る 1 行として、いずれも加工せずにそのまま用いる。区切り文字や改行が
+/// 混入して解釈が変わることを避けるため、base64url の文字だけを受け入れる。
+fn valid_base64url_secret(secret: &str) -> bool {
     !secret.is_empty()
         && secret
             .chars()
@@ -4310,34 +4373,18 @@ async fn executor_release(
     })
 }
 
-async fn executor_api_proxy_stop(connection: &Arc<ExecutorConnection>) -> Result<(), ErrorCode> {
+/// サービスの種類に応じた停止要求を送り、応答が `ok: true` であるかを確かめる。
+async fn executor_service_stop(
+    connection: &Arc<ExecutorConnection>,
+    kind: ServiceKind,
+) -> Result<(), ErrorCode> {
+    let (op, stop_timeout) = kind.stop_request();
     let response = executor_request(
         connection,
-        |id| ExecutorApiProxyStopRequest {
-            op: "api_proxy_stop",
-            id,
-        },
-        API_PROXY_STOP_TIMEOUT,
+        |id| ExecutorServiceStopRequest { op, id },
+        stop_timeout,
     )
     .await?;
-    stop_response_ok(&response)
-}
-
-async fn executor_mcp_server_stop(connection: &Arc<ExecutorConnection>) -> Result<(), ErrorCode> {
-    let response = executor_request(
-        connection,
-        |id| ExecutorMcpServerStopRequest {
-            op: "mcp_server_stop",
-            id,
-        },
-        MCP_SERVER_STOP_TIMEOUT,
-    )
-    .await?;
-    stop_response_ok(&response)
-}
-
-/// サービスの停止要求への応答が `ok: true` であるかを確かめる。
-fn stop_response_ok(response: &Value) -> Result<(), ErrorCode> {
     (response.get("ok").and_then(Value::as_bool) == Some(true))
         .then_some(())
         .ok_or(ErrorCode::Internal)
@@ -4352,8 +4399,12 @@ async fn release_lease(
         sessions::LeaseTarget::Tab(target_id) => {
             executor_release(connection, target_id.clone()).await
         }
-        sessions::LeaseTarget::ApiProxy => executor_api_proxy_stop(connection).await,
-        sessions::LeaseTarget::McpServer => executor_mcp_server_stop(connection).await,
+        sessions::LeaseTarget::ApiProxy => {
+            executor_service_stop(connection, ServiceKind::ApiProxy).await
+        }
+        sessions::LeaseTarget::McpServer => {
+            executor_service_stop(connection, ServiceKind::McpServer).await
+        }
     }
 }
 
@@ -4470,18 +4521,11 @@ struct ServiceEventContext {
 impl ServiceEventContext {
     /// セッションに共通する監査項目（資格・セッション・namespace・サービス名）を埋めた値を返す。
     fn audit_fields(&self) -> AuditFields {
-        let name = Some(self.name.clone());
-        let (proxy, mcp_server) = match self.kind {
-            ServiceKind::ApiProxy => (name, None),
-            ServiceKind::McpServer => (None, name),
-        };
         AuditFields {
             cred_id: Some(self.cred_id.clone()),
             session_id: Some(self.session_id.clone()),
             namespace: Some(self.namespace.clone()),
-            proxy,
-            mcp_server,
-            ..AuditFields::default()
+            ..self.kind.named_audit_fields(self.name.clone())
         }
     }
 }
@@ -4505,27 +4549,12 @@ async fn handle_service_event(state: &SharedState, context: &ServiceEventContext
 /// リースの終了は executor への停止要求を伴い、その応答はこのイベントを読んだ reaper が受け渡す。
 /// 同じタスクで待つと応答を読む者がいなくなるため、終了処理は別タスクで行う。
 async fn handle_mcp_server_event(state: &SharedState, context: &ServiceEventContext, event: Value) {
-    let Ok(event) = serde_json::from_value::<ExecutorMcpServerEvent>(event) else {
+    let parsed = serde_json::from_value::<ExecutorMcpServerEvent>(event).ok();
+    let Some((event, (end_reason, outcome, exit_code))) =
+        parsed.and_then(|event| classify_mcp_server_event(&event).map(|effect| (event, effect)))
+    else {
         eprintln!("tegatad: ignored an unrecognized executor event");
         return;
-    };
-    if event.event != "mcp_server" {
-        eprintln!("tegatad: ignored an unrecognized executor event");
-        return;
-    }
-    let (end_reason, outcome) = match event.action.as_str() {
-        "connected" => (None, "ok"),
-        "exit" => (Some("mcp_server_exit"), "ok"),
-        "leak" => (Some("mcp_server_leak"), "leak"),
-        _ => {
-            eprintln!("tegatad: ignored an unrecognized executor event");
-            return;
-        }
-    };
-    let exit_code = if event.action == "exit" {
-        event.exit_code
-    } else {
-        None
     };
     let fields = AuditFields {
         mcp_action: Some(event.action),
@@ -4539,6 +4568,22 @@ async fn handle_mcp_server_event(state: &SharedState, context: &ServiceEventCont
         tokio::spawn(async move {
             end_service_lease(&state, &browser_id, reason).await;
         });
+    }
+}
+
+/// MCP サーバーのイベント行を `(リースの終了理由, 監査の outcome, exit_code)` に対応づける。
+/// `exit_code` は `exit` でのみ監査へ載せる。認識できない行は `None` とする。
+fn classify_mcp_server_event(
+    event: &ExecutorMcpServerEvent,
+) -> Option<(Option<&'static str>, &'static str, Option<i64>)> {
+    if event.event != "mcp_server" {
+        return None;
+    }
+    match event.action.as_str() {
+        "connected" => Some((None, "ok", None)),
+        "exit" => Some((Some("mcp_server_exit"), "ok", event.exit_code)),
+        "leak" => Some((Some("mcp_server_leak"), "leak", None)),
+        _ => None,
     }
 }
 
@@ -4629,7 +4674,7 @@ fn audit_proxy_path(path: &str) -> String {
     let mut sanitized = match path.strip_prefix('/') {
         Some(rest) => {
             let (segment, tail) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-            if segment.len() == API_PROXY_SECRET_LEN && valid_api_proxy_secret(segment) {
+            if segment.len() == API_PROXY_SECRET_LEN && valid_base64url_secret(segment) {
                 format!("/[redacted]{tail}")
             } else {
                 path.to_owned()
@@ -4969,6 +5014,111 @@ mod mcp_server_launch_tests {
         let (rendered, scanned) = render_mcp_env_value("{{other}} ä {{", &values);
         assert_eq!(rendered.as_str(), "{{other}} ä {{");
         assert!(!scanned);
+    }
+}
+
+#[cfg(test)]
+mod mcp_server_config_tests {
+    use super::{McpServerConfig, validate_mcp_servers};
+    use std::collections::BTreeMap;
+
+    fn server() -> McpServerConfig {
+        McpServerConfig {
+            name: "fx".to_owned(),
+            cred_id: "mock:site".to_owned(),
+            command: "/bin/server".to_owned(),
+            args: vec!["--stdio".to_owned()],
+            env: BTreeMap::from([("TOKEN".to_owned(), "{{secret}}".to_owned())]),
+        }
+    }
+
+    fn rejection(server: McpServerConfig) -> String {
+        validate_mcp_servers(&[server]).expect_err("invalid mcp_server accepted")
+    }
+
+    #[test]
+    fn valid_mcp_server_is_accepted() {
+        validate_mcp_servers(&[server()]).expect("valid mcp_server rejected");
+    }
+
+    #[test]
+    fn mcp_server_rejects_nul_in_command_args_and_env() {
+        let mut command = server();
+        command.command = "/bin/ser\0ver".to_owned();
+        let mut args = server();
+        args.args.push("a\0b".to_owned());
+        let mut env_name = server();
+        env_name.env.insert("NA\0ME".to_owned(), "value".to_owned());
+        let mut env_value = server();
+        env_value
+            .env
+            .insert("OTHER".to_owned(), "va\0lue".to_owned());
+        for invalid in [command, args, env_name, env_value] {
+            assert!(rejection(invalid).contains("must not contain NUL"));
+        }
+    }
+
+    #[test]
+    fn mcp_server_rejects_empty_env_names_and_names_with_equals() {
+        let mut empty = server();
+        empty.env.insert(String::new(), "value".to_owned());
+        let mut equals = server();
+        equals.env.insert("A=B".to_owned(), "value".to_owned());
+        for invalid in [empty, equals] {
+            assert!(rejection(invalid).contains("env names must not be empty or contain '='"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod mcp_server_executor_tests {
+    use super::{
+        ExecutorMcpServerEvent, classify_mcp_server_event, parse_mcp_server_start_response,
+    };
+
+    #[test]
+    fn start_response_ignores_an_error_field() {
+        let (port, secret) = parse_mcp_server_start_response(
+            r#"{"id":1,"ok":true,"port":4000,"stream_secret":"abc_-9","error":"INTERNAL"}"#,
+        )
+        .unwrap_or_else(|_| panic!("start response with an error field rejected"));
+        assert_eq!(port, 4000);
+        assert_eq!(secret, "abc_-9");
+        assert!(
+            parse_mcp_server_start_response(r#"{"id":1,"ok":false,"error":"INTERNAL"}"#).is_err()
+        );
+    }
+
+    fn event(event: &str, action: &str, exit_code: Option<i64>) -> ExecutorMcpServerEvent {
+        ExecutorMcpServerEvent {
+            event: event.to_owned(),
+            action: action.to_owned(),
+            exit_code,
+        }
+    }
+
+    #[test]
+    fn events_map_to_reason_outcome_and_exit_code() {
+        assert_eq!(
+            classify_mcp_server_event(&event("mcp_server", "connected", Some(1))),
+            Some((None, "ok", None))
+        );
+        assert_eq!(
+            classify_mcp_server_event(&event("mcp_server", "exit", Some(3))),
+            Some((Some("mcp_server_exit"), "ok", Some(3)))
+        );
+        assert_eq!(
+            classify_mcp_server_event(&event("mcp_server", "leak", Some(1))),
+            Some((Some("mcp_server_leak"), "leak", None))
+        );
+        assert_eq!(
+            classify_mcp_server_event(&event("mcp_server", "other", None)),
+            None
+        );
+        assert_eq!(
+            classify_mcp_server_event(&event("api_proxy_request", "exit", None)),
+            None
+        );
     }
 }
 

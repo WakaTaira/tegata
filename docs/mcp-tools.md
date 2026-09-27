@@ -60,6 +60,7 @@ the public code format; arbitrary daemon text is normalised to `INTERNAL`.
 | `INVALID_CREDENTIAL` | The credential does not exist, or the site rejected the login |
 | `MFA_REQUIRED` | The login needs a TOTP code and the credential has no seed |
 | `SELECTOR_NOT_FOUND` | A login step's selector did not resolve within the step timeout |
+| `FILL_MISMATCH` | A secret fill was refused or rolled back: `{{password}}` targeted a non-password input, or the page changed another field / the value did not stick; explicit steps include `step` |
 | `LOGIN_RESULT_TIMEOUT` | All login steps ran, but the executor could not tell within the wait window whether the login worked; no browser is handed back. Also returned by `authorize_device` when its login stage cannot be judged. |
 | `OAUTH_GRANT_FAILED` | The OAuth device-code grant behind an `open_api_proxy` failed: the device authorization or token endpoint refused, the grant was denied or expired, or polling ran out of time. |
 | `DEVICE_CODE_REJECTED` | The device authorization page rejected the user code |
@@ -188,12 +189,14 @@ in the namespace.
 
 ### Steps and the placeholder contract
 
-A step is either a `fill` or a `click`:
+A step is a `fill`, `click`, or `wait_for`:
 
 ```json
 {
   "steps": [
     { "action": "fill",  "selector": "#username", "value": "{{username}}" },
+    { "action": "click", "selector": "#next" },
+    { "action": "wait_for", "selector": "#password" },
     { "action": "fill",  "selector": "#password", "value": "{{password}}" },
     { "action": "click", "selector": "button[type=submit]" }
   ]
@@ -203,7 +206,21 @@ A step is either a `fill` or a `click`:
 A `fill` step's `value` must be exactly one of `{{username}}`, `{{password}}`, or
 `{{totp}}`. No other value is accepted — not a literal, not a partial string. The
 schema rejects anything else before the call leaves the agent's machine, and the
-executor rejects it again on the far side.
+executor rejects it again on the far side. The `{{password}}` placeholder may
+only target `input[type=password]`; a mismatch returns `FILL_MISMATCH` without
+filling the element.
+
+Every fill, including automatic fills and `{{user_code}}`, waits for its element
+to be visible and sets its value directly through the element's native setter,
+then dispatches `input` and `change` events and verifies the result. It does not
+focus the element or send keystrokes, so a page that moves focus cannot redirect
+a secret into another field. Sites that rely on keystroke events may need a click
+or another step afterwards if they validate on key events.
+
+`wait_for` has no `value` and waits for its selector to become visible. It uses
+the same 10-second per-step timeout as selector resolution and returns
+`SELECTOR_NOT_FOUND` on timeout. It is available in `login`, `authorize_device`,
+and OAuth-proxy device steps.
 
 This is what makes the step list safe to accept from an agent. The agent describes
 *where* each value goes; it can neither supply a value nor construct a step that
@@ -309,14 +326,15 @@ When `steps` is omitted, tegata uses the credential's login heuristic, opens
 `input[type=text]`, submits with `button[type=submit]`, clicks the first matching
 `Authorize`, `Continue`, or `Approve` button, and waits for `success_selector`.
 Explicit steps have the same placeholder restriction as `login`, with
-`{{user_code}}` additionally allowed.
+`{{user_code}}` additionally allowed. `wait_for` is also accepted in these
+steps.
 
 **Output**: `{"ok": true}`
 
 The browser is dedicated to this call, closes when it completes, and never
 returns a CDP channel. Login-stage failures use `INVALID_CREDENTIAL`,
-`MFA_REQUIRED`, or `SELECTOR_NOT_FOUND`. After `verification_url` is opened,
-selector and timeout failures return `INTERNAL`; a matching `failure_selector`
+`MFA_REQUIRED`, `SELECTOR_NOT_FOUND`, or `FILL_MISMATCH`. After `verification_url`
+is opened, selector, fill, and timeout failures return `INTERNAL`; a matching `failure_selector`
 returns `DEVICE_CODE_REJECTED`, including when it renders while a step is still
 waiting for its selector. Approval hooks can also return `APPROVAL_DENIED`
 or `APPROVAL_TIMEOUT`.

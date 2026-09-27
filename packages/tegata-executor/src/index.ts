@@ -6,7 +6,12 @@ import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
-import { type Browser, chromium, type Page } from "playwright-core";
+import {
+  type Browser,
+  chromium,
+  type Locator,
+  type Page,
+} from "playwright-core";
 import {
   type ApiProxy,
   type ApiProxyRequestRecord,
@@ -52,8 +57,13 @@ type ClickStep = {
   selector: string;
 };
 
-type LoginStep = FillStep | ClickStep;
-type DeviceStep = DeviceFillStep | ClickStep;
+type WaitForStep = {
+  action: "wait_for";
+  selector: string;
+};
+
+type LoginStep = FillStep | ClickStep | WaitForStep;
+type DeviceStep = DeviceFillStep | ClickStep | WaitForStep;
 
 type RequestId = number;
 
@@ -150,6 +160,7 @@ type ErrorCode =
   | "INVALID_CREDENTIAL"
   | "MFA_REQUIRED"
   | "SELECTOR_NOT_FOUND"
+  | "FILL_MISMATCH"
   | "VAULT_LOCKED"
   | "RATE_LIMITED"
   | "TOTP_NOT_EXPOSABLE"
@@ -159,6 +170,12 @@ type ErrorCode =
   | "INTERNAL";
 
 export class SelectorNotFoundError extends Error {
+  constructor(readonly stepIndex?: number) {
+    super();
+  }
+}
+
+export class FillMismatchError extends Error {
   constructor(readonly stepIndex?: number) {
     super();
   }
@@ -292,13 +309,15 @@ export function classifyError(
   }
   return error instanceof SelectorNotFoundError
     ? "SELECTOR_NOT_FOUND"
-    : error instanceof InvalidCredentialError
-      ? "INVALID_CREDENTIAL"
-      : error instanceof MfaRequiredError
-        ? "MFA_REQUIRED"
-        : error instanceof LoginResultTimeoutError
-          ? "LOGIN_RESULT_TIMEOUT"
-          : "INTERNAL";
+    : error instanceof FillMismatchError
+      ? "FILL_MISMATCH"
+      : error instanceof InvalidCredentialError
+        ? "INVALID_CREDENTIAL"
+        : error instanceof MfaRequiredError
+          ? "MFA_REQUIRED"
+          : error instanceof LoginResultTimeoutError
+            ? "LOGIN_RESULT_TIMEOUT"
+            : "INTERNAL";
 }
 
 type ClassifiedExecutionError = {
@@ -311,10 +330,13 @@ function classifyExecutionError(
   stage: ExecutionStage,
 ): ClassifiedExecutionError {
   const code = classifyError(error, stage);
-  return code === "SELECTOR_NOT_FOUND" &&
-    error instanceof SelectorNotFoundError &&
-    error.stepIndex !== undefined
-    ? { code, step: error.stepIndex }
+  const stepIndex =
+    error instanceof SelectorNotFoundError || error instanceof FillMismatchError
+      ? error.stepIndex
+      : undefined;
+  return (code === "SELECTOR_NOT_FOUND" || code === "FILL_MISMATCH") &&
+    stepIndex !== undefined
+    ? { code, step: stepIndex }
     : { code };
 }
 
@@ -659,8 +681,8 @@ function parseDeviceSteps(value: unknown, id?: RequestId): DeviceStep[] | null {
     if (!isRecord(step) || typeof step.selector !== "string") {
       throw new InvalidRequestError(id);
     }
-    if (step.action === "click") {
-      return { action: "click", selector: step.selector };
+    if (step.action === "click" || step.action === "wait_for") {
+      return { action: step.action, selector: step.selector };
     }
     if (step.action === "fill" && isDevicePlaceholder(step.value)) {
       return { action: "fill", selector: step.selector, value: step.value };
@@ -875,8 +897,8 @@ export function parseRequest(line: string): Request {
       if (!isRecord(step) || typeof step.selector !== "string") {
         throw new InvalidRequestError(id);
       }
-      if (step.action === "click") {
-        return { action: "click", selector: step.selector };
+      if (step.action === "click" || step.action === "wait_for") {
+        return { action: step.action, selector: step.selector };
       }
       if (step.action === "fill" && isSecretPlaceholder(step.value)) {
         return {
@@ -1259,18 +1281,214 @@ function isTimeoutError(error: unknown): boolean {
   return error instanceof Error && error.name === "TimeoutError";
 }
 
-async function fill(
-  page: Page,
-  selector: string,
-  value: string,
+/** 入力の結果。他の欄の値を page の外へ持ち出さないよう、比較は page 内で行い結果の種別のみを返す。 */
+type FillStatus = "ok" | "not_password" | "not_fillable" | "mismatch";
+
+type FillArguments = { value: string; passwordOnly: boolean };
+
+/**
+ * page 内で実行する入力処理。Playwright の fill はフォーカス → 全選択 → 文字挿入の順で行うため、
+ * 入力中にフォーカスを移すサイトでは別の欄へ秘密が入る。そこでフォーカスに依存せず、
+ * 要素のネイティブな value setter で直接設定し、同じ文書の他の欄が変化していないことを検証する。
+ * page へシリアライズされるため、外部の識別子を参照してはならない。
+ *
+ * page 側の getter・setter は例外を送出することがあり、その文言には欄の値が含まれうる。
+ * 例外を page の外へ伝播させるとその文言が stderr へ達し、また残留した秘密の消去も行われないため、
+ * 例外はすべて捕捉して結果の種別へ変換し、値を設定した後であれば消去を行ってから返す。
+ */
+async function setValueInPage(
+  element: Element,
+  { value, passwordOnly }: FillArguments,
+): Promise<FillStatus> {
+  type Field = HTMLInputElement | HTMLTextAreaElement;
+  const resolveView = () => {
+    try {
+      return element.ownerDocument.defaultView;
+    } catch {
+      return undefined;
+    }
+  };
+  const view = resolveView();
+  if (view === undefined) return "mismatch";
+  if (view === null) return "not_fillable";
+  // フレーム内の要素は、そのフレームの window のコンストラクタでのみ判定できる。
+  const isInput = (target: Element): target is HTMLInputElement =>
+    target instanceof view.HTMLInputElement;
+  const isTextArea = (target: Element): target is HTMLTextAreaElement =>
+    target instanceof view.HTMLTextAreaElement;
+  const resolveTarget = (): Field | FillStatus => {
+    try {
+      if (passwordOnly && !(isInput(element) && element.type === "password")) {
+        return "not_password";
+      }
+      if (isInput(element) || isTextArea(element)) return element;
+      return "not_fillable";
+    } catch {
+      return "mismatch";
+    }
+  };
+  const resolved = resolveTarget();
+  if (typeof resolved === "string") return resolved;
+  const target: Field = resolved;
+  const setNativeValue = (field: Field, next: string): void => {
+    const prototype = isInput(field)
+      ? view.HTMLInputElement.prototype
+      : view.HTMLTextAreaElement.prototype;
+    Object.getOwnPropertyDescriptor(prototype, "value")?.set?.call(field, next);
+    field.dispatchEvent(new view.Event("input", { bubbles: true }));
+    field.dispatchEvent(new view.Event("change", { bubbles: true }));
+  };
+  // closed な shadow root は page 側から辿れないため、その内側の欄は検証の対象外となる。
+  const collectFields = (
+    root: Document | ShadowRoot,
+    into: Field[],
+  ): Field[] => {
+    for (const node of Array.from(root.querySelectorAll("*"))) {
+      if (isInput(node) || isTextArea(node)) into.push(node);
+      if (node.shadowRoot !== null) collectFields(node.shadowRoot, into);
+    }
+    return into;
+  };
+  const otherFields = (): Field[] =>
+    collectFields(target.ownerDocument, []).filter((field) => field !== target);
+  // 入力前に存在しなかった欄は、空であることを期待値とする。
+  let expected: Map<Field, string>;
+  try {
+    expected = new Map<Field, string>();
+    for (const field of otherFields()) expected.set(field, field.value);
+  } catch {
+    return "mismatch";
+  }
+  const changedFields = (): Field[] =>
+    otherFields().filter(
+      (field) => field.value !== (expected.get(field) ?? ""),
+    );
+  // queueMicrotask や setTimeout(0) で遅延された page 側の変更を、比較の前に反映させる。
+  const yieldToPage = (): Promise<void> =>
+    new Promise((resolve) => {
+      view.setTimeout(resolve, 0);
+    });
+  // 値または期待値を読めない欄は秘密が残っていないことを確認できないため、残留とみなす。
+  const isResidual = (field: Field): boolean => {
+    try {
+      const want = field === target ? "" : (expected.get(field) ?? "");
+      return field.value !== want;
+    } catch {
+      return true;
+    }
+  };
+  const residualFields = (): Field[] => {
+    let others: Field[] = [];
+    try {
+      others = otherFields();
+    } catch {
+      // 欄の列挙に失敗しても、入力先の欄は消去の対象とする。
+    }
+    return [
+      ...(isResidual(target) ? [target] : []),
+      ...others.filter(isResidual),
+    ];
+  };
+  const clearField = (field: Field): void => {
+    try {
+      setNativeValue(field, "");
+    } catch {
+      // 1 つの欄の失敗で、他の欄の消去を止めない。
+    }
+  };
+  // 秘密が意図しない欄に残ったまま送信されないよう、変化した欄をすべて空にする。
+  // 空にした際のイベントで page が値を書き戻しうるため、回数を区切って再検証する。
+  const clearResidualFields = async (): Promise<void> => {
+    for (let pass = 0; pass < 3; pass += 1) {
+      const residual = residualFields();
+      if (residual.length === 0) return;
+      for (const field of residual) {
+        clearField(field);
+        if (field === target) continue;
+        try {
+          expected.set(field, "");
+        } catch {
+          // 期待値を更新できない欄は、次の回でも残留とみなされ再び消去される。
+        }
+      }
+      try {
+        await yieldToPage();
+      } catch {
+        // 待機に失敗しても、残りの回数で再検証と消去を続ける。
+      }
+    }
+  };
+  try {
+    setNativeValue(target, value);
+    await yieldToPage();
+    if (target.value === value && changedFields().length === 0) return "ok";
+  } catch {
+    // 例外の文言は破棄し、秘密が残りうる欄の消去へ進む。
+  }
+  try {
+    await clearResidualFields();
+  } catch {
+    // 組み込みオブジェクトの改変などで消去の途中に例外が生じても、入力先の欄だけは空にする。
+    clearField(target);
+  }
+  return "mismatch";
+}
+
+async function waitForVisible(
+  locator: Locator,
   stepIndex?: number,
 ): Promise<void> {
   try {
-    await page.fill(selector, value, { timeout: 10_000 });
+    await locator.waitFor({ state: "visible", timeout: 10_000 });
   } catch (error) {
     if (isTimeoutError(error)) throw new SelectorNotFoundError(stepIndex);
     throw error;
   }
+}
+
+/** 可視になった要素へ値を設定し、設定の検証に失敗した場合は FillMismatchError とする。 */
+async function fillLocator(
+  locator: Locator,
+  value: string,
+  passwordOnly: boolean,
+  stepIndex?: number,
+): Promise<void> {
+  await waitForVisible(locator, stepIndex);
+  let status: FillStatus;
+  try {
+    status = await locator.evaluate(
+      setValueInPage,
+      { value, passwordOnly },
+      { timeout: 10_000 },
+    );
+  } catch (error) {
+    if (isTimeoutError(error)) throw new SelectorNotFoundError(stepIndex);
+    throw error;
+  }
+  if (status !== "ok") throw new FillMismatchError(stepIndex);
+}
+
+async function fill(
+  page: Page,
+  selector: string,
+  value: string,
+  passwordOnly: boolean,
+  stepIndex?: number,
+): Promise<void> {
+  await fillLocator(
+    page.locator(selector).first(),
+    value,
+    passwordOnly,
+    stepIndex,
+  );
+}
+
+async function waitForStep(
+  page: Page,
+  selector: string,
+  stepIndex: number,
+): Promise<void> {
+  await waitForVisible(page.locator(selector).first(), stepIndex);
 }
 
 async function click(
@@ -1316,6 +1534,26 @@ export interface RunStepsOptions {
   failureSelector?: string | null;
 }
 
+async function runStep(
+  page: Page,
+  step: LoginStep | DeviceStep,
+  stepIndex: number,
+  secret: LoginRequest["secret"],
+  userCode?: string,
+): Promise<void> {
+  if (step.action === "click") return click(page, step.selector, stepIndex);
+  if (step.action === "wait_for") {
+    return waitForStep(page, step.selector, stepIndex);
+  }
+  return fill(
+    page,
+    step.selector,
+    substituteSecrets(step.value, secret, userCode),
+    step.value === "{{password}}",
+    stepIndex,
+  );
+}
+
 export async function runSteps(
   page: Page,
   steps: LoginStep[] | DeviceStep[] | null,
@@ -1332,14 +1570,7 @@ export async function runSteps(
     }
     for (const [stepIndex, step] of steps.entries()) {
       await withRejectionCheck(page, failureSelector, () =>
-        step.action === "fill"
-          ? fill(
-              page,
-              step.selector,
-              substituteSecrets(step.value, secret, userCode),
-              stepIndex,
-            )
-          : click(page, step.selector, stepIndex),
+        runStep(page, step, stepIndex, secret, userCode),
       );
       await throwIfRejected(page, failureSelector);
     }
@@ -1360,17 +1591,13 @@ export async function runSteps(
     );
   });
   if (usernameIndex >= 0) {
-    try {
-      await page
-        .locator("input")
-        .nth(usernameIndex)
-        .fill(secret.username, { timeout: 10_000 });
-    } catch (error) {
-      if (isTimeoutError(error)) throw new SelectorNotFoundError();
-      throw error;
-    }
+    await fillLocator(
+      page.locator("input").nth(usernameIndex),
+      secret.username,
+      false,
+    );
   }
-  await fill(page, 'input[type="password"]', secret.password);
+  await fillLocator(password, secret.password, true);
 
   if (automaticTotp) {
     const totpSelectors = [
@@ -1565,12 +1792,7 @@ async function fillFirstMatching(
   for (const selector of selectors) {
     const locator = page.locator(selector);
     if ((await locator.count()) === 0) continue;
-    try {
-      await locator.first().fill(value, { timeout: 10_000 });
-    } catch (error) {
-      if (isTimeoutError(error)) throw new SelectorNotFoundError();
-      throw error;
-    }
+    await fillLocator(locator.first(), value, false);
     return;
   }
   throw new SelectorNotFoundError();

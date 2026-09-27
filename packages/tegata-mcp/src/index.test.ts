@@ -160,6 +160,24 @@ describe.sequential("login bridge", () => {
     }
   });
 
+  test("returns the fill mismatch step in structured content", async () => {
+    const fake = await startFakeServer(false, {
+      message: "FILL_MISMATCH",
+      data: { step: 2 },
+    });
+    delete process.env.TEGATA_BRIDGE;
+    try {
+      const result = await loginHandler({});
+      expect(result).toEqual({
+        isError: true,
+        content: [{ type: "text", text: "FILL_MISMATCH" }],
+        structuredContent: { error: "FILL_MISMATCH", step: 2 },
+      });
+    } finally {
+      await stopFakeServer(fake.server);
+    }
+  });
+
   test("preserves the endpoint when bridge mode is disabled", async () => {
     const fake = await startFakeServer();
     delete process.env.TEGATA_BRIDGE;

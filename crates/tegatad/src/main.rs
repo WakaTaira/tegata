@@ -632,6 +632,7 @@ enum ErrorCode {
     InvalidCredential,
     MfaRequired,
     SelectorNotFound,
+    FillMismatch,
     DeviceCodeRejected,
     LoginResultTimeout,
     VaultLocked,
@@ -655,6 +656,7 @@ impl ErrorCode {
             Self::InvalidCredential => "INVALID_CREDENTIAL",
             Self::MfaRequired => "MFA_REQUIRED",
             Self::SelectorNotFound => "SELECTOR_NOT_FOUND",
+            Self::FillMismatch => "FILL_MISMATCH",
             Self::DeviceCodeRejected => "DEVICE_CODE_REJECTED",
             Self::LoginResultTimeout => "LOGIN_RESULT_TIMEOUT",
             Self::VaultLocked => "VAULT_LOCKED",
@@ -3260,6 +3262,7 @@ fn valid_authorize_steps(steps: Option<&[tegata_core::wire::LoginStep]>) -> bool
     steps.is_none_or(|steps| {
         steps.iter().all(|step| match step.action.as_str() {
             "click" => step.value.is_none(),
+            "wait_for" => step.value.is_none(),
             "fill" => matches!(
                 step.value.as_deref(),
                 Some("{{username}}")
@@ -4239,7 +4242,7 @@ fn cdp_port_from_endpoint(endpoint: &str) -> Option<u16> {
 }
 
 fn selector_step(response: &ExecutorResponse, code: ErrorCode) -> Option<usize> {
-    if !matches!(code, ErrorCode::SelectorNotFound) {
+    if !matches!(code, ErrorCode::SelectorNotFound | ErrorCode::FillMismatch) {
         return None;
     }
     response
@@ -4255,6 +4258,7 @@ fn parse_error_code(value: &str) -> ErrorCode {
         "INVALID_CREDENTIAL" => ErrorCode::InvalidCredential,
         "MFA_REQUIRED" => ErrorCode::MfaRequired,
         "SELECTOR_NOT_FOUND" => ErrorCode::SelectorNotFound,
+        "FILL_MISMATCH" => ErrorCode::FillMismatch,
         "DEVICE_CODE_REJECTED" => ErrorCode::DeviceCodeRejected,
         "LOGIN_RESULT_TIMEOUT" => ErrorCode::LoginResultTimeout,
         "VAULT_LOCKED" => ErrorCode::VaultLocked,
@@ -4281,6 +4285,7 @@ fn parse_authorize_error_code(value: &str) -> ErrorCode {
         "INVALID_CREDENTIAL"
         | "MFA_REQUIRED"
         | "SELECTOR_NOT_FOUND"
+        | "FILL_MISMATCH"
         | "DEVICE_CODE_REJECTED"
         | "LOGIN_RESULT_TIMEOUT" => parse_error_code(value),
         _ => ErrorCode::Internal,
@@ -4902,7 +4907,7 @@ fn error_response_with_step(id: Value, error: ErrorCode, step: Option<usize>) ->
         error: Some(RpcError {
             code: CLASSIFICATION_ERROR,
             message: error.as_str().to_owned(),
-            data: if matches!(error, ErrorCode::SelectorNotFound) {
+            data: if matches!(error, ErrorCode::SelectorNotFound | ErrorCode::FillMismatch) {
                 step.map(|step| json!({ "step": step }))
             } else {
                 None
@@ -4913,7 +4918,11 @@ fn error_response_with_step(id: Value, error: ErrorCode, step: Option<usize>) ->
 
 #[cfg(all(test, unix))]
 mod tests {
-    use super::{AuditFields, AuditPeer, AuditRecord, PeerIdentity};
+    use super::{
+        AuditFields, AuditPeer, AuditRecord, ErrorCode, ExecutorResponse, PeerIdentity,
+        valid_authorize_steps,
+    };
+    use tegata_core::wire::LoginStep;
 
     #[test]
     fn audit_record_names_the_peer_by_its_transport_identity() {
@@ -4967,6 +4976,36 @@ mod tests {
         assert_eq!(super::api_proxy_outcome(404), "upstream_error");
         assert_eq!(super::api_proxy_outcome(500), "upstream_error");
         assert_eq!(super::api_proxy_outcome(502), "upstream_unreachable");
+    }
+
+    #[test]
+    fn wait_for_step_requires_no_value() {
+        let valid = LoginStep {
+            action: "wait_for".to_owned(),
+            selector: "#ready".to_owned(),
+            value: None,
+        };
+        let invalid = LoginStep {
+            value: Some("unexpected".to_owned()),
+            ..valid.clone()
+        };
+        assert!(valid_authorize_steps(Some(&[valid])));
+        assert!(!valid_authorize_steps(Some(&[invalid])));
+    }
+
+    #[test]
+    fn fill_mismatch_preserves_the_executor_step() {
+        let response = ExecutorResponse {
+            id: Some(1),
+            ok: false,
+            endpoint: None,
+            error: Some("FILL_MISMATCH".to_owned()),
+            step: Some(serde_json::json!(2)),
+            target_id: None,
+        };
+        let code = super::parse_error_code(response.error.as_deref().unwrap());
+        assert!(matches!(code, ErrorCode::FillMismatch));
+        assert_eq!(super::selector_step(&response, code), Some(2));
     }
 }
 

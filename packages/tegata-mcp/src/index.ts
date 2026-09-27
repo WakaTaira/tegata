@@ -16,6 +16,7 @@ const ERROR_CODES = [
   "INVALID_CREDENTIAL",
   "MFA_REQUIRED",
   "SELECTOR_NOT_FOUND",
+  "FILL_MISMATCH",
   "LOGIN_RESULT_TIMEOUT",
   "OAUTH_GRANT_FAILED",
   "DEVICE_CODE_REJECTED",
@@ -45,6 +46,10 @@ const loginStep = z.union([
     action: z.literal("click"),
     selector: z.string(),
   }),
+  z.object({
+    action: z.literal("wait_for"),
+    selector: z.string(),
+  }),
 ]);
 
 const authorizeDeviceStep = z.union([
@@ -60,6 +65,10 @@ const authorizeDeviceStep = z.union([
   }),
   z.object({
     action: z.literal("click"),
+    selector: z.string(),
+  }),
+  z.object({
+    action: z.literal("wait_for"),
     selector: z.string(),
   }),
 ]);

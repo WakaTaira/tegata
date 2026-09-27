@@ -3,11 +3,13 @@ import {
   classifyDeviceResult,
   classifyError,
   DeviceCodeRejectedError,
+  formatExecutorErrorLine,
   formatResponse,
   guardTargetCommands,
   headfulUserAgent,
   headfulUserAgentMetadata,
   InvalidCredentialError,
+  LoginResultTimeoutError,
   MfaRequiredError,
   parseRequest,
   runSteps,
@@ -26,6 +28,64 @@ describe("headfulUserAgent", () => {
   test("keeps a user agent without HeadlessChrome unchanged", () => {
     const userAgent = "Mozilla/5.0 Chrome/150.0.0.0 Safari/537.36";
     expect(headfulUserAgent(userAgent)).toBe(userAgent);
+  });
+});
+
+describe("executor error diagnostics", () => {
+  test("redacts request secrets and keeps only the first message line", () => {
+    const request = {
+      op: "authorize_device" as const,
+      login_url: "https://example.test/login",
+      verification_url: "https://example.test/device",
+      user_code: "ABCD-EFGH",
+      steps: null,
+      success_selector: "#success",
+      failure_selector: null,
+      secret: { username: "alice", password: "password", totp: "123456" },
+    };
+
+    const line = formatExecutorErrorLine(
+      request,
+      "login",
+      "INTERNAL",
+      new Error(
+        "alice/password/123456/ABCD-EFGH\nthis second line must not appear",
+      ),
+    );
+
+    expect(line).toBe(
+      `tegata-executor: error ${JSON.stringify({
+        op: "authorize_device",
+        stage: "login",
+        code: "INTERNAL",
+        name: "Error",
+        message: "[REDACTED]/[REDACTED]/[REDACTED]/[REDACTED]",
+      })}\n`,
+    );
+  });
+
+  test("truncates the message at 300 UTF-8 bytes on a character boundary", () => {
+    const request = {
+      op: "login" as const,
+      target_url: "https://example.test/login",
+      steps: null,
+      success_selector: null,
+      failure_selector: null,
+      secret: { username: "", password: "", totp: null },
+    };
+
+    const line = formatExecutorErrorLine(
+      request,
+      "login",
+      "LOGIN_RESULT_TIMEOUT",
+      new Error(`${"あ".repeat(101)}\nthis second line must not appear`),
+    );
+    const payload = JSON.parse(
+      line.slice("tegata-executor: error ".length).trimEnd(),
+    );
+
+    expect(payload.message).toBe("あ".repeat(100));
+    expect(Buffer.byteLength(payload.message, "utf8")).toBe(300);
   });
 });
 
@@ -248,6 +308,12 @@ describe("authorize_device protocol", () => {
       "INVALID_CREDENTIAL",
     );
     expect(classifyError(new MfaRequiredError(), "login")).toBe("MFA_REQUIRED");
+    expect(classifyError(new LoginResultTimeoutError(), "login")).toBe(
+      "LOGIN_RESULT_TIMEOUT",
+    );
+    expect(classifyError(new LoginResultTimeoutError(), "device")).toBe(
+      "INTERNAL",
+    );
     expect(classifyError(new SelectorNotFoundError(), "device")).toBe(
       "INTERNAL",
     );

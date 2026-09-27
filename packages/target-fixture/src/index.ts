@@ -210,6 +210,35 @@ function loggedInPage(): string {
   return '<!doctype html><html lang="en"><body><div id="welcome">login-ok</div></body></html>';
 }
 
+function withBusyPoll(page: string): string {
+  return page.replace(
+    "</body>",
+    `<script>
+const poll = () => fetch("/busy/poll").finally(poll);
+poll();
+</script>
+</body>`,
+  );
+}
+
+function busyLoginForm(error = false, totpEnabled = false): string {
+  return withBusyPoll(
+    loginForm(error, totpEnabled).replace(
+      'action="/login"',
+      'action="/busy/login"',
+    ),
+  );
+}
+
+function busyLoggedInPage(): string {
+  return withBusyPoll(
+    loggedInPage().replace(
+      '<div id="welcome">login-ok</div>',
+      '<div id="welcome">login-ok</div><input type="password" hidden>',
+    ),
+  );
+}
+
 function devicePage(): string {
   return `<!doctype html>
 <html lang="en">
@@ -262,6 +291,28 @@ function handleRequest(
   response: ServerResponse,
   credentials: Credentials,
 ): void {
+  if (request.method === "GET" && request.url === "/busy/poll") {
+    const timer = setTimeout(() => {
+      if (response.destroyed) return;
+      response.writeHead(204);
+      response.end();
+    }, 25_000);
+    timer.unref();
+    response.on("close", () => clearTimeout(timer));
+    return;
+  }
+
+  if (request.method === "GET" && request.url === "/busy/") {
+    const session = sessionFrom(request);
+    writePage(
+      response,
+      session !== undefined && sessions.has(session)
+        ? busyLoggedInPage()
+        : busyLoginForm(false, credentials.totp_seed !== undefined),
+    );
+    return;
+  }
+
   if (
     request.method === "GET" &&
     (request.url === "/" ||
@@ -315,7 +366,11 @@ function handleRequest(
     return;
   }
 
-  if (request.method === "POST" && request.url === "/login") {
+  if (
+    request.method === "POST" &&
+    (request.url === "/login" || request.url === "/busy/login")
+  ) {
+    const busy = request.url === "/busy/login";
     let body = "";
     request.setEncoding("utf8");
     request.on("data", (chunk: string) => {
@@ -331,13 +386,15 @@ function handleRequest(
       ) {
         const session = randomBytes(32).toString("hex");
         sessions.set(session, true);
-        writePage(response, loggedInPage(), {
+        writePage(response, busy ? busyLoggedInPage() : loggedInPage(), {
           "Set-Cookie": `session=${session}; HttpOnly; Path=/; SameSite=Lax`,
         });
       } else {
         writePage(
           response,
-          loginForm(true, credentials.totp_seed !== undefined),
+          busy
+            ? busyLoginForm(true, credentials.totp_seed !== undefined)
+            : loginForm(true, credentials.totp_seed !== undefined),
         );
       }
     });

@@ -93,6 +93,7 @@ type ErrorCode =
   | "RATE_LIMITED"
   | "TOTP_NOT_EXPOSABLE"
   | "DEVICE_CODE_REJECTED"
+  | "LOGIN_RESULT_TIMEOUT"
   | "INTERNAL";
 
 export class SelectorNotFoundError extends Error {
@@ -107,7 +108,63 @@ export class MfaRequiredError extends Error {}
 
 export class DeviceCodeRejectedError extends Error {}
 
+export class LoginResultTimeoutError extends Error {}
+
 type ExecutionStage = "login" | "device";
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  let bytes = 0;
+  let end = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maxBytes) break;
+    bytes += characterBytes;
+    end += character.length;
+  }
+  return value.slice(0, end);
+}
+
+function redactExecutorErrorMessage(
+  message: string,
+  secrets: Array<string | null | undefined>,
+): string {
+  const nonEmptySecrets = secrets.filter(
+    (secret): secret is string =>
+      secret !== undefined && secret !== null && secret !== "",
+  );
+  return [...new Set(nonEmptySecrets)]
+    .sort((left, right) => right.length - left.length)
+    .reduce(
+      (redacted, secret) => redacted.replaceAll(secret, "[REDACTED]"),
+      message,
+    );
+}
+
+export function formatExecutorErrorLine(
+  request: LoginRequest | AuthorizeDeviceRequest,
+  stage: ExecutionStage,
+  code: ErrorCode,
+  error: unknown,
+): string {
+  const message =
+    error instanceof Error ? error.message.split(/\r\n|[\r\n]/u, 1)[0] : "";
+  const secrets =
+    request.op === "login"
+      ? [request.secret.username, request.secret.password, request.secret.totp]
+      : [
+          request.secret.username,
+          request.secret.password,
+          request.secret.totp,
+          request.user_code,
+        ];
+  return `tegata-executor: error ${JSON.stringify({
+    op: request.op,
+    stage,
+    code,
+    name: error instanceof Error ? error.name : typeof error,
+    message: truncateUtf8(redactExecutorErrorMessage(message, secrets), 300),
+  })}\n`;
+}
 
 export function classifyError(
   error: unknown,
@@ -124,7 +181,9 @@ export function classifyError(
       ? "INVALID_CREDENTIAL"
       : error instanceof MfaRequiredError
         ? "MFA_REQUIRED"
-        : "INTERNAL";
+        : error instanceof LoginResultTimeoutError
+          ? "LOGIN_RESULT_TIMEOUT"
+          : "INTERNAL";
 }
 
 type ClassifiedExecutionError = {
@@ -150,6 +209,20 @@ function formatErrorResponse(error: ClassifiedExecutionError) {
     error: error.code,
     ...(error.step === undefined ? {} : { step: error.step }),
   };
+}
+
+function writeExecutorErrorLine(
+  request: LoginRequest | AuthorizeDeviceRequest,
+  stage: ExecutionStage,
+  error: ClassifiedExecutionError,
+  cause: unknown,
+): void {
+  if (error.code !== "INTERNAL" && error.code !== "LOGIN_RESULT_TIMEOUT") {
+    return;
+  }
+  process.stderr.write(
+    formatExecutorErrorLine(request, stage, error.code, cause),
+  );
 }
 
 let activeBrowser: Browser | undefined;
@@ -1086,6 +1159,8 @@ export async function runSteps(
 
 type WaitResult = "success" | "failure" | undefined;
 
+const DEFAULT_RESULT_SETTLE_MS = 10_000;
+
 async function waitForSelector(page: Page, selector: string): Promise<boolean> {
   try {
     await page.waitForSelector(selector, {
@@ -1141,7 +1216,7 @@ async function waitForLoginResult(
     "success" | "failure" | undefined
   > => {
     const networkIdleSettled = await page
-      .waitForLoadState("networkidle", { timeout: 15_000 })
+      .waitForLoadState("networkidle", { timeout: DEFAULT_RESULT_SETTLE_MS })
       .then(() => true)
       .catch(() => false);
     const { hasPasswordInput } = await page.evaluate((loadStateSettled) => {
@@ -1173,7 +1248,7 @@ async function waitForLoginResult(
     waitForDefaultResult,
   );
   if (result === "failure") throw new InvalidCredentialError();
-  if (result !== "success") throw new Error("login result timed out");
+  if (result !== "success") throw new LoginResultTimeoutError();
 }
 
 export function classifyDeviceResult(
@@ -1435,7 +1510,9 @@ async function executeAuthorizeDevice(
     }
     return undefined;
   } catch (error) {
-    return classifyExecutionError(error, stage);
+    const classified = classifyExecutionError(error, stage);
+    writeExecutorErrorLine(request, stage, classified, error);
+    return classified;
   }
 }
 
@@ -1591,10 +1668,10 @@ async function handleRelease(request: ReleaseRequest): Promise<void> {
 
 async function handleLogin(request: LoginRequest): Promise<void> {
   if (activeBrowser !== undefined) {
-    writeResponse(
-      { ok: false, error: "INTERNAL" satisfies ErrorCode },
-      request.id,
-    );
+    const error = new Error("browser is already active");
+    const classified = classifyExecutionError(error, "login");
+    writeExecutorErrorLine(request, "login", classified, error);
+    writeResponse(formatErrorResponse(classified), request.id);
     return;
   }
 
@@ -1603,6 +1680,7 @@ async function handleLogin(request: LoginRequest): Promise<void> {
     writeResponse({ ok: true, endpoint, target_id: targetId }, request.id);
   } catch (error) {
     const classified = classifyExecutionError(error, "login");
+    writeExecutorErrorLine(request, "login", classified, error);
     await cleanupResources();
     writeResponse(formatErrorResponse(classified), request.id);
   }
@@ -1612,10 +1690,10 @@ async function handleAuthorizeDevice(
   request: AuthorizeDeviceRequest,
 ): Promise<void> {
   if (activeBrowser !== undefined) {
-    writeResponse(
-      { ok: false, error: "INTERNAL" satisfies ErrorCode },
-      request.id,
-    );
+    const error = new Error("browser is already active");
+    const classified = classifyExecutionError(error, "login");
+    writeExecutorErrorLine(request, "login", classified, error);
+    writeResponse(formatErrorResponse(classified), request.id);
     return;
   }
 

@@ -443,6 +443,7 @@ enum ErrorCode {
     MfaRequired,
     SelectorNotFound,
     DeviceCodeRejected,
+    LoginResultTimeout,
     VaultLocked,
     RateLimited,
     TotpNotExposable,
@@ -464,6 +465,7 @@ impl ErrorCode {
             Self::MfaRequired => "MFA_REQUIRED",
             Self::SelectorNotFound => "SELECTOR_NOT_FOUND",
             Self::DeviceCodeRejected => "DEVICE_CODE_REJECTED",
+            Self::LoginResultTimeout => "LOGIN_RESULT_TIMEOUT",
             Self::VaultLocked => "VAULT_LOCKED",
             Self::RateLimited => "RATE_LIMITED",
             Self::TotpNotExposable => "TOTP_NOT_EXPOSABLE",
@@ -3172,7 +3174,7 @@ async fn connect_executor(
         .arg(entry)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     #[cfg(windows)]
     if let Some(browsers_path) = browsers_path {
@@ -3190,16 +3192,53 @@ async fn connect_executor(
             writer,
         })
     } else {
-        Ok(ExecutorHandle::Spawned(
-            command.spawn().map_err(|_| ErrorCode::Internal)?,
-        ))
+        let mut child = command.spawn().map_err(|_| ErrorCode::Internal)?;
+        forward_executor_stderr(&mut child);
+        Ok(ExecutorHandle::Spawned(child))
     }
     #[cfg(windows)]
     {
-        Ok(ExecutorHandle::Spawned(
-            command.spawn().map_err(|_| ErrorCode::Internal)?,
-        ))
+        let mut child = command.spawn().map_err(|_| ErrorCode::Internal)?;
+        forward_executor_stderr(&mut child);
+        Ok(ExecutorHandle::Spawned(child))
     }
+}
+
+const EXECUTOR_STDERR_LINE_MAX_BYTES: usize = 1000;
+
+fn truncate_executor_stderr_line(line: &[u8]) -> String {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let mut line = String::from_utf8_lossy(line).into_owned();
+    if line.len() > EXECUTOR_STDERR_LINE_MAX_BYTES {
+        let mut end = EXECUTOR_STDERR_LINE_MAX_BYTES;
+        while !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        line.truncate(end);
+    }
+    line
+}
+
+fn forward_executor_stderr(child: &mut Child) {
+    let Some(stderr) = child.stderr.take() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    let line = truncate_executor_stderr_line(&line);
+                    eprintln!("tegatad: executor {line}");
+                }
+                Err(_) => break,
+            }
+        }
+    });
 }
 
 /// executor へ id 1 の初回要求を 1 行書き込み、応答を 1 行読む。
@@ -3464,6 +3503,7 @@ fn parse_error_code(value: &str) -> ErrorCode {
         "MFA_REQUIRED" => ErrorCode::MfaRequired,
         "SELECTOR_NOT_FOUND" => ErrorCode::SelectorNotFound,
         "DEVICE_CODE_REJECTED" => ErrorCode::DeviceCodeRejected,
+        "LOGIN_RESULT_TIMEOUT" => ErrorCode::LoginResultTimeout,
         "VAULT_LOCKED" => ErrorCode::VaultLocked,
         "RATE_LIMITED" => ErrorCode::RateLimited,
         "TOTP_NOT_EXPOSABLE" => ErrorCode::TotpNotExposable,
@@ -3478,9 +3518,11 @@ fn parse_error_code(value: &str) -> ErrorCode {
 
 fn parse_authorize_error_code(value: &str) -> ErrorCode {
     match value {
-        "INVALID_CREDENTIAL" | "MFA_REQUIRED" | "SELECTOR_NOT_FOUND" | "DEVICE_CODE_REJECTED" => {
-            parse_error_code(value)
-        }
+        "INVALID_CREDENTIAL"
+        | "MFA_REQUIRED"
+        | "SELECTOR_NOT_FOUND"
+        | "DEVICE_CODE_REJECTED"
+        | "LOGIN_RESULT_TIMEOUT" => parse_error_code(value),
         _ => ErrorCode::Internal,
     }
 }
@@ -4036,6 +4078,38 @@ mod tests {
         assert_eq!(super::api_proxy_outcome(404), "upstream_error");
         assert_eq!(super::api_proxy_outcome(500), "upstream_error");
         assert_eq!(super::api_proxy_outcome(502), "upstream_unreachable");
+    }
+}
+
+#[cfg(test)]
+mod executor_stderr_tests {
+    use super::truncate_executor_stderr_line;
+
+    #[test]
+    fn truncates_executor_stderr_lines_to_1000_bytes() {
+        let line = format!("{}\n", "a".repeat(1200));
+        let truncated = truncate_executor_stderr_line(line.as_bytes());
+
+        assert_eq!(truncated.len(), 1000);
+        assert!(truncated.chars().all(|character| character == 'a'));
+    }
+
+    #[test]
+    fn truncates_executor_stderr_lines_at_a_utf8_boundary() {
+        let line = format!("{}\n", "あ".repeat(400));
+        let truncated = truncate_executor_stderr_line(line.as_bytes());
+
+        assert_eq!(truncated.len(), 999);
+        assert!(truncated.chars().all(|character| character == 'あ'));
+    }
+
+    #[test]
+    fn replaces_invalid_utf8_before_truncating() {
+        let line = vec![0xff; 400];
+        let truncated = truncate_executor_stderr_line(&line);
+
+        assert_eq!(truncated.len(), 999);
+        assert!(truncated.chars().all(|character| character == '\u{fffd}'));
     }
 }
 

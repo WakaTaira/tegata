@@ -449,6 +449,8 @@ service.
 
 For each Bitwarden CLI invocation, the daemon writes a `tegatad: bw_diag {…}` line to stderr with the operation name, attempt count, duration, failure kind, exit code, io error kind, and truncated stderr; it contains no stdout, session key, password, or email. At startup it writes a `tegatad: bw_version …` line to stderr. View these lines in the file configured by `TEGATA_LOG_FILE`.
 
+When `login` or `authorize_device` ends with `INTERNAL` or `LOGIN_RESULT_TIMEOUT`, the executor writes one secret-free `tegata-executor: error {…}` line to stderr with the operation, stage, code, error name, and first line of the message; when the daemon starts the executor itself, it forwards the line with a `tegatad: executor ` prefix, and Windows records it in `TEGATA_LOG_FILE`. Repeating `login` with the same credentials in a short period can return `RATE_LIMITED`, so leave an interval between attempts while investigating a failure.
+
 **The browser fails to launch.** The Playwright browser revision must match the
 `playwright-core` bundled with the executor, and the service account needs read
 access to `browsers_path`. A revision mismatch fails immediately at launch.

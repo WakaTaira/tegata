@@ -5022,11 +5022,17 @@ mod mcp_server_config_tests {
     use super::{McpServerConfig, validate_mcp_servers};
     use std::collections::BTreeMap;
 
+    /// 実行環境で絶対パスとして扱われるコマンド。Windows では `/bin/…` が絶対パスにならない。
+    #[cfg(windows)]
+    const ABSOLUTE_COMMAND: &str = r"C:\bin\server.exe";
+    #[cfg(not(windows))]
+    const ABSOLUTE_COMMAND: &str = "/bin/server";
+
     fn server() -> McpServerConfig {
         McpServerConfig {
             name: "fx".to_owned(),
             cred_id: "mock:site".to_owned(),
-            command: "/bin/server".to_owned(),
+            command: ABSOLUTE_COMMAND.to_owned(),
             args: vec!["--stdio".to_owned()],
             env: BTreeMap::from([("TOKEN".to_owned(), "{{secret}}".to_owned())]),
         }
@@ -5044,7 +5050,7 @@ mod mcp_server_config_tests {
     #[test]
     fn mcp_server_rejects_nul_in_command_args_and_env() {
         let mut command = server();
-        command.command = "/bin/ser\0ver".to_owned();
+        command.command = format!("{ABSOLUTE_COMMAND}\0x");
         let mut args = server();
         args.args.push("a\0b".to_owned());
         let mut env_name = server();

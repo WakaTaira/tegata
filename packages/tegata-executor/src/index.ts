@@ -140,14 +140,19 @@ function redactExecutorErrorMessage(
     );
 }
 
+function removeUrlQueryAndFragment(value: string): string {
+  return value.replace(/\b[a-z][a-z\d+.-]*:\/\/[^\s"'()]*/giu, (url) => {
+    const detailStart = url.search(/[?#]/u);
+    return detailStart === -1 ? url : url.slice(0, detailStart);
+  });
+}
+
 export function formatExecutorErrorLine(
   request: LoginRequest | AuthorizeDeviceRequest,
   stage: ExecutionStage,
   code: ErrorCode,
   error: unknown,
 ): string {
-  const message =
-    error instanceof Error ? error.message.split(/\r\n|[\r\n]/u, 1)[0] : "";
   const secrets =
     request.op === "login"
       ? [request.secret.username, request.secret.password, request.secret.totp]
@@ -157,12 +162,26 @@ export function formatExecutorErrorLine(
           request.secret.totp,
           request.user_code,
         ];
+  const rawMessage = error instanceof Error ? error.message : "";
+  const message = truncateUtf8(
+    removeUrlQueryAndFragment(
+      redactExecutorErrorMessage(rawMessage, secrets),
+    ).split(/\r\n|[\r\n]/u, 1)[0],
+    300,
+  );
+  const name = truncateUtf8(
+    redactExecutorErrorMessage(
+      error instanceof Error ? error.name : typeof error,
+      secrets,
+    ),
+    64,
+  );
   return `tegata-executor: error ${JSON.stringify({
     op: request.op,
     stage,
     code,
-    name: error instanceof Error ? error.name : typeof error,
-    message: truncateUtf8(redactExecutorErrorMessage(message, secrets), 300),
+    name,
+    message,
   })}\n`;
 }
 
@@ -1161,6 +1180,20 @@ type WaitResult = "success" | "failure" | undefined;
 
 const DEFAULT_RESULT_SETTLE_MS = 10_000;
 
+export function raceDecisive<T>(
+  waits: Array<Promise<T | undefined>>,
+  timeout: Promise<undefined>,
+): Promise<T | undefined> {
+  return Promise.race([
+    ...waits.map((wait) =>
+      wait.then((result) =>
+        result === undefined ? new Promise<never>(() => {}) : result,
+      ),
+    ),
+    timeout,
+  ]);
+}
+
 async function waitForSelector(page: Page, selector: string): Promise<boolean> {
   try {
     await page.waitForSelector(selector, {
@@ -1201,10 +1234,10 @@ async function waitForResult(
   ) {
     waits.push(waitForDefaultResult());
   }
-  return Promise.race([
-    ...waits,
+  return raceDecisive(
+    waits,
     new Promise<undefined>((resolve) => setTimeout(resolve, 15_000)),
-  ]);
+  );
 }
 
 async function waitForLoginResult(

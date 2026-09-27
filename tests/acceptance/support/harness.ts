@@ -255,11 +255,15 @@ export interface Daemon {
   stateDir: string;
   /** Daemon-private directory. Excluded from agent-visible scan roots. */
   daemonDir: string;
+  stderr?: () => string;
   stop(): Promise<void>;
 }
 
 /** Start tegatad with a mock-provider config in a private temp directory. */
-export async function startDaemon(entries: MockEntry[]): Promise<Daemon> {
+export async function startDaemon(
+  entries: MockEntry[],
+  options: { captureStderr?: boolean } = {},
+): Promise<Daemon> {
   const daemonDir = fs.mkdtempSync(path.join(os.tmpdir(), "tegatad-"));
   const socketPath = path.join(daemonDir, "tegatad.sock");
   const stateDir = path.join(daemonDir, "state");
@@ -276,10 +280,17 @@ export async function startDaemon(entries: MockEntry[]): Promise<Daemon> {
     }),
     { mode: 0o600 },
   );
+  let stderr = "";
   const child = spawn(bins().tegatad, ["--config", configPath], {
-    stdio: ["ignore", "inherit", "inherit"],
+    stdio: ["ignore", "inherit", options.captureStderr ? "pipe" : "inherit"],
     cwd: daemonDir,
   });
+  if (options.captureStderr) {
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+  }
   const exited = new Promise<never>((_, reject) => {
     child.once("exit", (code) =>
       reject(new Error(`tegatad exited early (code ${code})`)),
@@ -302,6 +313,7 @@ export async function startDaemon(entries: MockEntry[]): Promise<Daemon> {
     socketPath,
     stateDir,
     daemonDir,
+    ...(options.captureStderr ? { stderr: () => stderr } : {}),
     stop: async () => {
       await stopProcess(child);
       fs.rmSync(daemonDir, { recursive: true, force: true });

@@ -12,6 +12,7 @@ import {
   LoginResultTimeoutError,
   MfaRequiredError,
   parseRequest,
+  raceDecisive,
   runSteps,
   SelectorNotFoundError,
   substituteSecrets,
@@ -86,6 +87,92 @@ describe("executor error diagnostics", () => {
 
     expect(payload.message).toBe("あ".repeat(100));
     expect(Buffer.byteLength(payload.message, "utf8")).toBe(300);
+  });
+
+  test("removes URL query and fragment details from the message", () => {
+    const request = {
+      op: "login" as const,
+      target_url: "https://example.test/login",
+      steps: null,
+      success_selector: null,
+      failure_selector: null,
+      secret: { username: "", password: "", totp: null },
+    };
+
+    const line = formatExecutorErrorLine(
+      request,
+      "login",
+      "INTERNAL",
+      new Error(
+        'request failed at https://example.test/path?token=secret#fragment and "https://example.test/other#fragment"',
+      ),
+    );
+
+    const payload = JSON.parse(
+      line.slice("tegata-executor: error ".length).trimEnd(),
+    );
+    expect(payload.message).toBe(
+      'request failed at https://example.test/path and "https://example.test/other"',
+    );
+  });
+
+  test("redacts multiline secrets from the name and message", () => {
+    const password = "password\ncontinued";
+    class SecretError extends Error {
+      name = `SecretError:${password}:${"x".repeat(100)}`;
+    }
+    const request = {
+      op: "login" as const,
+      target_url: "https://example.test/login",
+      steps: null,
+      success_selector: null,
+      failure_selector: null,
+      secret: { username: "", password, totp: null },
+    };
+
+    const line = formatExecutorErrorLine(
+      request,
+      "login",
+      "INTERNAL",
+      new SecretError(`${password}\nthis second line must not appear`),
+    );
+
+    const payload = JSON.parse(
+      line.slice("tegata-executor: error ".length).trimEnd(),
+    );
+    expect(payload.name).toBe(`SecretError:[REDACTED]:${"x".repeat(41)}`);
+    expect(Buffer.byteLength(payload.name, "utf8")).toBeLessThanOrEqual(64);
+    expect(payload.message).toBe("[REDACTED]");
+    expect(line).not.toContain(password);
+  });
+});
+
+describe("raceDecisive", () => {
+  test("ignores an undefined result until a decisive result arrives", async () => {
+    const result = await raceDecisive(
+      [
+        Promise.resolve(undefined),
+        new Promise<"success">((resolve) =>
+          setTimeout(() => resolve("success"), 10),
+        ),
+      ],
+      new Promise<undefined>((resolve) =>
+        setTimeout(() => resolve(undefined), 100),
+      ),
+    );
+
+    expect(result).toBe("success");
+  });
+
+  test("returns undefined from the timer when every wait is undefined", async () => {
+    const result = await raceDecisive(
+      [Promise.resolve(undefined), Promise.resolve(undefined)],
+      new Promise<undefined>((resolve) =>
+        setTimeout(() => resolve(undefined), 0),
+      ),
+    );
+
+    expect(result).toBeUndefined();
   });
 });
 

@@ -300,8 +300,7 @@ in
           };
           env = lib.mkOption {
             type = lib.types.attrsOf lib.types.str;
-            default = {};
-            description = "Environment variables passed to the server; values may contain {{secret}}, {{username}}, or {{totp}}.";
+            description = "Environment variables passed to the server; values may contain {{secret}}, {{username}}, or {{totp}}, and at least one placeholder is required.";
           };
         };
       });

@@ -97,6 +97,8 @@ An approval grant from `approval_grant_ttl_secs` is keyed by
 `(principal, credential)`, not by method. A grant earned by a `login` with the
 proxy's `login_cred_id` also lets the same principal call `open_api_proxy` for
 the OAuth proxy without a new approval, and the reverse holds as well.
+`open_mcp_server` shares the same grant: an approval earned by any of these
+methods covers the others for the same credential.
 
 ## Calling it
 

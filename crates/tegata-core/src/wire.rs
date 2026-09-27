@@ -232,9 +232,10 @@ pub struct ExecutorApiProxyStartResponse {
     pub error: Option<String>,
 }
 
-/// executor 接続の注入プロキシのリスナーを閉じる要求。
+/// executor 接続 1 本を占有するサービスを止める要求。`op` は `api_proxy_stop`（注入プロキシのリスナーを
+/// 閉じる）または `mcp_server_stop`（MCP サーバーを終了させ、中継のリスナーと一時ディレクトリを片付ける）である。
 #[derive(Serialize)]
-pub struct ExecutorApiProxyStopRequest {
+pub struct ExecutorServiceStopRequest {
     pub op: &'static str,
     pub id: u64,
 }
@@ -280,20 +281,15 @@ pub struct ExecutorMcpServerStartRequest {
 }
 
 /// `mcp_server_start` への応答。成功時は loopback のポートと stream secret を持つ。
+///
+/// デーモンは失敗を分類せず一律に `INTERNAL` とするため、executor が添える `error` は読まない
+/// （未知のフィールドとして無視される）。
 #[derive(Deserialize)]
 pub struct ExecutorMcpServerStartResponse {
     pub id: Option<u64>,
     pub ok: bool,
     pub port: Option<u16>,
     pub stream_secret: Option<String>,
-    pub error: Option<String>,
-}
-
-/// executor 接続の MCP サーバーを終了させ、中継のリスナーと一時ディレクトリを片付ける要求。
-#[derive(Serialize)]
-pub struct ExecutorMcpServerStopRequest {
-    pub op: &'static str,
-    pub id: u64,
 }
 
 /// MCP サーバーの状態変化を executor が書くイベント行。`id` を持たないため、応答待ちの要求と照合されることはない。

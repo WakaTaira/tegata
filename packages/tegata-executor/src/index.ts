@@ -12,8 +12,8 @@ import {
   type ApiProxyRequestRecord,
   startApiProxy,
 } from "./api-proxy.js";
+import { createLoopbackSecret } from "./loopback.js";
 import {
-  createStreamSecret,
   type McpServerEvent,
   type McpServerHost,
   startMcpServer,
@@ -2312,7 +2312,7 @@ async function runMcpServerStart(
     );
     return;
   }
-  const streamSecret = createStreamSecret();
+  const streamSecret = createLoopbackSecret();
   try {
     const host = await startMcpServer({
       command: request.command,
@@ -2327,6 +2327,7 @@ async function runMcpServerStart(
       { ok: true, port: host.port, stream_secret: streamSecret },
       request.id,
     );
+    host.releaseEvents();
   } catch (error) {
     const classified = classifyExecutionError(error, "mcp_server");
     writeExecutorErrorLine(request, "mcp_server", classified, error, [

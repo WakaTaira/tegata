@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { createServer, createServer as createTcpServer } from "node:net";
+import { EventEmitter } from "node:events";
+import {
+  createServer as createTcpServer,
+  createServer as createUnixServer,
+} from "node:net";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { afterEach, describe, expect, test } from "vitest";
@@ -28,9 +32,11 @@ afterEach(() => {
   else process.env.TEGATA_BRIDGE = originalBridge;
 });
 
-/** テスト用のストリーム三つ組。stdout / stderr は書き込まれたテキストを蓄積する。
+/**
+ * テスト用のストリーム三つ組。stdout / stderr は書き込まれたテキストを蓄積する。
  * stderr は run.ts から write() のみ呼ばれるため、Writable の非同期な仕組みを介さない
- * 最小限のモックにして、書き込みを即座に観測できるようにする。 */
+ * 最小限のモックにして、書き込みを即座に観測できるようにする。
+ */
 function fakeStreams() {
   const stdin = new PassThrough();
   const stdout = new CapturingWritable();
@@ -53,14 +59,20 @@ function fakeStreams() {
   };
 }
 
-/** open_mcp_server（と、指定すれば logout / bridge_open_tunnel）に応答する偽デーモン。 */
+/** 偽デーモンが応答を返さずに接続を切ることを表す。 */
+const DROP = Symbol("drop");
+
+/**
+ * open_mcp_server（と、指定すれば logout / bridge_open_tunnel）に応答する偽デーモン。
+ * extra が DROP を返したメソッドには応答せず接続を切る。
+ */
 async function startFakeDaemon(
   openResult: unknown,
   extra: (method: string, params: unknown) => unknown = () => ({ ok: true }),
 ) {
   const socketPath = join(process.cwd(), `.tegata-mcp-${randomUUID()}.sock`);
   const calls: { method: string; params: unknown }[] = [];
-  const server = createServer((socket) => {
+  const server = createUnixServer((socket) => {
     let data = "";
     socket.on("data", (chunk) => {
       data += chunk.toString();
@@ -76,6 +88,10 @@ async function startFakeDaemon(
         request.method === "open_mcp_server"
           ? openResult
           : extra(request.method, request.params);
+      if (result === DROP) {
+        socket.destroy();
+        return;
+      }
       const response =
         result !== null && typeof result === "object" && "error" in result
           ? {
@@ -95,6 +111,40 @@ async function startFakeDaemon(
       await new Promise<void>((resolve, reject) =>
         server.close((error) => (error ? reject(error) : resolve())),
       );
+    },
+  };
+}
+
+/** 最初の行（stream secret）を受け取った時点で解決する中継先の TCP サーバー。 */
+async function startRelayTarget() {
+  const tcpServer = createTcpServer();
+  let firstLine = "";
+  const connected = new Promise<void>((resolve) => {
+    tcpServer.on("connection", (socket) => {
+      let data = "";
+      socket.on("data", (chunk) => {
+        data += chunk.toString();
+        const lineEnd = data.indexOf("\n");
+        if (lineEnd !== -1 && firstLine === "") {
+          firstLine = data.slice(0, lineEnd);
+          resolve();
+        }
+      });
+    });
+  });
+  await new Promise<void>((resolve) =>
+    tcpServer.listen(0, "127.0.0.1", resolve),
+  );
+  const address = tcpServer.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("expected a TCP address");
+  }
+  return {
+    port: address.port,
+    connected,
+    firstLine: () => firstLine,
+    async stop() {
+      await new Promise<void>((resolve) => tcpServer.close(() => resolve()));
     },
   };
 }
@@ -230,6 +280,99 @@ describe("run", () => {
     } finally {
       await daemon.stop();
       await new Promise<void>((resolve) => tcpServer.close(() => resolve()));
+    }
+  });
+
+  test("logs out and reports INTERNAL when the bridge tunnel call fails", async () => {
+    const daemon = await startFakeDaemon(
+      { session_id: "s3", port: 9999, stream_secret: "unused" },
+      (method) => (method === "bridge_open_tunnel" ? DROP : { ok: true }),
+    );
+    process.env.TEGATA_BRIDGE = "1";
+    try {
+      const fake = fakeStreams();
+      const exitCode = await run("fake", fake.streams);
+      expect(exitCode).toBe(1);
+      expect(fake.stderrText).toBe("INTERNAL\n");
+      expect(daemon.calls).toEqual([
+        { method: "open_mcp_server", params: { name: "fake" } },
+        {
+          method: "bridge_open_tunnel",
+          params: { session_id: "s3", port: 9999 },
+        },
+        { method: "logout", params: { session_id: "s3" } },
+      ]);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test("logs out a session whose open result is malformed", async () => {
+    const daemon = await startFakeDaemon({ session_id: "s4", port: "x" });
+    try {
+      const fake = fakeStreams();
+      const exitCode = await run("fake", fake.streams);
+      expect(exitCode).toBe(1);
+      expect(fake.stderrText).toBe("INTERNAL\n");
+      expect(daemon.calls).toEqual([
+        { method: "open_mcp_server", params: { name: "fake" } },
+        { method: "logout", params: { session_id: "s4" } },
+      ]);
+    } finally {
+      await daemon.stop();
+    }
+  });
+
+  test("logs out and exits on SIGTERM while relaying", async () => {
+    const target = await startRelayTarget();
+    const daemon = await startFakeDaemon({
+      session_id: "s5",
+      port: target.port,
+      stream_secret: "term-secret",
+    });
+    const signals = new EventEmitter();
+    try {
+      const fake = fakeStreams();
+      const runPromise = run("fake", fake.streams, signals);
+      await target.connected;
+      signals.emit("SIGTERM");
+      const exitCode = await runPromise;
+      expect(exitCode).toBe(143);
+      expect(fake.stderrText).toBe("");
+      expect(daemon.calls).toEqual([
+        { method: "open_mcp_server", params: { name: "fake" } },
+        { method: "logout", params: { session_id: "s5" } },
+      ]);
+      expect(signals.listenerCount("SIGTERM")).toBe(0);
+      expect(signals.listenerCount("SIGINT")).toBe(0);
+    } finally {
+      await daemon.stop();
+      await target.stop();
+    }
+  });
+
+  test("logs out without relaying when SIGINT arrives before the session opens", async () => {
+    const target = await startRelayTarget();
+    const daemon = await startFakeDaemon({
+      session_id: "s6",
+      port: target.port,
+      stream_secret: "int-secret",
+    });
+    const signals = new EventEmitter();
+    try {
+      const fake = fakeStreams();
+      const runPromise = run("fake", fake.streams, signals);
+      signals.emit("SIGINT");
+      const exitCode = await runPromise;
+      expect(exitCode).toBe(130);
+      expect(target.firstLine()).toBe("");
+      expect(daemon.calls).toEqual([
+        { method: "open_mcp_server", params: { name: "fake" } },
+        { method: "logout", params: { session_id: "s6" } },
+      ]);
+    } finally {
+      await daemon.stop();
+      await target.stop();
     }
   });
 });

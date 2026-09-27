@@ -1,7 +1,7 @@
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { timingSafeEqual } from "node:crypto";
 import http from "node:http";
 import https from "node:https";
-import type { AddressInfo } from "node:net";
+import { createLoopbackSecret, listenLoopback } from "./loopback.js";
 
 export type ApiProxyRequestRecord = {
   http_method: string;
@@ -264,16 +264,6 @@ function handleRequest(
   );
 }
 
-function listen(server: http.Server): Promise<number> {
-  return new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      server.removeListener("error", reject);
-      resolve((server.address() as AddressInfo).port);
-    });
-  });
-}
-
 /**
  * 上流へ固定ヘッダを注入する loopback の HTTP プロキシを起動する。
  * 注入値・secret・query は例外メッセージを含めどこにも出力しない。
@@ -284,7 +274,7 @@ export async function startApiProxy(
   http.validateHeaderName(options.header);
   http.validateHeaderValue(options.header, options.headerValue);
   const upstream = parseUpstream(options.upstream);
-  const secret = randomBytes(16).toString("base64url");
+  const secret = createLoopbackSecret();
   const state: InjectionState = {
     headerValue: options.headerValue,
     unavailable: false,
@@ -295,7 +285,7 @@ export async function startApiProxy(
 
   let port: number;
   try {
-    port = await listen(server);
+    port = await listenLoopback(server);
   } catch (error) {
     upstream.agent.destroy();
     throw error;

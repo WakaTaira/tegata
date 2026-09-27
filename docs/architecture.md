@@ -160,7 +160,7 @@ in a process argument list or an environment block.
 
 The daemon speaks newline-delimited JSON-RPC 2.0. Method dispatch is an explicit
 allowlist — `status`, `list_credentials`, `login`, `authorize_device`, `logout`, `get_totp`,
-`lock_vault`, `open_api_proxy`, plus the administrative methods `admin_peer_issue`,
+`lock_vault`, `open_api_proxy`, `open_mcp_server`, plus the administrative methods `admin_peer_issue`,
 `admin_peer_revoke`, `admin_peer_list`, and `admin_token_issue`, and on Windows
 `admin_seal`, `admin_approval_list`, and `admin_approval_decide`. Anything else
 returns method-not-found. There is deliberately no method that executes something

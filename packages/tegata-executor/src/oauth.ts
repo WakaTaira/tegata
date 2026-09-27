@@ -53,9 +53,11 @@ const SLOW_DOWN_INCREMENT_MS = 5_000;
 const MAX_POLL_WINDOW_MS = 45_000;
 const REFRESH_MARGIN_CAP_MS = 60_000;
 export const OAUTH_REQUEST_TIMEOUT_MS = 10_000;
+// デーモンの API_PROXY_STOP_TIMEOUT（8 秒、crates/tegatad/src/main.rs）はこの値に余裕を足したものである。
+// 変更する場合は両方を揃える。
 export const REVOCATION_TIMEOUT_MS = 5_000;
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
@@ -367,21 +369,24 @@ export function renderValueTemplate(template: string, token: string): string {
   return template.split("{{secret}}").join(token);
 }
 
-/** RFC 7009 の revocation を best effort で行う。各要求は 5 秒で打ち切り、結果は問わない。 */
+/**
+ * RFC 7009 の revocation を best effort で行う。各要求は 5 秒で打ち切る。
+ * 対象の失効要求がすべて 2xx で応答した場合のみ true を返す。revocation endpoint が無い場合は false とする。
+ */
 export async function revokeTokens(
   endpoints: OAuthEndpoints,
   tokens: TokenSet,
   post: PostForm,
-): Promise<void> {
+): Promise<boolean> {
   const url = endpoints.revocation_url;
-  if (url === null) return;
+  if (url === null) return false;
   const targets: Array<[string, string]> = [
     [tokens.accessToken, "access_token"],
   ];
   if (tokens.refreshToken !== null) {
     targets.push([tokens.refreshToken, "refresh_token"]);
   }
-  await Promise.allSettled(
+  const results = await Promise.allSettled(
     targets.map(([token, hint]) =>
       post(
         url,
@@ -389,6 +394,10 @@ export async function revokeTokens(
         REVOCATION_TIMEOUT_MS,
       ),
     ),
+  );
+  return results.every(
+    (result) =>
+      result.status === "fulfilled" && isSuccessStatus(result.value.status),
   );
 }
 
@@ -468,6 +477,7 @@ export class OAuthProxySession {
   /**
    * refresh を止め、revocation endpoint があれば token を失効させてからリスナーを閉じる。
    * 進行中の refresh は中断し、その完了を待ってから最新の token を失効させる。
+   * `revoked` は失効要求がすべて成功した場合のみ通知する。
    */
   close(): Promise<void> {
     this.#closing ??= (async () => {
@@ -475,10 +485,12 @@ export class OAuthProxySession {
       this.#timer = undefined;
       this.#refreshAbort?.abort();
       await this.#refreshDone?.catch(() => undefined);
-      if (this.#options.endpoints.revocation_url !== null) {
-        await revokeTokens(this.#options.endpoints, this.#tokens, this.#post);
-        this.#options.onEvent("revoked");
-      }
+      const revoked = await revokeTokens(
+        this.#options.endpoints,
+        this.#tokens,
+        this.#post,
+      );
+      if (revoked) this.#options.onEvent("revoked");
       await this.#options.proxy.close();
     })();
     return this.#closing;

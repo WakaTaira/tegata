@@ -73,6 +73,7 @@ impl CredentialProvider for StaticProvider {
             Ok(Some(ResolvedCredential {
                 locked: self.locked,
                 secrets_preregistered: true,
+                uri: Some(entry.uri.clone()),
                 username: Secret::new(entry.username.as_str()),
                 password: Secret::new(entry.password.as_str()),
                 totp_seed: entry

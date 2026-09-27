@@ -1086,9 +1086,11 @@ impl BitwardenCliProvider {
             });
         }
         let expose_totp = self.totp_exposable.iter().any(|name| name == &item.name);
+        let uri = login.uris.into_iter().next().and_then(|uri| uri.uri);
         Ok(Some(ResolvedCredential {
             locked: self.locked,
             secrets_preregistered: false,
+            uri,
             username: Secret::new(login.username.unwrap_or_default()),
             password: Secret::new(login.password.unwrap_or_default()),
             totp_seed: login.totp.map(Secret::new),

@@ -60,6 +60,7 @@ the public code format; arbitrary daemon text is normalised to `INTERNAL`.
 | `INVALID_CREDENTIAL` | The credential does not exist, or the site rejected the login |
 | `MFA_REQUIRED` | The login needs a TOTP code and the credential has no seed |
 | `SELECTOR_NOT_FOUND` | A login step's selector did not resolve within the step timeout |
+| `LOGIN_RESULT_TIMEOUT` | All login steps ran, but the executor could not tell within the wait window whether the login worked; no browser is handed back. Also returned by `authorize_device` when its login stage cannot be judged. |
 | `DEVICE_CODE_REJECTED` | The device authorization page rejected the user code |
 | `VAULT_LOCKED` | The provider holding this credential is locked |
 | `RATE_LIMITED` | A second `get_totp` for the same credential within 30 seconds |
@@ -226,13 +227,16 @@ anything behind a "Next" button need explicit `steps`.
 - With `success_selector`, the login succeeds when that selector attaches.
 - With `failure_selector`, it fails with `INVALID_CREDENTIAL` when that selector
   attaches.
-- With neither, the executor waits for the network to settle and then checks for a
-  *visible* password input: still present means the form was re-rendered, which is
-  read as a failed login; gone means success.
+- With neither, the executor waits up to 10 seconds for the network to settle and
+  then checks for a *visible* password input: still present means the form was
+  re-rendered, which is read as a failed login; gone means success. If the network
+  does not settle, as with sites that long-poll continuously, it makes that check
+  against the state at that point; hidden password inputs do not count.
 
 Provide at least one selector for any site where that heuristic is not obviously
-right. A login whose outcome cannot be determined within the wait window fails with
-`INTERNAL` rather than handing back a possibly-unauthenticated browser.
+right. A login whose outcome cannot be determined within the approximately 15-second
+wait window fails with `LOGIN_RESULT_TIMEOUT` rather than handing back a
+possibly-unauthenticated browser.
 
 ### Approval
 

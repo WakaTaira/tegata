@@ -615,6 +615,8 @@ an agent that is separately allowed to run `bw get password` itself.
 
 For each Bitwarden CLI invocation, the daemon writes a `tegatad: bw_diag {…}` line to stderr with the operation name, attempt count, duration, failure kind, exit code, io error kind, and truncated stderr; it contains no stdout, session key, password, or email. At startup it writes a `tegatad: bw_version …` line to stderr. View these lines with `journalctl -u tegata`.
 
+When `login` or `authorize_device` ends with `INTERNAL` or `LOGIN_RESULT_TIMEOUT`, the executor writes one secret-free `tegata-executor: error {…}` line to stderr with the operation, stage, code, error name, and first line of the message; in the NixOS configuration, find it in the `tegata-browser` service journal. Repeating `login` with the same credentials in a short period can return `RATE_LIMITED`, so leave an interval between attempts while investigating a failure.
+
 ## Verifying the boundary
 
 ```sh

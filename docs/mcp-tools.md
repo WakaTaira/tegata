@@ -61,6 +61,7 @@ the public code format; arbitrary daemon text is normalised to `INTERNAL`.
 | `MFA_REQUIRED` | The login needs a TOTP code and the credential has no seed |
 | `SELECTOR_NOT_FOUND` | A login step's selector did not resolve within the step timeout |
 | `LOGIN_RESULT_TIMEOUT` | All login steps ran, but the executor could not tell within the wait window whether the login worked; no browser is handed back. Also returned by `authorize_device` when its login stage cannot be judged. |
+| `OAUTH_GRANT_FAILED` | The OAuth device-code grant behind an `open_api_proxy` failed: the device authorization or token endpoint refused, the grant was denied or expired, or polling ran out of time. |
 | `DEVICE_CODE_REJECTED` | The device authorization page rejected the user code |
 | `VAULT_LOCKED` | The provider holding this credential is locked |
 | `RATE_LIMITED` | A second `get_totp` for the same credential within 30 seconds |
@@ -326,6 +327,8 @@ Opens a loopback HTTP relay that injects a credential's value into a fixed
 upstream API. The agent gets a URL that already carries the token's authority
 without ever seeing the token itself. See [api-proxy.md](api-proxy.md) for
 configuration and the full residual-risk discussion.
+
+The same call opens a proxy configured with an OAuth device-code grant.
 
 **Input**
 

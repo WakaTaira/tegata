@@ -79,6 +79,42 @@ rl.on("line", (line) => {
 });
 "#;
 
+const OAUTH_PROXY_EXECUTOR: &str = r#"
+const fs = require("node:fs");
+const readline = require("node:readline");
+const log = (value) => fs.appendFileSync(__filename + ".log", JSON.stringify(value) + "\n");
+const event = (action) =>
+  process.stdout.write(JSON.stringify({ event: "oauth_token", action }) + "\n");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  log(request);
+  if (request.op === "api_proxy_start") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true, port: 38998, secret: "fake-path-secret_A1" }) + "\n");
+    event("unknown");
+    event("issued");
+  } else if (request.op === "api_proxy_stop") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true }) + "\n");
+    event("revoked");
+  } else if (request.op === "shutdown") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true }) + "\n");
+    process.exit(0);
+  }
+});
+rl.on("close", () => { setInterval(() => {}, 1000); });
+"#;
+
+const OAUTH_FAILING_PROXY_EXECUTOR: &str = r#"
+const readline = require("node:readline");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.op === "api_proxy_start") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: "OAUTH_GRANT_FAILED" }) + "\n");
+  }
+});
+"#;
+
 struct Options<'a> {
     executor: &'a str,
     api_proxies: String,
@@ -103,6 +139,17 @@ fn api_proxy_section(name: &str, upstream: &str, value: Option<&str>) -> String 
         .unwrap_or_default();
     format!(
         "\n[[api_proxy]]\nname = {name:?}\ncred_id = \"mock:site\"\nupstream = {upstream:?}\n{value}"
+    )
+}
+
+fn oauth_api_proxy_section(
+    name: &str,
+    upstream: &str,
+    token_url: &str,
+    login_cred_id: &str,
+) -> String {
+    format!(
+        "\n[[api_proxy]]\nname = {name:?}\nupstream = {upstream:?}\nvalue = \"Bearer {{{{secret}}}}\"\n[api_proxy.oauth]\nclient_id = \"oauth-client\"\ndevice_authorization_url = \"https://oauth.example/device\"\ntoken_url = {token_url:?}\nlogin_cred_id = {login_cred_id:?}\nsuccess_selector = \"#success\"\n"
     )
 }
 
@@ -425,6 +472,77 @@ fn executor_start_failure_is_internal_and_leaves_no_lease() {
 }
 
 #[test]
+fn oauth_api_proxy_sends_oauth_wire_and_audits_token_events() {
+    let mut options = Options::new(OAUTH_PROXY_EXECUTOR);
+    options.api_proxies =
+        oauth_api_proxy_section("fx", UPSTREAM, "https://oauth.example/token", "mock:site");
+    let daemon = Daemon::start(options);
+    let response = rpc(daemon.socket(), "open_api_proxy", json!({ "name": "fx" }));
+    let session_id = response["result"]["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_owned();
+
+    let start = daemon
+        .executor_log()
+        .into_iter()
+        .find(|request| request["op"] == "api_proxy_start")
+        .expect("api_proxy_start request");
+    assert!(start.get("header_value").is_none());
+    assert_eq!(start["value_template"], json!("Bearer {{secret}}"));
+    assert_eq!(start["oauth"]["client_id"], json!("oauth-client"));
+    assert_eq!(
+        start["oauth"]["device_authorization_url"],
+        json!("https://oauth.example/device")
+    );
+    assert_eq!(
+        start["oauth"]["token_url"],
+        json!("https://oauth.example/token")
+    );
+    assert_eq!(start["oauth"]["login_url"], json!("http://127.0.0.1"));
+    assert_eq!(start["oauth"]["secret"]["username"], json!(USERNAME));
+    assert_eq!(start["oauth"]["secret"]["password"], json!(PASSWORD));
+    assert!(start["oauth"]["secret"]["totp"].is_null());
+    assert!(start["oauth"]["revocation_url"].is_null());
+    assert!(start["oauth"]["scope"].is_null());
+    assert!(start["oauth"]["steps"].is_null());
+    assert!(start["oauth"]["failure_selector"].is_null());
+
+    wait_for("issued oauth audit record", Duration::from_secs(5), || {
+        daemon.audit_records().iter().any(|record| {
+            record["method"] == "api_proxy_oauth"
+                && record["session_id"] == session_id
+                && record["oauth_action"] == "issued"
+        })
+    });
+    let logout = rpc(
+        daemon.socket(),
+        "logout",
+        json!({ "session_id": session_id }),
+    );
+    assert_eq!(logout["result"]["ok"], json!(true));
+    wait_for("revoked oauth audit record", Duration::from_secs(5), || {
+        daemon.audit_records().iter().any(|record| {
+            record["method"] == "api_proxy_oauth"
+                && record["oauth_action"] == "revoked"
+                && record["principal"] == format!("uid:{}", unsafe { libc::geteuid() })
+        })
+    });
+}
+
+#[test]
+fn oauth_api_proxy_propagates_grant_failure_and_keeps_no_lease() {
+    let mut options = Options::new(OAUTH_FAILING_PROXY_EXECUTOR);
+    options.api_proxies =
+        oauth_api_proxy_section("fx", UPSTREAM, "https://oauth.example/token", "mock:site");
+    let daemon = Daemon::start(options);
+    let response = rpc(daemon.socket(), "open_api_proxy", json!({ "name": "fx" }));
+    error_message(&response, "OAUTH_GRANT_FAILED");
+    let status = rpc(daemon.socket(), "status", json!({}));
+    assert_eq!(status["result"]["leases"], json!(0));
+}
+
+#[test]
 fn audit_redacts_secret_shaped_segments_and_truncates_long_paths() {
     let daemon = Daemon::start(Options::new(PATH_EVENT_EXECUTOR));
     let response = rpc(daemon.socket(), "open_api_proxy", json!({ "name": "fx" }));
@@ -566,6 +684,41 @@ fn invalid_api_proxy_configs_refuse_startup() {
         (
             api_proxy_section("nocolon", UPSTREAM, None).replace("mock:site", "mocksite"),
             "cred_id",
+        ),
+        (
+            oauth_api_proxy_section(
+                "external-token",
+                UPSTREAM,
+                "http://example.com/token",
+                "mock:site",
+            ),
+            "token_url",
+        ),
+        (
+            oauth_api_proxy_section(
+                "bad-login-cred",
+                UPSTREAM,
+                "https://oauth.example/token",
+                "mocksite",
+            ),
+            "login_cred_id",
+        ),
+        (
+            api_proxy_section("no-cred", UPSTREAM, None).replace("cred_id = \"mock:site\"\n", ""),
+            "exactly one of cred_id or oauth",
+        ),
+        (
+            oauth_api_proxy_section(
+                "both-credentials",
+                UPSTREAM,
+                "https://oauth.example/token",
+                "mock:site",
+            )
+            .replace(
+                "\nupstream = \"http://127.0.0.1:9\"",
+                "\ncred_id = \"mock:site\"\nupstream = \"http://127.0.0.1:9\"",
+            ),
+            "mutually exclusive",
         ),
     ];
     for (section, reason) in cases {

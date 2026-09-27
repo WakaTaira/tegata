@@ -28,7 +28,8 @@ use leakscan::scan_bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tegata_core::wire::{
-    AuthorizeDeviceParams, ExecutorApiProxyRequestEvent, ExecutorApiProxyStartRequest,
+    AuthorizeDeviceParams, ExecutorApiProxyOAuth, ExecutorApiProxyOAuthSecret,
+    ExecutorApiProxyOAuthTokenEvent, ExecutorApiProxyRequestEvent, ExecutorApiProxyStartRequest,
     ExecutorApiProxyStartResponse, ExecutorApiProxyStopRequest, ExecutorAuthorizeDeviceRequest,
     ExecutorLeaseRequest, ExecutorLoginRequest, ExecutorReleaseRequest, ExecutorResponse,
     ExecutorSecret, LoginParams, OpenApiProxyParams, RpcError, RpcRequest, RpcResponse,
@@ -65,6 +66,7 @@ const METHOD_NOT_FOUND: i32 = -32601;
 const CLASSIFICATION_ERROR: i32 = -32000;
 const EXECUTOR_TIMEOUT: Duration = Duration::from_secs(90);
 const EXECUTOR_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+const API_PROXY_STOP_TIMEOUT: Duration = Duration::from_secs(8);
 const EXECUTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const PASSWORD_FILE_DIR: &str = ".bw-passwords";
 
@@ -146,12 +148,32 @@ fn default_browser_max_lifetime_secs() -> u64 {
 #[derive(Clone, Debug, Deserialize)]
 struct ApiProxyConfig {
     name: String,
-    cred_id: String,
+    cred_id: Option<String>,
     upstream: String,
     #[serde(default = "default_api_proxy_header")]
     header: String,
     #[serde(default = "default_api_proxy_value")]
     value: String,
+    oauth: Option<ApiProxyOAuthConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ApiProxyOAuthConfig {
+    client_id: String,
+    device_authorization_url: String,
+    token_url: String,
+    revocation_url: Option<String>,
+    scope: Option<String>,
+    login_cred_id: String,
+    steps: Option<Vec<tegata_core::wire::LoginStep>>,
+    success_selector: String,
+    failure_selector: Option<String>,
+}
+
+struct ApiProxyStartOptions {
+    value_template: Option<String>,
+    header_value: Option<Zeroizing<String>>,
+    oauth: Option<ExecutorApiProxyOAuth>,
 }
 
 const API_PROXY_SECRET_PLACEHOLDER: &str = "{{secret}}";
@@ -162,6 +184,15 @@ fn default_api_proxy_header() -> String {
 
 fn default_api_proxy_value() -> String {
     format!("Bearer {API_PROXY_SECRET_PLACEHOLDER}")
+}
+
+fn api_proxy_cred_id(proxy: &ApiProxyConfig) -> Option<&str> {
+    proxy.cred_id.as_deref().or_else(|| {
+        proxy
+            .oauth
+            .as_ref()
+            .map(|oauth| oauth.login_cred_id.as_str())
+    })
 }
 
 /// 起動を拒否すべき `[[api_proxy]]` の設定誤りを検出する。
@@ -177,7 +208,17 @@ fn validate_api_proxies(proxies: &[ApiProxyConfig]) -> Result<(), String> {
                 proxy.name
             ));
         }
-        if proxy.cred_id.split_once(':').is_none() {
+        if proxy.cred_id.is_some() == proxy.oauth.is_some() {
+            let reason = if proxy.cred_id.is_some() {
+                "cred_id and oauth are mutually exclusive"
+            } else {
+                "exactly one of cred_id or oauth is required"
+            };
+            return Err(format!("api_proxy \"{}\": {reason}", proxy.name));
+        }
+        if let Some(cred_id) = &proxy.cred_id
+            && cred_id.split_once(':').is_none()
+        {
             return Err(format!(
                 "api_proxy \"{}\": cred_id must be <namespace>:<entry id>",
                 proxy.name
@@ -188,6 +229,42 @@ fn validate_api_proxies(proxies: &[ApiProxyConfig]) -> Result<(), String> {
                 "api_proxy \"{}\": upstream must be https:// or http:// on a loopback host (127.0.0.1, ::1, localhost)",
                 proxy.name
             ));
+        }
+        if let Some(oauth) = &proxy.oauth {
+            if oauth.login_cred_id.split_once(':').is_none() {
+                return Err(format!(
+                    "api_proxy \"{}\": login_cred_id must be <namespace>:<entry id>",
+                    proxy.name
+                ));
+            }
+            for (name, url) in [
+                (
+                    "device_authorization_url",
+                    oauth.device_authorization_url.as_str(),
+                ),
+                ("token_url", oauth.token_url.as_str()),
+            ] {
+                if !api_proxy_upstream_allowed(url) {
+                    return Err(format!(
+                        "api_proxy \"{}\": {name} must be https:// or http:// on a loopback host (127.0.0.1, ::1, localhost)",
+                        proxy.name
+                    ));
+                }
+            }
+            if let Some(url) = &oauth.revocation_url
+                && !api_proxy_upstream_allowed(url)
+            {
+                return Err(format!(
+                    "api_proxy \"{}\": revocation_url must be https:// or http:// on a loopback host (127.0.0.1, ::1, localhost)",
+                    proxy.name
+                ));
+            }
+            if !valid_authorize_steps(oauth.steps.as_deref()) {
+                return Err(format!(
+                    "api_proxy \"{}\": oauth steps contain an unsupported action or value",
+                    proxy.name
+                ));
+            }
         }
         if !proxy.value.contains(API_PROXY_SECRET_PLACEHOLDER) {
             return Err(format!(
@@ -443,6 +520,7 @@ type SharedState = Arc<Mutex<DaemonState>>;
 // Keep in sync with packages/tegata-mcp/src/index.ts and tests/acceptance/support/harness.ts.
 #[derive(Clone, Copy)]
 enum ErrorCode {
+    OAuthGrantFailed,
     InvalidCredential,
     MfaRequired,
     SelectorNotFound,
@@ -465,6 +543,7 @@ enum ErrorCode {
 impl ErrorCode {
     fn as_str(self) -> &'static str {
         match self {
+            Self::OAuthGrantFailed => "OAUTH_GRANT_FAILED",
             Self::InvalidCredential => "INVALID_CREDENTIAL",
             Self::MfaRequired => "MFA_REQUIRED",
             Self::SelectorNotFound => "SELECTOR_NOT_FOUND",
@@ -546,6 +625,8 @@ struct AuditFields {
     path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oauth_action: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2441,33 +2522,28 @@ async fn open_api_proxy(
     let Some(proxy) = state.lock().await.api_proxies.get(&params.name).cloned() else {
         return classified(request.id.clone(), ErrorCode::NotFound);
     };
+    let Some(cred_id) = api_proxy_cred_id(&proxy).map(ToOwned::to_owned) else {
+        return classified(request.id.clone(), ErrorCode::InvalidCredential);
+    };
     let mut fields = AuditFields {
-        cred_id: Some(proxy.cred_id.clone()),
+        cred_id: Some(cred_id.clone()),
         target_url: Some(proxy.upstream.clone()),
-        namespace: proxy
-            .cred_id
+        namespace: cred_id
             .split_once(':')
             .map(|(namespace, _)| namespace.to_owned()),
         ..AuditFields::default()
     };
-    let Some((namespace, _)) = proxy.cred_id.split_once(':') else {
+    let Some((namespace, _)) = cred_id.split_once(':') else {
         return classified(request.id.clone(), ErrorCode::InvalidCredential)
             .with_audit_fields(fields);
     };
     let namespace = namespace.to_owned();
-    let grant = match gate_on_approval(
-        &state,
-        &proxy.cred_id,
-        &proxy.upstream,
-        "open_api_proxy",
-        peer,
-    )
-    .await
-    {
-        Ok(grant) => grant,
-        Err(error) => return classified(request.id.clone(), error).with_audit_fields(fields),
-    };
-    match start_api_proxy_session(&state, peer, proxy, namespace).await {
+    let grant =
+        match gate_on_approval(&state, &cred_id, &proxy.upstream, "open_api_proxy", peer).await {
+            Ok(grant) => grant,
+            Err(error) => return classified(request.id.clone(), error).with_audit_fields(fields),
+        };
+    match start_api_proxy_session(&state, peer, proxy, cred_id, namespace).await {
         Ok((session_id, base_url)) => {
             fields.session_id = Some(session_id.clone());
             success(
@@ -2482,11 +2558,12 @@ async fn open_api_proxy(
 }
 
 /// 承認ゲートを通過した注入プロキシを起動制御を経て起動し、リースを登録して
-/// `(session_id, base_url)` を返す。`namespace` は `proxy.cred_id` から分割済みの値である。
+/// `(session_id, base_url)` を返す。`cred_id` と `namespace` は承認対象から分割済みの値である。
 async fn start_api_proxy_session(
     state: &SharedState,
     peer: &PeerIdentity,
     proxy: ApiProxyConfig,
+    cred_id: String,
     namespace: String,
 ) -> Result<(String, String), ErrorCode> {
     let principal = peer.principal();
@@ -2502,7 +2579,7 @@ async fn start_api_proxy_session(
     if start_guard.is_limited(Instant::now()) {
         return Err(ErrorCode::RateLimited);
     }
-    let credential = resolve_unlocked_credential(state, &proxy.cred_id).await?;
+    let credential = resolve_unlocked_credential(state, &cred_id).await?;
     let (executor_entry, executor_socket, node_path, browsers_path, ttl, browser_max_lifetime) = {
         let daemon = state.lock().await;
         (
@@ -2514,11 +2591,40 @@ async fn start_api_proxy_session(
             daemon.browser_max_lifetime,
         )
     };
-    let header_value = Zeroizing::new(
-        proxy
-            .value
-            .replace(API_PROXY_SECRET_PLACEHOLDER, credential.password.as_str()),
-    );
+    let (header_value, value_template, oauth) = if let Some(oauth) = &proxy.oauth {
+        let login_url = credential_metadata(state, &cred_id)
+            .await?
+            .and_then(|metadata| metadata.uri)
+            .filter(|uri| !uri.is_empty())
+            .or_else(|| http_origin(&oauth.device_authorization_url))
+            .ok_or(ErrorCode::Internal)?;
+        let oauth = ExecutorApiProxyOAuth {
+            client_id: oauth.client_id.clone(),
+            device_authorization_url: oauth.device_authorization_url.clone(),
+            token_url: oauth.token_url.clone(),
+            revocation_url: oauth.revocation_url.clone(),
+            scope: oauth.scope.clone(),
+            login_url,
+            steps: oauth.steps.clone(),
+            success_selector: oauth.success_selector.clone(),
+            failure_selector: oauth.failure_selector.clone(),
+            secret: ExecutorApiProxyOAuthSecret {
+                username: Zeroizing::new(credential.username.as_str().to_owned()),
+                password: Zeroizing::new(credential.password.as_str().to_owned()),
+                totp: current_totp(&credential).map(Zeroizing::new),
+            },
+        };
+        (None, Some(proxy.value.clone()), Some(oauth))
+    } else {
+        (
+            Some(Zeroizing::new(proxy.value.replace(
+                API_PROXY_SECRET_PLACEHOLDER,
+                credential.password.as_str(),
+            ))),
+            None,
+            None,
+        )
+    };
     drop(credential);
     start_guard.record_attempt(Instant::now());
     let browser_started_at = Instant::now();
@@ -2528,7 +2634,11 @@ async fn start_api_proxy_session(
         &node_path,
         browsers_path.as_deref(),
         &proxy,
-        header_value,
+        ApiProxyStartOptions {
+            value_template,
+            header_value,
+            oauth,
+        },
     )
     .await
     {
@@ -2559,7 +2669,7 @@ async fn start_api_proxy_session(
     // プロキシは共有しないため shared_browsers には登録しない。endpoint は CDP の
     // 相乗りにのみ使われる値であり、path secret を残さないよう空とする。
     let browser = sessions::Browser {
-        key: sessions::BrowserKey::new(principal.clone(), namespace.clone(), proxy.cred_id.clone()),
+        key: sessions::BrowserKey::new(principal.clone(), namespace.clone(), cred_id.clone()),
         executor: connection.clone(),
         port,
         endpoint: String::new(),
@@ -2596,7 +2706,7 @@ async fn start_api_proxy_session(
             session_id: session_id.clone(),
             namespace,
             name: proxy.name,
-            cred_id: proxy.cred_id,
+            cred_id,
             peer: peer.clone(),
         }),
     );
@@ -3550,14 +3660,22 @@ async fn start_api_proxy_executor(
     node_path: &Path,
     browsers_path: Option<&Path>,
     proxy: &ApiProxyConfig,
-    header_value: Zeroizing<String>,
+    options: ApiProxyStartOptions,
 ) -> Result<(u16, String, ExecutorHandle), ErrorCode> {
+    let ApiProxyStartOptions {
+        value_template,
+        header_value,
+        oauth,
+    } = options;
+    let oauth_enabled = oauth.is_some();
     let build_request = || ExecutorApiProxyStartRequest {
         op: "api_proxy_start",
         id: 1,
         upstream: proxy.upstream.clone(),
         header: proxy.header.clone(),
+        value_template,
         header_value,
+        oauth,
     };
     let ((port, secret), executor) = open_executor_with(
         entry,
@@ -3565,18 +3683,32 @@ async fn start_api_proxy_executor(
         node_path,
         browsers_path,
         build_request,
-        parse_api_proxy_start_response,
+        |line| parse_api_proxy_start_response(line, oauth_enabled),
     )
     .await?;
     Ok((port, secret, executor))
 }
 
 /// `api_proxy_start` への応答からリスナーのポートと path secret を取り出す。
-fn parse_api_proxy_start_response(line: &str) -> Result<(u16, String), ErrorCode> {
+fn parse_api_proxy_start_response(
+    line: &str,
+    oauth_enabled: bool,
+) -> Result<(u16, String), ErrorCode> {
     let response: ExecutorApiProxyStartResponse =
         serde_json::from_str(line).map_err(|_| ErrorCode::Internal)?;
-    if response.id != Some(1) || !response.ok {
+    if response.id != Some(1) {
         return Err(ErrorCode::Internal);
+    }
+    if !response.ok {
+        return Err(if oauth_enabled {
+            response
+                .error
+                .as_deref()
+                .map(parse_api_proxy_error_code)
+                .unwrap_or(ErrorCode::Internal)
+        } else {
+            ErrorCode::Internal
+        });
     }
     let port = response
         .port
@@ -3616,6 +3748,7 @@ fn selector_step(response: &ExecutorResponse, code: ErrorCode) -> Option<usize> 
 
 fn parse_error_code(value: &str) -> ErrorCode {
     match value {
+        "OAUTH_GRANT_FAILED" => ErrorCode::OAuthGrantFailed,
         "INVALID_CREDENTIAL" => ErrorCode::InvalidCredential,
         "MFA_REQUIRED" => ErrorCode::MfaRequired,
         "SELECTOR_NOT_FOUND" => ErrorCode::SelectorNotFound,
@@ -3629,6 +3762,19 @@ fn parse_error_code(value: &str) -> ErrorCode {
         "PROVIDER_UNAVAILABLE" => ErrorCode::ProviderUnavailable,
         "INTERNAL" => ErrorCode::Internal,
         "NOT_FOUND" => ErrorCode::NotFound,
+        _ => ErrorCode::Internal,
+    }
+}
+
+fn parse_api_proxy_error_code(value: &str) -> ErrorCode {
+    match value {
+        "OAUTH_GRANT_FAILED"
+        | "INVALID_CREDENTIAL"
+        | "MFA_REQUIRED"
+        | "SELECTOR_NOT_FOUND"
+        | "DEVICE_CODE_REJECTED"
+        | "LOGIN_RESULT_TIMEOUT"
+        | "INTERNAL" => parse_error_code(value),
         _ => ErrorCode::Internal,
     }
 }
@@ -3647,29 +3793,30 @@ fn parse_authorize_error_code(value: &str) -> ErrorCode {
 async fn executor_request<T, F>(
     connection: &Arc<ExecutorConnection>,
     request: F,
+    operation_timeout: Duration,
 ) -> Result<Value, ErrorCode>
 where
     T: Serialize,
     F: FnOnce(u64) -> T,
 {
-    let operation = timeout(EXECUTOR_OPERATION_TIMEOUT, connection.operation.lock())
+    let operation = timeout(operation_timeout, connection.operation.lock())
         .await
         .map_err(|_| ErrorCode::Internal)?;
     let id = connection.next_id.fetch_add(1, Ordering::Relaxed);
     let mut request = serde_json::to_vec(&request(id)).map_err(|_| ErrorCode::Internal)?;
     request.push(b'\n');
-    let mut executor = timeout(EXECUTOR_OPERATION_TIMEOUT, connection.executor.lock())
+    let mut executor = timeout(operation_timeout, connection.executor.lock())
         .await
         .map_err(|_| ErrorCode::Internal)?;
-    timeout(EXECUTOR_OPERATION_TIMEOUT, executor.write_line(&request))
+    timeout(operation_timeout, executor.write_line(&request))
         .await
         .map_err(|_| ErrorCode::Internal)?
         .map_err(|_| ErrorCode::Internal)?;
     drop(executor);
-    let mut responses = timeout(EXECUTOR_OPERATION_TIMEOUT, connection.responses.lock())
+    let mut responses = timeout(operation_timeout, connection.responses.lock())
         .await
         .map_err(|_| ErrorCode::Internal)?;
-    let response = timeout(EXECUTOR_OPERATION_TIMEOUT, responses.recv())
+    let response = timeout(operation_timeout, responses.recv())
         .await
         .map_err(|_| ErrorCode::Internal)?
         .ok_or(ErrorCode::Internal)?
@@ -3685,8 +3832,12 @@ where
 }
 
 async fn executor_lease(connection: &Arc<ExecutorConnection>) -> Result<String, ErrorCode> {
-    let response =
-        executor_request(connection, |id| ExecutorLeaseRequest { op: "lease", id }).await?;
+    let response = executor_request(
+        connection,
+        |id| ExecutorLeaseRequest { op: "lease", id },
+        EXECUTOR_OPERATION_TIMEOUT,
+    )
+    .await?;
     let response: tegata_core::wire::ExecutorLeaseResponse =
         serde_json::from_value(response).map_err(|_| ErrorCode::Internal)?;
     if response.ok {
@@ -3704,11 +3855,15 @@ async fn executor_release(
     connection: &Arc<ExecutorConnection>,
     target_id: String,
 ) -> Result<(), ErrorCode> {
-    let response = executor_request(connection, |id| ExecutorReleaseRequest {
-        op: "release",
-        id,
-        target_id,
-    })
+    let response = executor_request(
+        connection,
+        |id| ExecutorReleaseRequest {
+            op: "release",
+            id,
+            target_id,
+        },
+        EXECUTOR_OPERATION_TIMEOUT,
+    )
     .await?;
     let response: tegata_core::wire::ExecutorLeaseResponse =
         serde_json::from_value(response).map_err(|_| ErrorCode::Internal)?;
@@ -3722,10 +3877,14 @@ async fn executor_release(
 }
 
 async fn executor_api_proxy_stop(connection: &Arc<ExecutorConnection>) -> Result<(), ErrorCode> {
-    let response = executor_request(connection, |id| ExecutorApiProxyStopRequest {
-        op: "api_proxy_stop",
-        id,
-    })
+    let response = executor_request(
+        connection,
+        |id| ExecutorApiProxyStopRequest {
+            op: "api_proxy_stop",
+            id,
+        },
+        API_PROXY_STOP_TIMEOUT,
+    )
     .await?;
     (response.get("ok").and_then(Value::as_bool) == Some(true))
         .then_some(())
@@ -3860,33 +4019,71 @@ fn executor_event(line: &str) -> Option<Value> {
 }
 
 async fn audit_api_proxy_event(state: &SharedState, context: &ApiProxyAuditContext, event: Value) {
-    let event = match serde_json::from_value::<ExecutorApiProxyRequestEvent>(event) {
-        Ok(event) if event.event == "api_proxy_request" => event,
-        _ => {
-            eprintln!("tegatad: ignored an unrecognized executor event");
-            return;
+    match event.get("event").and_then(Value::as_str) {
+        Some("api_proxy_request") => {
+            let Ok(event) = serde_json::from_value::<ExecutorApiProxyRequestEvent>(event) else {
+                eprintln!("tegatad: ignored an unrecognized executor event");
+                return;
+            };
+            let daemon = state.lock().await;
+            if let Err(error) = append_audit(
+                &daemon,
+                AuditPeer::Peer(&context.peer),
+                "api_proxy_request".to_owned(),
+                AuditFields {
+                    cred_id: Some(context.cred_id.clone()),
+                    session_id: Some(context.session_id.clone()),
+                    namespace: Some(context.namespace.clone()),
+                    proxy: Some(context.name.clone()),
+                    http_method: Some(event.http_method),
+                    path: Some(audit_proxy_path(&event.path)),
+                    status: Some(event.status),
+                    ..AuditFields::default()
+                },
+                api_proxy_outcome(event.status).to_owned(),
+            )
+            .await
+            {
+                eprintln!("tegatad: audit append failed: {error}");
+            }
         }
-    };
-    let daemon = state.lock().await;
-    if let Err(error) = append_audit(
-        &daemon,
-        AuditPeer::Peer(&context.peer),
-        "api_proxy_request".to_owned(),
-        AuditFields {
-            cred_id: Some(context.cred_id.clone()),
-            session_id: Some(context.session_id.clone()),
-            namespace: Some(context.namespace.clone()),
-            proxy: Some(context.name.clone()),
-            http_method: Some(event.http_method),
-            path: Some(audit_proxy_path(&event.path)),
-            status: Some(event.status),
-            ..AuditFields::default()
-        },
-        api_proxy_outcome(event.status).to_owned(),
-    )
-    .await
-    {
-        eprintln!("tegatad: audit append failed: {error}");
+        Some("oauth_token") => {
+            let Ok(event) = serde_json::from_value::<ExecutorApiProxyOAuthTokenEvent>(event) else {
+                eprintln!("tegatad: ignored an unrecognized executor event");
+                return;
+            };
+            if !matches!(
+                event.action.as_str(),
+                "issued" | "refreshed" | "refresh_failed" | "revoked"
+            ) {
+                return;
+            }
+            let outcome = if event.action == "refresh_failed" {
+                event.action.clone()
+            } else {
+                "ok".to_owned()
+            };
+            let daemon = state.lock().await;
+            if let Err(error) = append_audit(
+                &daemon,
+                AuditPeer::Peer(&context.peer),
+                "api_proxy_oauth".to_owned(),
+                AuditFields {
+                    cred_id: Some(context.cred_id.clone()),
+                    session_id: Some(context.session_id.clone()),
+                    namespace: Some(context.namespace.clone()),
+                    proxy: Some(context.name.clone()),
+                    oauth_action: Some(event.action),
+                    ..AuditFields::default()
+                },
+                outcome,
+            )
+            .await
+            {
+                eprintln!("tegatad: audit append failed: {error}");
+            }
+        }
+        _ => eprintln!("tegatad: ignored an unrecognized executor event"),
     }
 }
 
@@ -4197,6 +4394,72 @@ mod tests {
         assert_eq!(super::api_proxy_outcome(404), "upstream_error");
         assert_eq!(super::api_proxy_outcome(500), "upstream_error");
         assert_eq!(super::api_proxy_outcome(502), "upstream_unreachable");
+    }
+}
+
+#[cfg(test)]
+mod api_proxy_config_tests {
+    use super::{
+        ApiProxyConfig, ApiProxyOAuthConfig, default_api_proxy_value, validate_api_proxies,
+    };
+
+    fn oauth_config() -> ApiProxyOAuthConfig {
+        ApiProxyOAuthConfig {
+            client_id: "client".to_owned(),
+            device_authorization_url: "https://oauth.example/device".to_owned(),
+            token_url: "https://oauth.example/token".to_owned(),
+            revocation_url: None,
+            scope: None,
+            login_cred_id: "mock:site".to_owned(),
+            steps: None,
+            success_selector: "#success".to_owned(),
+            failure_selector: None,
+        }
+    }
+
+    fn proxy() -> ApiProxyConfig {
+        ApiProxyConfig {
+            name: "fx".to_owned(),
+            cred_id: Some("mock:site".to_owned()),
+            upstream: "https://api.example".to_owned(),
+            header: "Authorization".to_owned(),
+            value: default_api_proxy_value(),
+            oauth: None,
+        }
+    }
+
+    #[test]
+    fn api_proxy_requires_exactly_one_credential_mode() {
+        let mut both = proxy();
+        both.oauth = Some(oauth_config());
+        let error = validate_api_proxies(&[both]).expect_err("both credential modes accepted");
+        assert!(error.contains("mutually exclusive"));
+
+        let mut neither = proxy();
+        neither.cred_id = None;
+        let error = validate_api_proxies(&[neither]).expect_err("missing credential mode accepted");
+        assert!(error.contains("exactly one of cred_id or oauth"));
+    }
+
+    #[test]
+    fn api_proxy_rejects_external_http_token_url_and_invalid_login_credential_id() {
+        let mut external_token = proxy();
+        external_token.cred_id = None;
+        let mut oauth = oauth_config();
+        oauth.token_url = "http://example.com/token".to_owned();
+        external_token.oauth = Some(oauth);
+        let error =
+            validate_api_proxies(&[external_token]).expect_err("external token URL accepted");
+        assert!(error.contains("token_url"));
+
+        let mut invalid_login_cred = proxy();
+        invalid_login_cred.cred_id = None;
+        let mut oauth = oauth_config();
+        oauth.login_cred_id = "mocksite".to_owned();
+        invalid_login_cred.oauth = Some(oauth);
+        let error = validate_api_proxies(&[invalid_login_cred])
+            .expect_err("invalid login credential ID accepted");
+        assert!(error.contains("login_cred_id"));
     }
 }
 

@@ -1,6 +1,12 @@
 import { expect, test } from "vitest";
 
-import { encodeFrame, WebSocketFrameParser } from "../src/ws.ts";
+import {
+  encodeFrame,
+  MAX_INCOMING_MESSAGE_BYTES,
+  parseClosePayload,
+  WebSocketFrameParser,
+  WebSocketProtocolError,
+} from "../src/ws.ts";
 
 test("WebSocket frames encode extended lengths and server masking rules", () => {
   const short = encodeFrame("x");
@@ -58,3 +64,59 @@ test("WebSocketFrameParser keeps control frames available between fragments", ()
     { type: "text", text: "partial" },
   ]);
 });
+
+test("WebSocketFrameParser rejects oversized frames and fragmented messages", () => {
+  const single = new WebSocketFrameParser(4);
+  expectProtocolError(
+    () => single.push(encodeFrame("12345", { mask: true })),
+    1009,
+  );
+
+  const fragmented = new WebSocketFrameParser(4);
+  const first = encodeFrame("123", {
+    fin: false,
+    mask: true,
+    maskKey: Buffer.from([1, 2, 3, 4]),
+  });
+  const second = encodeFrame("45", {
+    opcode: 0x0,
+    mask: true,
+    maskKey: Buffer.from([5, 6, 7, 8]),
+  });
+  expect(fragmented.push(first)).toEqual([]);
+  expectProtocolError(() => fragmented.push(second), 1009);
+  expect(MAX_INCOMING_MESSAGE_BYTES).toBe(16 * 1024 * 1024);
+});
+
+test("WebSocket close payloads reject invalid status codes and UTF-8", () => {
+  expect(parseClosePayload(Buffer.alloc(0))).toEqual({
+    code: 1000,
+    reason: "",
+  });
+  expect(parseClosePayload(Buffer.from([0x03, 0xe8, 0x6f, 0x6b]))).toEqual({
+    code: 1000,
+    reason: "ok",
+  });
+
+  for (const payload of [
+    Buffer.from([0x01]),
+    Buffer.from([0x03, 0xed]),
+    Buffer.from([0x03, 0xee]),
+    Buffer.from([0x03, 0xf7]),
+    Buffer.from([0x00, 0x01]),
+    Buffer.from([0x13, 0x88]),
+    Buffer.from([0x03, 0xe8, 0xff]),
+  ]) {
+    expectProtocolError(() => parseClosePayload(payload), 1002);
+  }
+});
+
+function expectProtocolError(action: () => void, code: number): void {
+  try {
+    action();
+    throw new Error("expected a WebSocket protocol error");
+  } catch (error) {
+    expect(error).toBeInstanceOf(WebSocketProtocolError);
+    expect((error as WebSocketProtocolError).code).toBe(code);
+  }
+}

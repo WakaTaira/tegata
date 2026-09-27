@@ -3,6 +3,8 @@ import type { IncomingMessage } from "node:http";
 import type { Socket } from "node:net";
 
 const WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+export const MAX_INCOMING_MESSAGE_BYTES = 16 * 1024 * 1024;
+export const SOCKET_CLOSE_GRACE_MS = 500;
 
 export type WebSocketFrameOptions = {
   opcode?: number;
@@ -78,8 +80,14 @@ export function encodeFrame(
 }
 
 export class WebSocketFrameParser {
+  private readonly maxMessageBytes: number;
   private buffer = Buffer.alloc(0);
   private fragments: Buffer[] | null = null;
+  private fragmentBytes = 0;
+
+  constructor(maxMessageBytes = MAX_INCOMING_MESSAGE_BYTES) {
+    this.maxMessageBytes = maxMessageBytes;
+  }
 
   push(chunk: Uint8Array): WebSocketParsedEvent[] {
     if (chunk.length > 0) {
@@ -146,6 +154,10 @@ export class WebSocketFrameParser {
       length = Number(wideLength);
     }
 
+    if (length > this.maxMessageBytes) {
+      throw new WebSocketProtocolError(1009, "WebSocket message is too large");
+    }
+
     const isControl = opcode >= 0x8;
     if (isControl && (!fin || length > 125)) {
       throw new WebSocketProtocolError(1002, "invalid WebSocket control frame");
@@ -195,6 +207,7 @@ export class WebSocketFrameParser {
         events.push({ type: "text", text: decodeText(frame.payload) });
       } else {
         this.fragments = [frame.payload];
+        this.fragmentBytes = frame.payload.length;
       }
       return;
     }
@@ -205,13 +218,18 @@ export class WebSocketFrameParser {
         "invalid WebSocket continuation frame",
       );
     }
+    if (this.fragmentBytes + frame.payload.length > this.maxMessageBytes) {
+      throw new WebSocketProtocolError(1009, "WebSocket message is too large");
+    }
     this.fragments.push(frame.payload);
+    this.fragmentBytes += frame.payload.length;
     if (frame.fin) {
       events.push({
         type: "text",
         text: decodeText(Buffer.concat(this.fragments)),
       });
       this.fragments = null;
+      this.fragmentBytes = 0;
     }
   }
 }
@@ -234,6 +252,7 @@ export class ServerWebSocket {
   private readonly parser = new WebSocketFrameParser();
   private state: ServerWebSocketState = "open";
   private closeNotified = false;
+  private closeTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly messageHandlers: Array<(text: string) => void> = [];
   private readonly closeHandlers: Array<
     (code: number | null, reason: string) => void
@@ -278,19 +297,27 @@ export class ServerWebSocket {
       return;
     }
     if (this.state === "closing") {
-      this.socket.end();
+      this.scheduleSocketDestroy();
+      this.endSocket();
       return;
     }
 
     const payload = encodeClosePayload(code, reason);
     this.state = "closing";
-    this.socket.write(encodeFrame(payload, { opcode: 0x8 }), () =>
-      this.socket.end(),
-    );
+    this.scheduleSocketDestroy();
+    try {
+      this.socket.write(encodeFrame(payload, { opcode: 0x8 }), () =>
+        this.endSocket(),
+      );
+    } catch {
+      this.socket.destroy();
+      this.finishClose(null, "");
+    }
   }
 
   terminate(): void {
     if (this.state !== "closed") {
+      this.clearCloseTimer();
       this.state = "closed";
       this.socket.destroy();
       this.finishClose(null, "");
@@ -329,18 +356,40 @@ export class ServerWebSocket {
     if (this.state === "closed") {
       return;
     }
+    let closePayload: Buffer;
+    try {
+      const close = parseClosePayload(payload);
+      closePayload = encodeClosePayload(close.code, close.reason);
+    } catch (error) {
+      const protocolError =
+        error instanceof WebSocketProtocolError
+          ? error
+          : new WebSocketProtocolError(1002, "invalid WebSocket close frame");
+      this.reportError(protocolError);
+      this.close(protocolError.code, protocolError.message);
+      return;
+    }
     if (this.state === "open") {
       this.state = "closing";
-      this.socket.write(encodeFrame(payload, { opcode: 0x8 }), () =>
-        this.socket.end(),
-      );
+      this.scheduleSocketDestroy();
+      try {
+        this.socket.write(encodeFrame(closePayload, { opcode: 0x8 }), () =>
+          this.endSocket(),
+        );
+      } catch {
+        this.socket.destroy();
+        this.finishClose(null, "");
+      }
     } else {
-      this.socket.end();
+      this.scheduleSocketDestroy();
+      this.endSocket();
     }
   }
 
   private fail(error: Error): void {
     this.reportError(error);
+    this.clearCloseTimer();
+    this.socket.destroy();
     this.finishClose(null, "");
   }
 
@@ -354,10 +403,38 @@ export class ServerWebSocket {
     if (this.closeNotified) {
       return;
     }
+    this.clearCloseTimer();
     this.closeNotified = true;
     this.state = "closed";
     for (const handler of this.closeHandlers) {
       handler(code, reason);
+    }
+  }
+
+  private scheduleSocketDestroy(): void {
+    this.clearCloseTimer();
+    this.closeTimer = setTimeout(() => {
+      this.closeTimer = null;
+      if (this.state !== "closed") {
+        this.socket.destroy();
+        this.finishClose(null, "");
+      }
+    }, SOCKET_CLOSE_GRACE_MS);
+  }
+
+  private clearCloseTimer(): void {
+    if (this.closeTimer) {
+      clearTimeout(this.closeTimer);
+      this.closeTimer = null;
+    }
+  }
+
+  private endSocket(): void {
+    try {
+      this.socket.end();
+    } catch {
+      this.socket.destroy();
+      this.finishClose(null, "");
     }
   }
 }
@@ -442,4 +519,48 @@ function encodeClosePayload(code: number, reason: string): Buffer {
   payload.writeUInt16BE(code, 0);
   reasonBytes.copy(payload, 2);
   return payload;
+}
+
+export function parseClosePayload(payload: Uint8Array): {
+  code: number;
+  reason: string;
+} {
+  const bytes = Buffer.from(payload);
+  if (bytes.length === 0) {
+    return { code: 1000, reason: "" };
+  }
+  if (bytes.length === 1) {
+    throw new WebSocketProtocolError(
+      1002,
+      "a WebSocket close frame must contain a status code",
+    );
+  }
+
+  const code = bytes.readUInt16BE(0);
+  if (!isValidCloseCode(code)) {
+    throw new WebSocketProtocolError(
+      1002,
+      `invalid WebSocket close status code: ${code}`,
+    );
+  }
+  let reason: string;
+  try {
+    reason = new TextDecoder("utf-8", { fatal: true }).decode(
+      bytes.subarray(2),
+    );
+  } catch {
+    throw new WebSocketProtocolError(
+      1002,
+      "invalid UTF-8 in WebSocket close reason",
+    );
+  }
+  return { code, reason };
+}
+
+function isValidCloseCode(code: number): boolean {
+  return (
+    (code >= 1000 && code <= 1003) ||
+    (code >= 1007 && code <= 1014) ||
+    (code >= 3000 && code <= 4999)
+  );
 }

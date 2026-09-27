@@ -4,12 +4,18 @@ import {
   type Server,
   type ServerResponse,
 } from "node:http";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
-import { type ServerWebSocket, WebSocketServer } from "./ws.ts";
+import {
+  type ServerWebSocket,
+  SOCKET_CLOSE_GRACE_MS,
+  WebSocketServer,
+} from "./ws.ts";
 
 type JsonObject = Record<string, unknown>;
 
-type CdpMessage = {
+export type CdpMessage = {
   id?: string | number;
   method?: string;
   params?: JsonObject;
@@ -25,7 +31,7 @@ type PendingProxyRequest = {
   sessionId?: string;
 };
 
-type TargetInfo = JsonObject & {
+export type TargetInfo = JsonObject & {
   targetId?: string;
   browserContextId?: string;
 };
@@ -74,7 +80,71 @@ const TARGET_EVENT_METHODS = new Set([
   "Target.targetCreated",
   "Target.targetInfoChanged",
   "Target.targetDestroyed",
+  "Target.targetCrashed",
+  "Target.attachedToTarget",
+  "Target.detachedFromTarget",
 ]);
+
+const STARTUP_TIMEOUT_MS = 10_000;
+
+export function shouldForwardUpstreamResponse(
+  message: CdpMessage,
+  pending: ReadonlyMap<number, unknown>,
+): boolean {
+  if (message.id === undefined) {
+    return true;
+  }
+  return typeof message.id === "number" && pending.has(message.id);
+}
+
+export function shouldForwardTargetEvent(
+  message: CdpMessage,
+  contextId: string,
+  loginTargetId: string,
+  shimTargets: ReadonlySet<string>,
+  targetInfos: ReadonlyMap<string, TargetInfo>,
+  attachedSessions: ReadonlySet<string>,
+): boolean {
+  const method = message.method;
+  if (!method || !TARGET_EVENT_METHODS.has(method)) {
+    return false;
+  }
+  const params = isRecord(message.params) ? message.params : {};
+  if (method === "Target.targetCrashed") {
+    const targetId = stringField(params.targetId);
+    return (
+      targetId === loginTargetId ||
+      (targetId !== null && shimTargets.has(targetId))
+    );
+  }
+  if (
+    method === "Target.attachedToTarget" ||
+    method === "Target.detachedFromTarget"
+  ) {
+    const sessionId = stringField(params.sessionId);
+    return sessionId !== null && attachedSessions.has(sessionId);
+  }
+  if (method === "Target.targetDestroyed") {
+    const targetId = stringField(params.targetId);
+    if (!targetId) {
+      return false;
+    }
+    return (
+      targetId === loginTargetId ||
+      shimTargets.has(targetId) ||
+      targetInfos.get(targetId)?.browserContextId === contextId
+    );
+  }
+
+  const targetInfo = isRecord(params.targetInfo)
+    ? (params.targetInfo as TargetInfo)
+    : null;
+  const targetId = targetInfo ? stringField(targetInfo.targetId) : null;
+  const previous = targetId ? targetInfos.get(targetId) : undefined;
+  const eventContextId =
+    stringField(targetInfo?.browserContextId) ?? previous?.browserContextId;
+  return Boolean(targetId && eventContextId === contextId);
+}
 
 class UpstreamConnection {
   private readonly endpoint: string;
@@ -87,6 +157,7 @@ class UpstreamConnection {
   private messageHandler: ((message: CdpMessage) => void) | null = null;
   private closeHandler: (() => void) | null = null;
   private closeNotified = false;
+  private forceCloseTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(endpoint: string) {
     this.endpoint = endpoint;
@@ -183,6 +254,28 @@ class UpstreamConnection {
     this.socket.close();
   }
 
+  forceClose(): void {
+    if (!this.socket || this.socket.readyState >= 2) {
+      this.handleClose();
+      return;
+    }
+    try {
+      this.socket.close();
+    } catch {
+      this.handleClose();
+      return;
+    }
+    this.forceCloseTimer = setTimeout(() => {
+      this.forceCloseTimer = null;
+      try {
+        this.socket?.close();
+      } catch {
+        // 上流 socket が既に破棄されている場合は処理を継続します。
+      }
+      this.handleClose();
+    }, SOCKET_CLOSE_GRACE_MS);
+  }
+
   private receive(data: unknown): void {
     let message: CdpMessage;
     try {
@@ -216,6 +309,10 @@ class UpstreamConnection {
     if (this.closeNotified) {
       return;
     }
+    if (this.forceCloseTimer) {
+      clearTimeout(this.forceCloseTimer);
+      this.forceCloseTimer = null;
+    }
     this.closeNotified = true;
     const error = new Error("the tegata CDP endpoint closed");
     for (const pending of this.pending.values()) {
@@ -239,14 +336,13 @@ class ShimRuntime {
   private readonly shimTargets = new Set<string>();
   private readonly attachedSessions = new Set<string>();
   private readonly pending = new Map<number, PendingProxyRequest>();
-  private readonly parentPid: number;
   private httpServer: Server | null = null;
   private pluginConnection: ServerWebSocket | null = null;
-  private parentWatch: NodeJS.Timeout | null = null;
   private stopping = false;
   private stopped = false;
-  private readonly stoppedPromise: Promise<void>;
-  private resolveStopped!: () => void;
+  private shutdownCode = 0;
+  private readonly stoppedPromise: Promise<number>;
+  private resolveStopped!: (code: number) => void;
 
   constructor(
     upstream: UpstreamConnection,
@@ -260,12 +356,11 @@ class ShimRuntime {
     this.endpoint = endpoint;
     this.contextId = contextId;
     this.loginTargetId = loginTargetId;
-    this.parentPid = process.ppid;
     this.targetInfos.set(loginTargetId, {
       targetId: loginTargetId,
       browserContextId: contextId,
     });
-    this.stoppedPromise = new Promise((resolve) => {
+    this.stoppedPromise = new Promise<number>((resolve) => {
       this.resolveStopped = resolve;
     });
     upstream.onMessage((message) => this.handleUpstreamMessage(message));
@@ -296,32 +391,22 @@ class ShimRuntime {
         resolve();
       });
     });
-
-    this.parentWatch = setInterval(() => {
-      if (process.ppid === 1 || process.ppid !== this.parentPid) {
-        void this.shutdown("parent process exited");
-      }
-    }, 1_000);
-    this.parentWatch.unref();
   }
 
-  waitForExit(): Promise<void> {
+  waitForExit(): Promise<number> {
     return this.stoppedPromise;
   }
 
-  shutdown(reason = "shim shutting down"): void {
+  shutdown(reason = "shim shutting down", code = 0): void {
     if (this.stopping) {
       return;
     }
     this.stopping = true;
-    if (this.parentWatch) {
-      clearInterval(this.parentWatch);
-      this.parentWatch = null;
-    }
+    this.shutdownCode = code;
     this.pending.clear();
     this.attachedSessions.clear();
     this.webSockets.close(1000, reason);
-    this.upstream.close();
+    this.upstream.forceClose();
 
     const server = this.httpServer;
     if (!server) {
@@ -490,24 +575,29 @@ class ShimRuntime {
       return;
     }
 
-    if (typeof message.id === "number") {
-      const pending = this.pending.get(message.id);
-      if (pending) {
-        this.pending.delete(message.id);
-        this.recordResponse(pending, message);
-        this.sendToPlugin({ ...message, id: pending.clientId });
+    if (message.id !== undefined) {
+      if (!shouldForwardUpstreamResponse(message, this.pending)) {
         return;
       }
+      const pending = this.pending.get(message.id as number);
+      if (!pending) {
+        return;
+      }
+      this.pending.delete(message.id as number);
+      this.recordResponse(pending, message);
+      this.sendToPlugin({ ...message, id: pending.clientId });
+      return;
     }
 
     if (message.sessionId && !this.attachedSessions.has(message.sessionId)) {
       return;
     }
-    if (
-      typeof message.method === "string" &&
-      TARGET_EVENT_METHODS.has(message.method)
-    ) {
-      if (!this.allowTargetEvent(message)) {
+    if (!message.sessionId) {
+      if (
+        typeof message.method !== "string" ||
+        !TARGET_EVENT_METHODS.has(message.method) ||
+        !this.allowTargetEvent(message)
+      ) {
         return;
       }
     }
@@ -550,40 +640,51 @@ class ShimRuntime {
   }
 
   private allowTargetEvent(message: CdpMessage): boolean {
+    if (
+      !shouldForwardTargetEvent(
+        message,
+        this.contextId,
+        this.loginTargetId,
+        this.shimTargets,
+        this.targetInfos,
+        this.attachedSessions,
+      )
+    ) {
+      return false;
+    }
+
     const params = isRecord(message.params) ? message.params : {};
     if (message.method === "Target.targetDestroyed") {
       const targetId = stringField(params.targetId);
-      if (!targetId) {
-        return false;
-      }
-      const targetInfo = this.targetInfos.get(targetId);
-      const allowed =
-        targetId === this.loginTargetId ||
-        this.shimTargets.has(targetId) ||
-        targetInfo?.browserContextId === this.contextId;
-      if (allowed) {
+      if (targetId) {
         this.targetInfos.delete(targetId);
         this.shimTargets.delete(targetId);
       }
-      return allowed;
+    } else if (
+      message.method === "Target.targetCreated" ||
+      message.method === "Target.targetInfoChanged"
+    ) {
+      const targetInfo = isRecord(params.targetInfo)
+        ? (params.targetInfo as TargetInfo)
+        : null;
+      const targetId = targetInfo ? stringField(targetInfo.targetId) : null;
+      const previous = targetId ? this.targetInfos.get(targetId) : undefined;
+      const eventContextId =
+        stringField(targetInfo?.browserContextId) ?? previous?.browserContextId;
+      if (targetId && eventContextId) {
+        this.targetInfos.set(targetId, {
+          ...previous,
+          ...targetInfo,
+          targetId,
+          browserContextId: eventContextId,
+        });
+      }
+    } else if (message.method === "Target.detachedFromTarget") {
+      const sessionId = stringField(params.sessionId);
+      if (sessionId) {
+        this.attachedSessions.delete(sessionId);
+      }
     }
-
-    const targetInfo = isRecord(params.targetInfo)
-      ? (params.targetInfo as TargetInfo)
-      : null;
-    const targetId = targetInfo ? stringField(targetInfo.targetId) : null;
-    const previous = targetId ? this.targetInfos.get(targetId) : undefined;
-    const contextId =
-      stringField(targetInfo?.browserContextId) ?? previous?.browserContextId;
-    if (!targetId || contextId !== this.contextId) {
-      return false;
-    }
-    this.targetInfos.set(targetId, {
-      ...previous,
-      ...targetInfo,
-      targetId,
-      browserContextId: contextId,
-    });
     return true;
   }
 
@@ -627,7 +728,7 @@ class ShimRuntime {
       return;
     }
     this.stopped = true;
-    this.resolveStopped();
+    this.resolveStopped(this.shutdownCode);
   }
 }
 
@@ -635,35 +736,67 @@ async function main(): Promise<number> {
   const initialParentPid = process.ppid;
   const endpoint = process.env.TEGATA_HERDR_ENDPOINT?.trim();
   const targetId = process.env.TEGATA_HERDR_TARGET_ID?.trim();
-  let valid = true;
-  if (!endpoint) {
-    console.error("TEGATA_HERDR_ENDPOINT is required");
-    valid = false;
-  }
-  if (!targetId) {
-    console.error("TEGATA_HERDR_TARGET_ID is required");
-    valid = false;
-  }
-  if (!valid) {
-    return 1;
-  }
+  let upstream: UpstreamConnection | null = null;
+  let runtime: ShimRuntime | null = null;
+  const parentWatch = setInterval(() => {
+    if (process.ppid === 1 || process.ppid !== initialParentPid) {
+      if (runtime) {
+        runtime.shutdown("parent process exited");
+      } else {
+        upstream?.forceClose();
+        process.exit(0);
+      }
+    }
+  }, 1_000);
+  parentWatch.unref();
 
-  const port = parseRemoteDebuggingPort(process.argv.slice(2));
-  if (port === null) {
-    console.error("--remote-debugging-port must be a valid TCP port");
-    return 1;
-  }
-  if (!isWebSocketEndpoint(endpoint)) {
-    console.error("TEGATA_HERDR_ENDPOINT must be a ws:// or wss:// URL");
-    return 1;
-  }
+  const shutdownOnSignal = () => {
+    if (runtime) {
+      runtime.shutdown();
+    } else {
+      upstream?.forceClose();
+      process.exit(0);
+    }
+  };
+  process.once("SIGTERM", shutdownOnSignal);
+  process.once("SIGINT", shutdownOnSignal);
 
-  const upstream = new UpstreamConnection(endpoint);
   try {
-    await upstream.connect();
-    const response = await upstream.request("Target.getTargetInfo", {
-      targetId,
-    });
+    let valid = true;
+    if (!endpoint) {
+      console.error("TEGATA_HERDR_ENDPOINT is required");
+      valid = false;
+    }
+    if (!targetId) {
+      console.error("TEGATA_HERDR_TARGET_ID is required");
+      valid = false;
+    }
+    if (!valid) {
+      return 1;
+    }
+
+    const port = parseRemoteDebuggingPort(process.argv.slice(2));
+    if (port === null) {
+      console.error("--remote-debugging-port must be a valid TCP port");
+      return 1;
+    }
+    if (!isWebSocketEndpoint(endpoint)) {
+      console.error("TEGATA_HERDR_ENDPOINT must be a ws:// or wss:// URL");
+      return 1;
+    }
+
+    const connection = new UpstreamConnection(endpoint);
+    upstream = connection;
+    const response = await withTimeout(
+      (async () => {
+        await connection.connect();
+        return await connection.request("Target.getTargetInfo", {
+          targetId,
+        });
+      })(),
+      STARTUP_TIMEOUT_MS,
+      "timed out starting the tegata Herdr shim",
+    );
     const result = isRecord(response.result) ? response.result : null;
     const targetInfo =
       result && isRecord(result.targetInfo)
@@ -676,28 +809,47 @@ async function main(): Promise<number> {
       throw new Error("Target.getTargetInfo did not return a browser context");
     }
 
-    const runtime = new ShimRuntime(
+    const candidate = new ShimRuntime(
       upstream,
       port,
       endpoint,
       contextId,
       targetId,
     );
-    await runtime.start();
-    process.once("SIGTERM", () => runtime.shutdown());
-    process.once("SIGINT", () => runtime.shutdown());
-    if (process.ppid !== initialParentPid) {
-      runtime.shutdown("parent process exited");
-    }
-    await runtime.waitForExit();
-    return 0;
+    await candidate.start();
+    runtime = candidate;
+    return await runtime.waitForExit();
   } catch (error) {
-    upstream.close();
+    upstream?.forceClose();
     console.error(
       `tegata-herdr shim: startup failed: ${error instanceof Error ? error.message : String(error)}`,
     );
     return 1;
+  } finally {
+    clearInterval(parentWatch);
+    process.removeListener("SIGTERM", shutdownOnSignal);
+    process.removeListener("SIGINT", shutdownOnSignal);
   }
+}
+
+function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 function parseRemoteDebuggingPort(args: string[]): number | null {
@@ -758,13 +910,17 @@ function writeJson(response: ServerResponse, body: unknown): void {
   response.end(text);
 }
 
-void main()
-  .then((code) => {
-    process.exitCode = code;
-  })
-  .catch((error: unknown) => {
-    console.error(
-      `tegata-herdr shim: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    process.exitCode = 1;
-  });
+const isMainModule =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+
+if (isMainModule) {
+  void main()
+    .then((code) => process.exit(code))
+    .catch((error: unknown) => {
+      console.error(
+        `tegata-herdr shim: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      process.exit(1);
+    });
+}

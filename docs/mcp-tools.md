@@ -252,9 +252,10 @@ answers through `approve_cmd` (Linux) or the operator approval hook (Windows,
 ### Session lifetime
 
 Each lease carries a TTL, 300 seconds by default, configurable with
-`session_ttl_secs`, fixed when issued. The browser also has an absolute lifetime
-of 3600 seconds by default, configurable with `browser_max_lifetime_secs` (an
-integer of at least 1), measured from browser launch. The whole login must also complete within
+`session_ttl_secs`, fixed when issued. Browser and API-proxy sessions also have an
+absolute lifetime of 3600 seconds by default, configurable with
+`browser_max_lifetime_secs` (an integer of at least 1), measured from browser or
+proxy launch. The whole login must also complete within
 90 seconds. If startup fails for the same key, subsequent `login` calls wait for
 backoff periods of 2 seconds, 5 seconds, then 15 seconds; calls during backoff
 return `RATE_LIMITED`. More than 3 reauthentication attempts for the same key in
@@ -274,9 +275,10 @@ Returns the caller's lease and shuts down the browser when it was the last lease
 An absent session or a session held by another principal returns `NOT_FOUND`, so
 the daemon does not disclose whether the session exists.
 
-Call it when finished. The CDP endpoint stops being connectable and tegata's browser
-closes, but logout does not invalidate a site-side session. Cookies or other session
-state extracted through CDP remain usable until the site invalidates them.
+Call it when finished. The caller's lease ends; the CDP endpoint and browser close
+only when that was the last lease. In either case, logout does not invalidate a
+site-side session. Cookies or other session state extracted through CDP remain
+usable until the site invalidates them.
 
 ## `authorize_device`
 
@@ -339,6 +341,9 @@ replaced by the injected value; a request missing the secret, or carrying a
 different session's secret, gets a 404 and never reaches upstream, as does a
 request whose path contains a dot segment, `%2e`, or a backslash. `session_id`
 is what `logout` takes to close the relay.
+
+The proxy session ends at the earlier of its `session_ttl_secs` deadline and the
+`browser_max_lifetime_secs` deadline. The latter is measured from proxy launch.
 
 An unknown `name` returns `NOT_FOUND`. Where an approval hook is configured, it
 gates `open_api_proxy` the same way it gates `login`, with `TEGATA_METHOD` set

@@ -1,5 +1,6 @@
 //! JSON wire types shared by the daemon and its clients.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -255,6 +256,72 @@ pub struct ExecutorApiProxyOAuthTokenEvent {
     pub action: String,
 }
 
+/// `open_mcp_server` RPC のパラメータ。agent は `[[mcp_server]]` の名前でのみ選び、コマンド・引数・環境変数は指定できない。
+#[derive(Deserialize)]
+pub struct OpenMcpServerParams {
+    pub name: String,
+}
+
+/// 専用の executor 接続で stdio MCP サーバーを起動する要求。
+///
+/// `env` はプレースホルダを置換済みの値であり、`scan` は漏洩検査の対象文字列である。いずれも解決済みの
+/// 秘密を含むため、executor へ書き込む以外の用途（ログ・監査）に出してはならない。破棄時に消去されるよう
+/// `Zeroizing` で保持し、`Debug` は導出しない。
+#[derive(Serialize)]
+pub struct ExecutorMcpServerStartRequest {
+    pub op: &'static str,
+    pub id: u64,
+    pub command: String,
+    pub args: Vec<String>,
+    #[serde(serialize_with = "serialize_zeroizing_map")]
+    pub env: BTreeMap<String, Zeroizing<String>>,
+    #[serde(serialize_with = "serialize_zeroizing_list")]
+    pub scan: Vec<Zeroizing<String>>,
+}
+
+/// `mcp_server_start` への応答。成功時は loopback のポートと stream secret を持つ。
+#[derive(Deserialize)]
+pub struct ExecutorMcpServerStartResponse {
+    pub id: Option<u64>,
+    pub ok: bool,
+    pub port: Option<u16>,
+    pub stream_secret: Option<String>,
+    pub error: Option<String>,
+}
+
+/// executor 接続の MCP サーバーを終了させ、中継のリスナーと一時ディレクトリを片付ける要求。
+#[derive(Serialize)]
+pub struct ExecutorMcpServerStopRequest {
+    pub op: &'static str,
+    pub id: u64,
+}
+
+/// MCP サーバーの状態変化を executor が書くイベント行。`id` を持たないため、応答待ちの要求と照合されることはない。
+/// `exit_code` は `exit` でのみ意味を持ち、シグナルで終了した場合は null となる。
+#[derive(Deserialize)]
+pub struct ExecutorMcpServerEvent {
+    pub event: String,
+    pub action: String,
+    #[serde(default)]
+    pub exit_code: Option<i64>,
+}
+
+/// 値が `Zeroizing<String>` の対応表を、文字列の対応表として直列化する。
+fn serialize_zeroizing_map<S: serde::Serializer>(
+    value: &BTreeMap<String, Zeroizing<String>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(value.iter().map(|(key, value)| (key, value.as_str())))
+}
+
+/// `Zeroizing<String>` の列を、文字列の配列として直列化する。
+fn serialize_zeroizing_list<S: serde::Serializer>(
+    value: &[Zeroizing<String>],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(value.iter().map(|value| value.as_str()))
+}
+
 /// Preamble version understood by this build.
 pub const PREAMBLE_VERSION: u32 = 1;
 
@@ -362,7 +429,14 @@ pub struct AdminTokenIssueResult {
 
 #[cfg(test)]
 mod tests {
-    use super::{PREAMBLE_VERSION, Preamble, PreambleError, PreambleResponse, PreambleTunnel};
+    use std::collections::BTreeMap;
+
+    use zeroize::Zeroizing;
+
+    use super::{
+        ExecutorMcpServerStartRequest, PREAMBLE_VERSION, Preamble, PreambleError, PreambleResponse,
+        PreambleTunnel,
+    };
 
     #[test]
     fn rpc_preamble_matches_the_pinned_line() {
@@ -390,6 +464,25 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&preamble).expect("serialize preamble"),
             r#"{"v":1,"auth":"token","tunnel":{"session_id":"session","port":9222}}"#
+        );
+    }
+
+    #[test]
+    fn mcp_server_start_request_matches_the_pinned_line() {
+        let request = ExecutorMcpServerStartRequest {
+            op: "mcp_server_start",
+            id: 1,
+            command: "/bin/server".to_owned(),
+            args: vec!["--stdio".to_owned()],
+            env: BTreeMap::from([
+                ("TOKEN".to_owned(), Zeroizing::new("value".to_owned())),
+                ("A".to_owned(), Zeroizing::new("literal".to_owned())),
+            ]),
+            scan: vec![Zeroizing::new("value".to_owned())],
+        };
+        assert_eq!(
+            serde_json::to_string(&request).expect("serialize request"),
+            r#"{"op":"mcp_server_start","id":1,"command":"/bin/server","args":["--stdio"],"env":{"A":"literal","TOKEN":"value"},"scan":["value"]}"#
         );
     }
 

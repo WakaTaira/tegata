@@ -239,6 +239,7 @@ they are meant to be read as the specification of what the boundary guarantees.
 - [Architecture](docs/architecture.md) — layers, abstractions, sequence, audit log
 - [Security](docs/security.md) — threat model, invariants, unlock and TOTP design
 - [MCP tools](docs/mcp-tools.md) — the full agent-facing contract
+- [MCP hosting](docs/mcp-hosting.md) — hosted stdio MCP servers via `tegata-mcp-run`
 - [Linux setup](docs/setup-linux.md) — NixOS module and `config.toml` reference
 - [Container setup](docs/setup-container.md) — Docker bridge network, named token, `tegata-bridge` in the container
 - [Windows / WSL setup](docs/setup-windows-wsl.md) — service, token, seal, bridge
@@ -262,7 +263,12 @@ device-code grant the agent's own tool started, without handing out a browser;
 an injection proxy for static API tokens and tokens tegata obtains itself through
 the OAuth device-code grant — `open_api_proxy` hands the agent a loopback base
 URL and adds the token to every request for one configured upstream, so the agent
-never holds it; an experimental Herdr integration in
+never holds it; hosted stdio MCP servers
+([#20](https://github.com/WakaTaira/tegata/issues/20)) — `open_mcp_server` and
+the `tegata-mcp-run` runner let the agent register a stdio MCP server whose
+own upstream cannot be redirected, with the credential injected into its
+environment behind the boundary instead of the agent's own; an experimental
+Herdr integration in
 [`integrations/herdr`](integrations/herdr) that shows a logged-in session in a
 Herdr browser pane;
 and prebuilt release binaries and bundles for non-Nix deployments,
@@ -274,9 +280,6 @@ Planned, tracked in the
 
 - **CDP isolation** — the browser in its own network namespace, reachable only
   through the daemon's authenticated relay
-- **Injection proxy, remaining part**
-  ([#20](https://github.com/WakaTaira/tegata/issues/20)) — hosted stdio MCP
-  servers
 - **Approved privilege escalation**
   ([#39](https://github.com/WakaTaira/tegata/issues/39)) — running an elevated
   command behind the same out-of-band approval, without handing the agent a

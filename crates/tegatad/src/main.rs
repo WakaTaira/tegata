@@ -15,7 +15,7 @@ mod windows_cli;
 #[cfg(windows)]
 mod windows_service;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -31,8 +31,10 @@ use tegata_core::wire::{
     AuthorizeDeviceParams, ExecutorApiProxyOAuth, ExecutorApiProxyOAuthSecret,
     ExecutorApiProxyOAuthTokenEvent, ExecutorApiProxyRequestEvent, ExecutorApiProxyStartRequest,
     ExecutorApiProxyStartResponse, ExecutorApiProxyStopRequest, ExecutorAuthorizeDeviceRequest,
-    ExecutorLeaseRequest, ExecutorLoginRequest, ExecutorReleaseRequest, ExecutorResponse,
-    ExecutorSecret, LoginParams, OpenApiProxyParams, RpcError, RpcRequest, RpcResponse,
+    ExecutorLeaseRequest, ExecutorLoginRequest, ExecutorMcpServerEvent,
+    ExecutorMcpServerStartRequest, ExecutorMcpServerStartResponse, ExecutorMcpServerStopRequest,
+    ExecutorReleaseRequest, ExecutorResponse, ExecutorSecret, LoginParams, OpenApiProxyParams,
+    OpenMcpServerParams, RpcError, RpcRequest, RpcResponse,
 };
 #[cfg(unix)]
 use tegata_core::wire::{ExecutorHelloRequest, ExecutorHelloResponse};
@@ -70,6 +72,9 @@ const EXECUTOR_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// （packages/tegata-executor/src/oauth.ts の `REVOCATION_TIMEOUT_MS`）に余裕を足した値である。
 /// 変更時は両方を揃える。
 const API_PROXY_STOP_TIMEOUT: Duration = Duration::from_secs(8);
+/// `mcp_server_stop` の応答待ちの上限。executor は SIGTERM の後 2 秒で SIGKILL へ移るため、
+/// その待機と後始末に余裕を足した値とする。
+const MCP_SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const EXECUTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const PASSWORD_FILE_DIR: &str = ".bw-passwords";
 
@@ -132,6 +137,8 @@ struct Config {
     max_pending_connections: usize,
     #[serde(default)]
     api_proxy: Vec<ApiProxyConfig>,
+    #[serde(default)]
+    mcp_server: Vec<McpServerConfig>,
     /// Keys of the platform transport, read from the same top level table.
     /// Which keys those are depends on the target, so the transport module
     /// owns them.
@@ -279,6 +286,74 @@ fn validate_api_proxy_oauth(name: &str, oauth: &ApiProxyOAuthConfig) -> Result<(
         return Err(format!(
             "api_proxy \"{name}\": oauth steps contain an unsupported action or value"
         ));
+    }
+    Ok(())
+}
+
+/// `[[mcp_server]]` の 1 項目。agent は `name` で選ぶだけで、コマンド・引数・環境変数は設定で固定される。
+#[derive(Clone, Debug, Deserialize)]
+struct McpServerConfig {
+    name: String,
+    cred_id: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+}
+
+/// `[mcp_server.env]` の値で置換するプレースホルダ。`{{secret}}` は password、`{{totp}}` は現在の TOTP である。
+const MCP_SECRET_PLACEHOLDER: &str = API_PROXY_SECRET_PLACEHOLDER;
+const MCP_USERNAME_PLACEHOLDER: &str = "{{username}}";
+const MCP_TOTP_PLACEHOLDER: &str = "{{totp}}";
+const MCP_PLACEHOLDERS: [&str; 3] = [
+    MCP_SECRET_PLACEHOLDER,
+    MCP_USERNAME_PLACEHOLDER,
+    MCP_TOTP_PLACEHOLDER,
+];
+
+fn contains_mcp_placeholder(template: &str) -> bool {
+    MCP_PLACEHOLDERS
+        .iter()
+        .any(|placeholder| template.contains(placeholder))
+}
+
+/// 起動を拒否すべき `[[mcp_server]]` の設定誤りを検出する。名前空間は `[[api_proxy]]` と別である。
+fn validate_mcp_servers(servers: &[McpServerConfig]) -> Result<(), String> {
+    let mut names = HashSet::new();
+    for server in servers {
+        if server.name.is_empty() {
+            return Err("mcp_server name must not be empty".to_owned());
+        }
+        if !names.insert(server.name.as_str()) {
+            return Err(format!(
+                "mcp_server \"{}\" is defined more than once",
+                server.name
+            ));
+        }
+        if server.cred_id.split_once(':').is_none() {
+            return Err(format!(
+                "mcp_server \"{}\": cred_id must be <namespace>:<entry id>",
+                server.name
+            ));
+        }
+        if !Path::new(&server.command).is_absolute() {
+            return Err(format!(
+                "mcp_server \"{}\": command must be an absolute path",
+                server.name
+            ));
+        }
+        if !server
+            .env
+            .values()
+            .any(|template| contains_mcp_placeholder(template))
+        {
+            return Err(format!(
+                "mcp_server \"{}\": env must contain at least one of {}",
+                server.name,
+                MCP_PLACEHOLDERS.join(", ")
+            ));
+        }
     }
     Ok(())
 }
@@ -518,6 +593,7 @@ struct DaemonState {
     approval_grants: grants::ApprovalGrants,
     peers: peers::SharedPeerStore,
     api_proxies: HashMap<String, ApiProxyConfig>,
+    mcp_servers: HashMap<String, McpServerConfig>,
     #[cfg(windows)]
     sealed_blob_path: PathBuf,
 }
@@ -609,7 +685,7 @@ struct AuditRecord<'a> {
     outcome: String,
 }
 
-/// 監査行の項目。`proxy` 以降は注入プロキシ経由の要求の行でのみ値を持ち、他の行では省略される。
+/// 監査行の項目。`proxy` 以降は注入プロキシ・MCP サーバーの行でのみ値を持ち、他の行では省略される。
 #[derive(Clone, Default, Serialize)]
 struct AuditFields {
     cred_id: Option<String>,
@@ -634,6 +710,12 @@ struct AuditFields {
     status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     oauth_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp_server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp_action: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -934,6 +1016,7 @@ async fn run_daemon(
     }
     let listeners = normalize_listeners(&config_text, &config)?;
     validate_api_proxies(&config.api_proxy)?;
+    validate_mcp_servers(&config.mcp_server)?;
     #[cfg(unix)]
     if let Some(path) = config.executor_socket.as_deref() {
         let uid = validate_executor_socket(path).await?;
@@ -1220,6 +1303,11 @@ async fn build_state(
         .iter()
         .map(|proxy| (proxy.name.clone(), proxy.clone()))
         .collect();
+    let mcp_servers = config
+        .mcp_server
+        .iter()
+        .map(|server| (server.name.clone(), server.clone()))
+        .collect();
     let mut providers = Vec::new();
     let mut version_logged = false;
     for provider in config.providers {
@@ -1317,6 +1405,7 @@ async fn build_state(
         approval_grants: grants::ApprovalGrants::new(approval_grant_ttl),
         peers,
         api_proxies,
+        mcp_servers,
         #[cfg(windows)]
         sealed_blob_path,
     })
@@ -1869,6 +1958,7 @@ async fn handle_request(
         "login" => login(request, state, peer).await,
         "authorize_device" => authorize_device(request, state, peer).await,
         "open_api_proxy" => open_api_proxy(request, state, peer).await,
+        "open_mcp_server" => open_mcp_server(request, state, peer).await,
         "logout" => logout(request, state, peer).await,
         "get_totp" => get_totp(request, state).await,
         "lock_vault" => lock_vault(request, state).await,
@@ -2105,11 +2195,11 @@ async fn status(request: &RpcRequest, state: SharedState) -> HandledRequest {
         .values()
         .map(|browser| browser.leases.len())
         .sum::<usize>();
-    // `browsers` はブラウザのみを数え、注入プロキシは含めない。`leases` は両方のリースを数える。
+    // `browsers` はブラウザのみを数え、注入プロキシと MCP サーバーは含めない。`leases` はすべてのリースを数える。
     let browsers = daemon
         .browsers
         .values()
-        .filter(|browser| !browser.is_api_proxy())
+        .filter(|browser| !browser.is_service())
         .count();
     success(
         request.id.clone(),
@@ -2574,11 +2664,10 @@ async fn start_api_proxy_session(
     cred_id: String,
     namespace: String,
 ) -> Result<(String, String), ErrorCode> {
-    let principal = peer.principal();
     let start_gate = start_control(
         state,
         sessions::StartKey::ApiProxy {
-            principal: principal.clone(),
+            principal: peer.principal(),
             name: proxy.name.clone(),
         },
     )
@@ -2588,17 +2677,7 @@ async fn start_api_proxy_session(
         return Err(ErrorCode::RateLimited);
     }
     let credential = resolve_unlocked_credential(state, &cred_id).await?;
-    let (executor_entry, executor_socket, node_path, browsers_path, ttl, browser_max_lifetime) = {
-        let daemon = state.lock().await;
-        (
-            daemon.executor_entry.clone(),
-            daemon.executor_socket.clone(),
-            daemon.node_path.clone(),
-            daemon.browsers_path.clone(),
-            daemon.session_ttl,
-            daemon.browser_max_lifetime,
-        )
-    };
+    let settings = service_launch_settings(state).await;
     let options = if let Some(oauth) = &proxy.oauth {
         build_oauth_start(&proxy.value, oauth, &credential)?
     } else {
@@ -2615,15 +2694,7 @@ async fn start_api_proxy_session(
     drop(credential);
     start_guard.record_attempt(Instant::now());
     let browser_started_at = Instant::now();
-    let (port, secret, mut executor) = match start_api_proxy_executor(
-        &executor_entry,
-        executor_socket.as_deref(),
-        &node_path,
-        browsers_path.as_deref(),
-        &proxy,
-        options,
-    )
-    .await
+    let (port, secret, executor) = match start_api_proxy_executor(&settings, &proxy, options).await
     {
         Ok(result) => {
             start_guard.record_success();
@@ -2634,8 +2705,71 @@ async fn start_api_proxy_session(
             return Err(error);
         }
     };
-    let deadline = browser_started_at + browser_max_lifetime;
+    let deadline = browser_started_at + settings.browser_max_lifetime;
     drop(start_guard);
+    let session_id = register_service_lease(
+        state,
+        peer,
+        executor,
+        ServiceLease {
+            kind: ServiceKind::ApiProxy,
+            name: proxy.name,
+            cred_id,
+            namespace,
+            port,
+            ttl: settings.session_ttl,
+            deadline,
+        },
+    )
+    .await?;
+    Ok((session_id, format!("http://127.0.0.1:{port}/{secret}")))
+}
+
+/// executor 接続 1 本を占有するサービスの種類。リースの解放要求とイベント行の扱いを決める。
+#[derive(Clone, Copy)]
+enum ServiceKind {
+    ApiProxy,
+    McpServer,
+}
+
+impl ServiceKind {
+    fn lease_target(self) -> sessions::LeaseTarget {
+        match self {
+            Self::ApiProxy => sessions::LeaseTarget::ApiProxy,
+            Self::McpServer => sessions::LeaseTarget::McpServer,
+        }
+    }
+}
+
+/// 起動済みのサービスをリースとして登録するための値。`name` は設定上の名前である。
+struct ServiceLease {
+    kind: ServiceKind,
+    name: String,
+    cred_id: String,
+    namespace: String,
+    port: u16,
+    ttl: Duration,
+    deadline: Instant,
+}
+
+/// 起動済みのサービスの executor 接続を排他リース 1 件として登録し、イベント行の読み取りを始める。
+/// 登録できなかった場合は executor を停止する。発行した session_id を返す。
+async fn register_service_lease(
+    state: &SharedState,
+    peer: &PeerIdentity,
+    mut executor: ExecutorHandle,
+    lease: ServiceLease,
+) -> Result<String, ErrorCode> {
+    let ServiceLease {
+        kind,
+        name,
+        cred_id,
+        namespace,
+        port,
+        ttl,
+        deadline,
+    } = lease;
+    let principal = peer.principal();
     let Some(reader) = executor.take_reader() else {
         stop_child(executor).await;
         return Err(ErrorCode::Internal);
@@ -2649,8 +2783,8 @@ async fn start_api_proxy_session(
     });
     let session_id = Uuid::new_v4().to_string();
     let now = Instant::now();
-    // プロキシは共有しないため shared_browsers には登録しない。endpoint は CDP の
-    // 相乗りにのみ使われる値であり、path secret を残さないよう空とする。
+    // サービスは共有しないため shared_browsers には登録しない。endpoint は CDP の
+    // 相乗りにのみ使われる値であり、path secret などを残さないよう空とする。
     let browser = sessions::Browser {
         key: sessions::BrowserKey::new(principal.clone(), namespace.clone(), cred_id.clone()),
         executor: connection.clone(),
@@ -2662,7 +2796,7 @@ async fn start_api_proxy_session(
             sessions::Lease {
                 principal: principal.clone(),
                 expires_at: lease_expiry(now, ttl, deadline),
-                target: sessions::LeaseTarget::ApiProxy,
+                target: kind.lease_target(),
             },
         )]),
         exclusive: true,
@@ -2682,18 +2816,258 @@ async fn start_api_proxy_session(
         .insert(browser_id.clone(), browser);
     spawn_executor_reaper(
         state.clone(),
-        browser_id,
+        browser_id.clone(),
         reader,
         response_sender,
-        Some(ApiProxyAuditContext {
+        Some(ServiceEventContext {
+            kind,
+            browser_id,
             session_id: session_id.clone(),
             namespace,
-            name: proxy.name,
+            name,
             cred_id,
             peer: peer.clone(),
         }),
     );
-    Ok((session_id, format!("http://127.0.0.1:{port}/{secret}")))
+    Ok(session_id)
+}
+
+/// 設定済みの MCP サーバーを専用の executor 接続で起動し、排他リースとして登録する。
+///
+/// 監査項目は agent が params に添えた値ではなく、名前で引いた設定の値から確定する。
+async fn open_mcp_server(
+    request: &RpcRequest,
+    state: SharedState,
+    peer: &PeerIdentity,
+) -> HandledRequest {
+    let params = match parse_params::<OpenMcpServerParams>(&request.params) {
+        Ok(params) => params,
+        Err(error) => return classified(request.id.clone(), error),
+    };
+    let Some(server) = state.lock().await.mcp_servers.get(&params.name).cloned() else {
+        return classified(request.id.clone(), ErrorCode::NotFound);
+    };
+    let cred_id = server.cred_id.clone();
+    let target_url = format!("mcp:{}", server.name);
+    let mut fields = AuditFields {
+        cred_id: Some(cred_id.clone()),
+        target_url: Some(target_url.clone()),
+        namespace: cred_id
+            .split_once(':')
+            .map(|(namespace, _)| namespace.to_owned()),
+        mcp_server: Some(server.name.clone()),
+        ..AuditFields::default()
+    };
+    let Some((namespace, _)) = cred_id.split_once(':') else {
+        return classified(request.id.clone(), ErrorCode::InvalidCredential)
+            .with_audit_fields(fields);
+    };
+    let namespace = namespace.to_owned();
+    let grant = match gate_on_approval(&state, &cred_id, &target_url, "open_mcp_server", peer).await
+    {
+        Ok(grant) => grant,
+        Err(error) => return classified(request.id.clone(), error).with_audit_fields(fields),
+    };
+    match start_mcp_server_session(&state, peer, server, cred_id, namespace).await {
+        Ok((session_id, port, stream_secret)) => {
+            fields.session_id = Some(session_id.clone());
+            success(
+                request.id.clone(),
+                json!({ "session_id": session_id, "port": port, "stream_secret": stream_secret }),
+            )
+            .with_audit_fields(fields)
+        }
+        Err(error) => classified(request.id.clone(), error).with_audit_fields(fields),
+    }
+    .with_audit_approval_grant(grant)
+}
+
+/// 承認ゲートを通過した MCP サーバーを起動制御を経て起動し、リースを登録して
+/// `(session_id, port, stream_secret)` を返す。`cred_id` と `namespace` は承認対象から分割済みの値である。
+async fn start_mcp_server_session(
+    state: &SharedState,
+    peer: &PeerIdentity,
+    server: McpServerConfig,
+    cred_id: String,
+    namespace: String,
+) -> Result<(String, u16, String), ErrorCode> {
+    let start_gate = start_control(
+        state,
+        sessions::StartKey::McpServer {
+            principal: peer.principal(),
+            name: server.name.clone(),
+        },
+    )
+    .await;
+    let mut start_guard = start_gate.lock().await;
+    if start_guard.is_limited(Instant::now()) {
+        return Err(ErrorCode::RateLimited);
+    }
+    let credential = resolve_unlocked_credential(state, &cred_id).await?;
+    let settings = service_launch_settings(state).await;
+    let launch = build_mcp_server_launch(&server.env, &credential)?;
+    drop(credential);
+    start_guard.record_attempt(Instant::now());
+    let started_at = Instant::now();
+    let (port, stream_secret, executor) =
+        match start_mcp_server_executor(&settings, &server, launch).await {
+            Ok(result) => {
+                start_guard.record_success();
+                result
+            }
+            Err(error) => {
+                start_guard.record_failure(Instant::now());
+                return Err(error);
+            }
+        };
+    let deadline = started_at + settings.browser_max_lifetime;
+    drop(start_guard);
+    let session_id = register_service_lease(
+        state,
+        peer,
+        executor,
+        ServiceLease {
+            kind: ServiceKind::McpServer,
+            name: server.name,
+            cred_id,
+            namespace,
+            port,
+            ttl: settings.session_ttl,
+            deadline,
+        },
+    )
+    .await?;
+    Ok((session_id, port, stream_secret))
+}
+
+/// サービスの起動に用いる executor の起動経路とリースの寿命の設定。
+struct ServiceLaunchSettings {
+    executor_entry: PathBuf,
+    executor_socket: Option<PathBuf>,
+    node_path: PathBuf,
+    browsers_path: Option<PathBuf>,
+    session_ttl: Duration,
+    browser_max_lifetime: Duration,
+}
+
+async fn service_launch_settings(state: &SharedState) -> ServiceLaunchSettings {
+    let daemon = state.lock().await;
+    ServiceLaunchSettings {
+        executor_entry: daemon.executor_entry.clone(),
+        executor_socket: daemon.executor_socket.clone(),
+        node_path: daemon.node_path.clone(),
+        browsers_path: daemon.browsers_path.clone(),
+        session_ttl: daemon.session_ttl,
+        browser_max_lifetime: daemon.browser_max_lifetime,
+    }
+}
+
+/// `mcp_server_start` に載せる環境変数と漏洩検査の対象文字列。いずれも解決済みの秘密を含むため
+/// `Zeroizing` で保持し、`Debug` は導出しない。
+struct McpServerLaunch {
+    env: BTreeMap<String, Zeroizing<String>>,
+    scan: Vec<Zeroizing<String>>,
+}
+
+/// `[mcp_server.env]` のプレースホルダを資格の値で置換し、漏洩検査の対象文字列を作る。
+///
+/// 検査の対象は password と、`{{secret}}` または `{{totp}}` を含んでいた値の置換後の値である
+/// （空文字を除き、重複を除去する）。`{{username}}` のみを含む値は対象としない。
+/// `{{totp}}` を使う設定で資格が TOTP の seed を持たない場合は `INTERNAL` とする。
+fn build_mcp_server_launch(
+    templates: &BTreeMap<String, String>,
+    credential: &ResolvedCredential,
+) -> Result<McpServerLaunch, ErrorCode> {
+    let totp = if templates
+        .values()
+        .any(|template| template.contains(MCP_TOTP_PLACEHOLDER))
+    {
+        Some(Zeroizing::new(
+            current_totp(credential).ok_or(ErrorCode::Internal)?,
+        ))
+    } else {
+        None
+    };
+    let mut values = vec![
+        McpPlaceholderValue {
+            placeholder: MCP_SECRET_PLACEHOLDER,
+            value: credential.password.as_str(),
+            scanned: true,
+        },
+        McpPlaceholderValue {
+            placeholder: MCP_USERNAME_PLACEHOLDER,
+            value: credential.username.as_str(),
+            scanned: false,
+        },
+    ];
+    if let Some(totp) = &totp {
+        values.push(McpPlaceholderValue {
+            placeholder: MCP_TOTP_PLACEHOLDER,
+            value: totp.as_str(),
+            scanned: true,
+        });
+    }
+    let mut scan = Vec::new();
+    push_scan_value(&mut scan, credential.password.as_str());
+    let mut env = BTreeMap::new();
+    for (key, template) in templates {
+        let (value, scanned) = render_mcp_env_value(template, &values);
+        if scanned {
+            push_scan_value(&mut scan, value.as_str());
+        }
+        env.insert(key.clone(), value);
+    }
+    Ok(McpServerLaunch { env, scan })
+}
+
+/// 空文字と既出の値を除いて、漏洩検査の対象文字列へ加える。
+fn push_scan_value(scan: &mut Vec<Zeroizing<String>>, value: &str) {
+    if !value.is_empty() && !scan.iter().any(|existing| existing.as_str() == value) {
+        scan.push(Zeroizing::new(value.to_owned()));
+    }
+}
+
+/// プレースホルダ 1 種と置換する値。`scanned` は、これを含んだ値を漏洩検査の対象とするかである。
+struct McpPlaceholderValue<'a> {
+    placeholder: &'static str,
+    value: &'a str,
+    scanned: bool,
+}
+
+/// テンプレートを先頭から 1 回だけ走査してプレースホルダを置換し、`scanned` のプレースホルダを
+/// 1 つでも置換したかを添えて返す。
+///
+/// 置換後の値を再走査しないため、資格の値に含まれるプレースホルダ形の文字列は展開されない。
+/// 置換中の再確保で秘密の断片が解放済み領域に残らないよう、上限の長さを先に確保する。
+fn render_mcp_env_value(
+    template: &str,
+    values: &[McpPlaceholderValue<'_>],
+) -> (Zeroizing<String>, bool) {
+    let longest = values
+        .iter()
+        .map(|entry| entry.value.len())
+        .max()
+        .unwrap_or(0);
+    let occurrences = template.matches("{{").count();
+    let mut rendered = Zeroizing::new(String::with_capacity(
+        template.len() + occurrences.saturating_mul(longest),
+    ));
+    let mut scanned = false;
+    let mut rest = template;
+    while let Some(character) = rest.chars().next() {
+        if let Some(entry) = values
+            .iter()
+            .find(|entry| rest.starts_with(entry.placeholder))
+        {
+            rendered.push_str(entry.value);
+            rest = &rest[entry.placeholder.len()..];
+            scanned |= entry.scanned;
+        } else {
+            rendered.push(character);
+            rest = &rest[character.len_utf8()..];
+        }
+    }
+    (rendered, scanned)
 }
 
 /// OAuth の注入プロキシについて `api_proxy_start` に載せる値を組み立てる。
@@ -3181,10 +3555,11 @@ async fn terminate_browser(
     let leases = browser.leases.into_iter().collect::<Vec<_>>();
     // executor が応答しない場合に全リース分の待機を積み上げないよう、最初の失敗で個別解放を打ち切る。
     // executor の停止でブラウザ全体が閉じるため、残りのタブは停止処理で回収される。
-    // 注入プロキシのリースは release_leases が偽でも api_proxy_stop で解放する。executor は
-    // この要求の中で OAuth トークンを失効させるため、停止処理の短い待機で打ち切らせない。
+    // 注入プロキシと MCP サーバーのリースは release_leases が偽でも停止要求で解放する。executor は
+    // この要求の中で OAuth トークンの失効や MCP サーバーの終了・一時ディレクトリの削除を行うため、
+    // 停止処理の短い待機で打ち切らせない。
     for (_, lease) in &leases {
-        if !release_leases && !matches!(lease.target, sessions::LeaseTarget::ApiProxy) {
+        if !release_leases && !lease.target.is_service() {
             continue;
         }
         if release_lease(&browser.executor, &lease.target)
@@ -3677,10 +4052,7 @@ async fn shutdown_authorize_executor(executor: &mut ExecutorHandle) {
 
 /// executor 接続を 1 本開き、`api_proxy_start` を送ってリスナーのポートと path secret を受け取る。
 async fn start_api_proxy_executor(
-    entry: &Path,
-    executor_socket: Option<&Path>,
-    node_path: &Path,
-    browsers_path: Option<&Path>,
+    settings: &ServiceLaunchSettings,
     proxy: &ApiProxyConfig,
     options: ApiProxyStartOptions,
 ) -> Result<(u16, String, ExecutorHandle), ErrorCode> {
@@ -3700,15 +4072,61 @@ async fn start_api_proxy_executor(
         oauth,
     };
     let ((port, secret), executor) = open_executor_with(
-        entry,
-        executor_socket,
-        node_path,
-        browsers_path,
+        &settings.executor_entry,
+        settings.executor_socket.as_deref(),
+        &settings.node_path,
+        settings.browsers_path.as_deref(),
         build_request,
         |line| parse_api_proxy_start_response(line, oauth_enabled),
     )
     .await?;
     Ok((port, secret, executor))
+}
+
+/// executor 接続を 1 本開き、`mcp_server_start` を送って中継のリスナーのポートと stream secret を受け取る。
+async fn start_mcp_server_executor(
+    settings: &ServiceLaunchSettings,
+    server: &McpServerConfig,
+    launch: McpServerLaunch,
+) -> Result<(u16, String, ExecutorHandle), ErrorCode> {
+    let McpServerLaunch { env, scan } = launch;
+    let build_request = || ExecutorMcpServerStartRequest {
+        op: "mcp_server_start",
+        id: 1,
+        command: server.command.clone(),
+        args: server.args.clone(),
+        env,
+        scan,
+    };
+    let ((port, stream_secret), executor) = open_executor_with(
+        &settings.executor_entry,
+        settings.executor_socket.as_deref(),
+        &settings.node_path,
+        settings.browsers_path.as_deref(),
+        build_request,
+        parse_mcp_server_start_response,
+    )
+    .await?;
+    Ok((port, stream_secret, executor))
+}
+
+/// `mcp_server_start` への応答から中継のリスナーのポートと stream secret を取り出す。
+/// executor の失敗は分類せず一律に `INTERNAL` とする。
+fn parse_mcp_server_start_response(line: &str) -> Result<(u16, String), ErrorCode> {
+    let response: ExecutorMcpServerStartResponse =
+        serde_json::from_str(line).map_err(|_| ErrorCode::Internal)?;
+    if response.id != Some(1) || !response.ok {
+        return Err(ErrorCode::Internal);
+    }
+    let port = response
+        .port
+        .filter(|port| *port != 0)
+        .ok_or(ErrorCode::Internal)?;
+    let stream_secret = response
+        .stream_secret
+        .filter(|secret| valid_api_proxy_secret(secret))
+        .ok_or(ErrorCode::Internal)?;
+    Ok((port, stream_secret))
 }
 
 /// `api_proxy_start` への応答からリスナーのポートと path secret を取り出す。
@@ -3902,6 +4320,24 @@ async fn executor_api_proxy_stop(connection: &Arc<ExecutorConnection>) -> Result
         API_PROXY_STOP_TIMEOUT,
     )
     .await?;
+    stop_response_ok(&response)
+}
+
+async fn executor_mcp_server_stop(connection: &Arc<ExecutorConnection>) -> Result<(), ErrorCode> {
+    let response = executor_request(
+        connection,
+        |id| ExecutorMcpServerStopRequest {
+            op: "mcp_server_stop",
+            id,
+        },
+        MCP_SERVER_STOP_TIMEOUT,
+    )
+    .await?;
+    stop_response_ok(&response)
+}
+
+/// サービスの停止要求への応答が `ok: true` であるかを確かめる。
+fn stop_response_ok(response: &Value) -> Result<(), ErrorCode> {
     (response.get("ok").and_then(Value::as_bool) == Some(true))
         .then_some(())
         .ok_or(ErrorCode::Internal)
@@ -3917,6 +4353,7 @@ async fn release_lease(
             executor_release(connection, target_id.clone()).await
         }
         sessions::LeaseTarget::ApiProxy => executor_api_proxy_stop(connection).await,
+        sessions::LeaseTarget::McpServer => executor_mcp_server_stop(connection).await,
     }
 }
 
@@ -4018,8 +4455,11 @@ async fn stop_child(mut executor: ExecutorHandle) {
     }
 }
 
-/// 注入プロキシの executor が書くイベント行を監査へ記録するための文脈。
-struct ApiProxyAuditContext {
+/// サービス（注入プロキシ・MCP サーバー）の executor が書くイベント行を、監査とリースの終了へつなぐための文脈。
+/// `browser_id` はリースを収めた `DaemonState::browsers` の鍵である。
+struct ServiceEventContext {
+    kind: ServiceKind,
+    browser_id: String,
     session_id: String,
     namespace: String,
     name: String,
@@ -4027,14 +4467,20 @@ struct ApiProxyAuditContext {
     peer: PeerIdentity,
 }
 
-impl ApiProxyAuditContext {
-    /// セッションに共通する監査項目（資格・セッション・namespace・プロキシ名）を埋めた値を返す。
+impl ServiceEventContext {
+    /// セッションに共通する監査項目（資格・セッション・namespace・サービス名）を埋めた値を返す。
     fn audit_fields(&self) -> AuditFields {
+        let name = Some(self.name.clone());
+        let (proxy, mcp_server) = match self.kind {
+            ServiceKind::ApiProxy => (name, None),
+            ServiceKind::McpServer => (None, name),
+        };
         AuditFields {
             cred_id: Some(self.cred_id.clone()),
             session_id: Some(self.session_id.clone()),
             namespace: Some(self.namespace.clone()),
-            proxy: Some(self.name.clone()),
+            proxy,
+            mcp_server,
             ..AuditFields::default()
         }
     }
@@ -4047,7 +4493,65 @@ fn executor_event(line: &str) -> Option<Value> {
     (value.get("id").is_none() && value.get("event").is_some()).then_some(value)
 }
 
-async fn audit_api_proxy_event(state: &SharedState, context: &ApiProxyAuditContext, event: Value) {
+async fn handle_service_event(state: &SharedState, context: &ServiceEventContext, event: Value) {
+    match context.kind {
+        ServiceKind::ApiProxy => audit_api_proxy_event(state, context, event).await,
+        ServiceKind::McpServer => handle_mcp_server_event(state, context, event).await,
+    }
+}
+
+/// MCP サーバーのイベント行を監査し、サーバーが終了した場合（`exit`・`leak`）はそのリースを終える。
+///
+/// リースの終了は executor への停止要求を伴い、その応答はこのイベントを読んだ reaper が受け渡す。
+/// 同じタスクで待つと応答を読む者がいなくなるため、終了処理は別タスクで行う。
+async fn handle_mcp_server_event(state: &SharedState, context: &ServiceEventContext, event: Value) {
+    let Ok(event) = serde_json::from_value::<ExecutorMcpServerEvent>(event) else {
+        eprintln!("tegatad: ignored an unrecognized executor event");
+        return;
+    };
+    if event.event != "mcp_server" {
+        eprintln!("tegatad: ignored an unrecognized executor event");
+        return;
+    }
+    let (end_reason, outcome) = match event.action.as_str() {
+        "connected" => (None, "ok"),
+        "exit" => (Some("mcp_server_exit"), "ok"),
+        "leak" => (Some("mcp_server_leak"), "leak"),
+        _ => {
+            eprintln!("tegatad: ignored an unrecognized executor event");
+            return;
+        }
+    };
+    let exit_code = if event.action == "exit" {
+        event.exit_code
+    } else {
+        None
+    };
+    let fields = AuditFields {
+        mcp_action: Some(event.action),
+        exit_code,
+        ..context.audit_fields()
+    };
+    append_service_audit(state, context, "mcp_server", fields, outcome.to_owned()).await;
+    if let Some(reason) = end_reason {
+        let state = state.clone();
+        let browser_id = context.browser_id.clone();
+        tokio::spawn(async move {
+            end_service_lease(&state, &browser_id, reason).await;
+        });
+    }
+}
+
+/// サービスのリースを、logout と同じく停止要求と executor の停止で終え、`audit_method` で監査する。
+/// 既に logout などで終えられている場合は何もしない。
+async fn end_service_lease(state: &SharedState, browser_id: &str, audit_method: &'static str) {
+    let browser = take_browser_locked(&mut *state.lock().await, browser_id);
+    if let Some(browser) = browser {
+        terminate_browser(state, browser, audit_method, true).await;
+    }
+}
+
+async fn audit_api_proxy_event(state: &SharedState, context: &ServiceEventContext, event: Value) {
     match event.get("event").and_then(Value::as_str) {
         Some("api_proxy_request") => {
             let Ok(event) = serde_json::from_value::<ExecutorApiProxyRequestEvent>(event) else {
@@ -4061,7 +4565,7 @@ async fn audit_api_proxy_event(state: &SharedState, context: &ApiProxyAuditConte
                 ..context.audit_fields()
             };
             let outcome = api_proxy_outcome(event.status).to_owned();
-            append_api_proxy_audit(state, context, "api_proxy_request", fields, outcome).await;
+            append_service_audit(state, context, "api_proxy_request", fields, outcome).await;
         }
         Some("oauth_token") => {
             let Ok(event) = serde_json::from_value::<ExecutorApiProxyOAuthTokenEvent>(event) else {
@@ -4083,16 +4587,16 @@ async fn audit_api_proxy_event(state: &SharedState, context: &ApiProxyAuditConte
                 oauth_action: Some(event.action),
                 ..context.audit_fields()
             };
-            append_api_proxy_audit(state, context, "api_proxy_oauth", fields, outcome).await;
+            append_service_audit(state, context, "api_proxy_oauth", fields, outcome).await;
         }
         _ => eprintln!("tegatad: ignored an unrecognized executor event"),
     }
 }
 
-/// 注入プロキシの監査行を追記し、失敗は stderr へ報告する。
-async fn append_api_proxy_audit(
+/// サービスの監査行を追記し、失敗は stderr へ報告する。
+async fn append_service_audit(
     state: &SharedState,
-    context: &ApiProxyAuditContext,
+    context: &ServiceEventContext,
     method: &str,
     fields: AuditFields,
     outcome: String,
@@ -4157,7 +4661,7 @@ fn spawn_executor_reaper(
     browser_id: String,
     mut reader: ExecutorReader,
     sender: mpsc::UnboundedSender<io::Result<String>>,
-    api_proxy: Option<ApiProxyAuditContext>,
+    service: Option<ServiceEventContext>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -4172,8 +4676,8 @@ fn spawn_executor_reaper(
             match result {
                 Ok(line) if !line.is_empty() => {
                     if let Some(event) = executor_event(&line) {
-                        if let Some(context) = &api_proxy {
-                            audit_api_proxy_event(&state, context, event).await;
+                        if let Some(context) = &service {
+                            handle_service_event(&state, context, event).await;
                         }
                         continue;
                     }
@@ -4418,6 +4922,53 @@ mod tests {
         assert_eq!(super::api_proxy_outcome(404), "upstream_error");
         assert_eq!(super::api_proxy_outcome(500), "upstream_error");
         assert_eq!(super::api_proxy_outcome(502), "upstream_unreachable");
+    }
+}
+
+#[cfg(test)]
+mod mcp_server_launch_tests {
+    use super::{
+        MCP_SECRET_PLACEHOLDER, MCP_USERNAME_PLACEHOLDER, McpPlaceholderValue, render_mcp_env_value,
+    };
+
+    fn values<'a>(password: &'a str, username: &'a str) -> [McpPlaceholderValue<'a>; 2] {
+        [
+            McpPlaceholderValue {
+                placeholder: MCP_SECRET_PLACEHOLDER,
+                value: password,
+                scanned: true,
+            },
+            McpPlaceholderValue {
+                placeholder: MCP_USERNAME_PLACEHOLDER,
+                value: username,
+                scanned: false,
+            },
+        ]
+    }
+
+    #[test]
+    fn placeholders_are_replaced_in_one_pass() {
+        let values = values("pa{{username}}ss", "user");
+        let (rendered, scanned) = render_mcp_env_value("{{secret}}:{{username}}", &values);
+        // 置換後の値に含まれるプレースホルダ形の文字列は展開しない。
+        assert_eq!(rendered.as_str(), "pa{{username}}ss:user");
+        assert!(scanned);
+    }
+
+    #[test]
+    fn username_only_values_are_not_scanned() {
+        let values = values("secret", "user");
+        let (rendered, scanned) = render_mcp_env_value("as {{username}}", &values);
+        assert_eq!(rendered.as_str(), "as user");
+        assert!(!scanned);
+    }
+
+    #[test]
+    fn literals_and_unknown_placeholders_are_kept() {
+        let values = values("secret", "user");
+        let (rendered, scanned) = render_mcp_env_value("{{other}} ä {{", &values);
+        assert_eq!(rendered.as_str(), "{{other}} ä {{");
+        assert!(!scanned);
     }
 }
 

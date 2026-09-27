@@ -30,6 +30,8 @@ pub(crate) enum StartKey {
     Browser(BrowserKey),
     /// `open_api_proxy` のプロキシ起動。呼び出し元と `[[api_proxy]]` の名前の組ごとに制御する。
     ApiProxy { principal: String, name: String },
+    /// `open_mcp_server` の MCP サーバー起動。呼び出し元と `[[mcp_server]]` の名前の組ごとに制御する。
+    McpServer { principal: String, name: String },
 }
 
 pub(crate) struct Lease {
@@ -44,12 +46,22 @@ pub(crate) enum LeaseTarget {
     Tab(String),
     /// 注入プロキシのリスナー。解放は `api_proxy_stop` で行う。
     ApiProxy,
+    /// executor が起動した stdio MCP サーバーと中継のリスナー。解放は `mcp_server_stop` で行う。
+    McpServer,
+}
+
+impl LeaseTarget {
+    /// ブラウザのタブではなく、executor 接続 1 本を占有するサービス（注入プロキシ・MCP サーバー）であるかを判定する。
+    pub(crate) fn is_service(&self) -> bool {
+        matches!(self, Self::ApiProxy | Self::McpServer)
+    }
 }
 
 /// executor 接続 1 本と、その上のリースの集合。
 ///
-/// ブラウザだけでなく注入プロキシも表す。プロキシの場合、`port` はプロキシのリスナーの
-/// ポートであり、`endpoint` は空、リースは `LeaseTarget::ApiProxy` の 1 件のみとなる。
+/// ブラウザだけでなく注入プロキシと MCP サーバーも表す。これらのサービスの場合、`port` はリスナーの
+/// ポートであり、`endpoint` は空、リースは `LeaseTarget::ApiProxy` または `LeaseTarget::McpServer` の
+/// 1 件のみとなる。
 pub(crate) struct Browser {
     pub(crate) key: BrowserKey,
     pub(crate) executor: Arc<ExecutorConnection>,
@@ -61,11 +73,9 @@ pub(crate) struct Browser {
 }
 
 impl Browser {
-    /// 注入プロキシを表すかを判定する。プロキシのリースだけが `LeaseTarget::ApiProxy` を持つ。
-    pub(crate) fn is_api_proxy(&self) -> bool {
-        self.leases
-            .values()
-            .any(|lease| matches!(lease.target, LeaseTarget::ApiProxy))
+    /// 注入プロキシまたは MCP サーバーを表すかを判定する。これらのリースだけがサービスの `LeaseTarget` を持つ。
+    pub(crate) fn is_service(&self) -> bool {
+        self.leases.values().any(|lease| lease.target.is_service())
     }
 }
 

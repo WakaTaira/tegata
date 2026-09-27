@@ -449,6 +449,18 @@ principal or an absent session is refused with `NOT_FOUND`; a port that does not
 match the caller's session is refused with `FORBIDDEN`. It is a session handoff
 mechanism, not a port forwarder.
 
+## `open_mcp_server`
+
+Not a tool the agent calls — this RPC exists for `tegata-mcp-run`, the
+runner an agent's MCP client registers as an ordinary stdio server, one per
+configured `[[mcp_server]]` entry. See
+[mcp-hosting.md](mcp-hosting.md) for configuration, registration, and the
+leak-containment discussion; `open_mcp_server` shares its error codes with
+`login` and `open_api_proxy`: `NOT_FOUND` for an unconfigured name,
+`APPROVAL_DENIED` and `APPROVAL_TIMEOUT` from the same approval hook,
+`RATE_LIMITED` for repeated starts, `VAULT_LOCKED` for a locked namespace,
+`INVALID_CREDENTIAL`, and `INTERNAL`.
+
 ## Talking to the daemon without MCP
 
 The daemon speaks newline-delimited JSON-RPC 2.0 — one request object per line, one

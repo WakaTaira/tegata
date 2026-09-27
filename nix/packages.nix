@@ -75,9 +75,13 @@ let
       npm prune --omit=dev
       install -Dm644 packages/tegata-mcp/dist/index.js \
         $out/lib/tegata-mcp/index.js
+      install -Dm644 packages/tegata-mcp/dist/run.js \
+        $out/lib/tegata-mcp/run.js
       cp -rL node_modules $out/lib/tegata-mcp/node_modules
       makeWrapper ${pkgs.nodejs_24}/bin/node $out/bin/tegata-mcp \
         --add-flags $out/lib/tegata-mcp/index.js
+      makeWrapper ${pkgs.nodejs_24}/bin/node $out/bin/tegata-mcp-run \
+        --add-flags $out/lib/tegata-mcp/run.js
     '';
 
     meta.mainProgram = "tegata-mcp";

@@ -118,8 +118,9 @@ to container peers as well: sessions owned by another principal return
 
 ### 3. Only a thin, allowlisted RPC crosses the boundary
 
-Eight methods exist: `status`, `list_credentials`, `login`, `authorize_device`,
-`open_api_proxy`, `logout`, `get_totp`, `lock_vault`, plus the administrative
+Nine methods exist: `status`, `list_credentials`, `login`, `authorize_device`,
+`open_api_proxy`, `open_mcp_server`, `logout`, `get_totp`, `lock_vault`, plus
+the administrative
 methods `admin_peer_issue`, `admin_peer_revoke`, `admin_peer_list`, and
 `admin_token_issue`, and on Windows `admin_seal`, `admin_approval_list`, and
 `admin_approval_decide`. Anything else is answered with a JSON-RPC method-not-found
@@ -468,6 +469,17 @@ release.
 executor's guard attaching to CDP, another uid on the same host can connect to
 the loopback CDP port. This is a limitation of the port-based design; network
 namespace isolation is planned for a later release.
+
+**A hosted MCP server's leak scan is a substring check, not a secret
+detector.** `open_mcp_server` and `tegata-mcp-run` (see
+[mcp-hosting.md](mcp-hosting.md)) run the server's stdout through the same
+line-by-line check as any other output crossing the boundary, but it only
+catches the credential value appearing verbatim in a line. Encoding, splitting
+across lines, or otherwise transforming the value defeats it, and stderr is
+not scanned at all. The real control is choosing which servers get a
+`[[mcp_server]]` entry in the first place; the scan is a backstop against an
+accidental leak, not protection against a server that tries to exfiltrate the
+value on purpose.
 
 ## Operator checklist
 

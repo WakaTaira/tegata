@@ -52,6 +52,15 @@ let
       failure_selector = proxy.oauth.failureSelector;
     })}";
 
+  renderMcpServer = name: mcpServer:
+    "[[mcp_server]]\n${renderAssignments {
+      inherit name;
+      cred_id = mcpServer.credId;
+      command = mcpServer.command;
+      args = mcpServer.args;
+    }}"
+    + lib.optionalString (mcpServer.env != {}) "\n[mcp_server.env]\n${renderAssignments mcpServer.env}";
+
   baseConfig = {
     executor_socket = "/run/tegata-executor/executor.sock";
     state_dir = "/var/lib/tegata";
@@ -95,6 +104,8 @@ let
     ${lib.concatStringsSep "\n\n" (map renderProvider cfg.providers)}
 
     ${lib.concatStringsSep "\n\n" (lib.mapAttrsToList renderApiProxy cfg.apiProxies)}
+
+    ${lib.concatStringsSep "\n\n" (lib.mapAttrsToList renderMcpServer cfg.mcpServers)}
   '';
 
   allowedUserArgs = lib.concatStringsSep " " (map lib.escapeShellArg cfg.allowedUsers);
@@ -269,6 +280,33 @@ in
       });
       default = {};
       description = "Injection proxies (open_api_proxy), keyed by the name an agent passes to open_api_proxy.";
+    };
+
+    mcpServers = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.submodule {
+        options = {
+          credId = lib.mkOption {
+            type = lib.types.str;
+            description = "The namespaced credential reference whose values fill the env placeholders.";
+          };
+          command = lib.mkOption {
+            type = lib.types.str;
+            description = "Absolute path to the stdio MCP server binary.";
+          };
+          args = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [];
+            description = "Arguments passed to the server on startup.";
+          };
+          env = lib.mkOption {
+            type = lib.types.attrsOf lib.types.str;
+            default = {};
+            description = "Environment variables passed to the server; values may contain {{secret}}, {{username}}, or {{totp}}.";
+          };
+        };
+      });
+      default = {};
+      description = "Hosted stdio MCP servers (open_mcp_server), keyed by the name an agent's tegata-mcp-run invocation passes.";
     };
 
     executorEntry = lib.mkOption {

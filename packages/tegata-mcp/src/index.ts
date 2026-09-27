@@ -97,7 +97,8 @@ function errorResult(message: string, data?: unknown) {
   };
 }
 
-async function callDaemon(
+// run.ts（tegata-mcp-run）が同じデーモン呼び出し規則を共用するために export する。
+export async function callDaemon(
   method: string,
   params: unknown,
 ): Promise<RpcResponse> {
@@ -225,8 +226,9 @@ type BridgeTunnel =
   | { localPort: number }
   | { failure: ReturnType<typeof internalError | typeof errorResult> };
 
-/** bridge にセッションのポートへのトンネルを開かせ、bridge 側のローカルポートを得る。 */
-async function openBridgeTunnel(
+/** bridge にセッションのポートへのトンネルを開かせ、bridge 側のローカルポートを得る。
+ * run.ts（tegata-mcp-run）が MCP サーバー中継の bridge トンネルにも同じ手順を使うため export する。 */
+export async function openBridgeTunnel(
   sessionId: string,
   port: number,
 ): Promise<BridgeTunnel> {

@@ -16,6 +16,7 @@ interface Credentials {
 
 const sessions = new Map<string, true>();
 const deviceCodes = new Map<string, boolean>();
+let observedSecChUa: string | null = null;
 
 function usageError(message: string): never {
   throw new Error(message);
@@ -189,6 +190,22 @@ ${totpInput}
 </html>`;
 }
 
+function withWorkers(page: string): string {
+  return page.replace(
+    "</body>",
+    `<script>
+const worker = new Worker("/worker.js");
+worker.addEventListener("message", () => {
+  document.body.dataset.workerReady = "true";
+});
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/service-worker.js").catch(() => {});
+}
+</script>
+</body>`,
+  );
+}
+
 function loggedInPage(): string {
   return '<!doctype html><html lang="en"><body><div id="welcome">login-ok</div></body></html>';
 }
@@ -247,22 +264,53 @@ function handleRequest(
 ): void {
   if (
     request.method === "GET" &&
-    (request.url === "/" || request.url === "/ua-gated/")
+    (request.url === "/" ||
+      request.url === "/ua-gated/" ||
+      request.url === "/with-worker/")
   ) {
+    if (request.url === "/ua-gated/") {
+      const secChUa = request.headers["sec-ch-ua"];
+      observedSecChUa = Array.isArray(secChUa)
+        ? secChUa.join(", ")
+        : (secChUa ?? null);
+    }
     if (
       request.url === "/ua-gated/" &&
-      request.headers["user-agent"]?.includes("HeadlessChrome") === true
+      (request.headers["user-agent"]?.includes("HeadlessChrome") === true ||
+        observedSecChUa?.includes("HeadlessChrome") === true)
     ) {
       response.writeHead(403, { "Content-Type": "text/plain; charset=utf-8" });
-      response.end("headless user agent is forbidden");
+      response.end("headless user agent or client hint is forbidden");
       return;
     }
     const session = sessionFrom(request);
-    writePage(
-      response,
+    const page =
       session !== undefined && sessions.has(session)
         ? loggedInPage()
-        : loginForm(false, credentials.totp_seed !== undefined),
+        : loginForm(false, credentials.totp_seed !== undefined);
+    writePage(
+      response,
+      request.url === "/with-worker/" ? withWorkers(page) : page,
+    );
+    return;
+  }
+
+  if (request.method === "GET" && request.url === "/observed-headers") {
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.end(JSON.stringify({ sec_ch_ua: observedSecChUa }));
+    return;
+  }
+
+  if (request.method === "GET" && request.url === "/worker.js") {
+    response.writeHead(200, { "Content-Type": "application/javascript" });
+    response.end('self.postMessage("worker-ready");');
+    return;
+  }
+
+  if (request.method === "GET" && request.url === "/service-worker.js") {
+    response.writeHead(200, { "Content-Type": "application/javascript" });
+    response.end(
+      'self.addEventListener("install", () => self.skipWaiting()); self.addEventListener("activate", () => self.clients.claim());',
     );
     return;
   }

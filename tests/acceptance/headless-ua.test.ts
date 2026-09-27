@@ -22,6 +22,12 @@ async function login(stack: Stack): Promise<LoginResult> {
   return res.json as LoginResult;
 }
 
+async function observedSecChUa(stack: Stack): Promise<string | null> {
+  const response = await fetch(`${stack.fixture.url}/observed-headers`);
+  const value = (await response.json()) as { sec_ch_ua?: unknown };
+  return typeof value.sec_ch_ua === "string" ? value.sec_ch_ua : null;
+}
+
 test("AC-106: login succeeds on the User-Agent-gated route", async () => {
   // Given: a login route that answers HTTP 403 to a HeadlessChrome User-Agent
   const stack = await startStack();
@@ -32,6 +38,9 @@ test("AC-106: login succeeds on the User-Agent-gated route", async () => {
     // Then: login succeeds and returns a CDP endpoint
     expect(result.channel.kind).toBe("cdp");
     expect(result.channel.endpoint).toMatch(/^ws:\/\//);
+    const secChUa = await observedSecChUa(stack);
+    expect(secChUa).not.toBeNull();
+    expect(secChUa).not.toContain("HeadlessChrome");
   } finally {
     await stopStack(stack);
   }
@@ -53,6 +62,13 @@ test("AC-107: the headful User-Agent is inherited by later tabs", async () => {
         .find((candidate) => candidate.url().startsWith(stack.fixture.url));
       if (page === undefined) throw new Error("logged-in page not found");
       const loggedInUserAgent = await page.evaluate(() => navigator.userAgent);
+      const loggedInBrands = await page.evaluate(() =>
+        (
+          navigator as Navigator & {
+            userAgentData: { brands: Array<{ brand: string }> };
+          }
+        ).userAgentData.brands.map(({ brand }) => brand),
+      );
 
       // And: a new target is created in the same browser context
       client = await CdpClient.connect(result.channel.endpoint);
@@ -78,6 +94,13 @@ test("AC-107: the headful User-Agent is inherited by later tabs", async () => {
       const newPage = await newPagePromise;
       await newPage.waitForLoadState("domcontentloaded");
       const newTabUserAgent = await newPage.evaluate(() => navigator.userAgent);
+      const newTabBrands = await newPage.evaluate(() =>
+        (
+          navigator as Navigator & {
+            userAgentData: { brands: Array<{ brand: string }> };
+          }
+        ).userAgentData.brands.map(({ brand }) => brand),
+      );
 
       // Then: the new tab passed the gate and is logged in, and both tabs
       // identify as Chrome without a Headless token
@@ -85,6 +108,9 @@ test("AC-107: the headful User-Agent is inherited by later tabs", async () => {
       for (const userAgent of [loggedInUserAgent, newTabUserAgent]) {
         expect(userAgent).not.toContain("Headless");
         expect(userAgent).toContain("Chrome/");
+      }
+      for (const brands of [loggedInBrands, newTabBrands]) {
+        expect(brands.some((brand) => brand.includes("Headless"))).toBe(false);
       }
     } finally {
       client?.close();

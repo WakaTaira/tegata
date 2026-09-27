@@ -65,6 +65,8 @@ export interface Phase4ConfigOptions {
   tcpBind?: string;
   sessionTtlSecs?: number;
   browserMaxLifetimeSecs?: number;
+  approveCmd?: string;
+  approvalGrantTtlSecs?: number;
   maxPendingConnections?: number;
   entries: MockEntry[];
 }
@@ -79,6 +81,10 @@ export function renderPhase4Config(opts: Phase4ConfigOptions): string {
     lines.push(`session_ttl_secs = ${opts.sessionTtlSecs}`);
   if (opts.browserMaxLifetimeSecs !== undefined)
     lines.push(`browser_max_lifetime_secs = ${opts.browserMaxLifetimeSecs}`);
+  if (opts.approveCmd !== undefined)
+    lines.push(`approve_cmd = ${tomlString(opts.approveCmd)}`);
+  if (opts.approvalGrantTtlSecs !== undefined)
+    lines.push(`approval_grant_ttl_secs = ${opts.approvalGrantTtlSecs}`);
   if (opts.maxPendingConnections !== undefined)
     lines.push(`max_pending_connections = ${opts.maxPendingConnections}`);
   lines.push(
@@ -155,6 +161,8 @@ export interface Phase4DaemonOptions {
   tcpBind?: string;
   sessionTtlSecs?: number;
   browserMaxLifetimeSecs?: number;
+  approveCmd?: string;
+  approvalGrantTtlSecs?: number;
   maxPendingConnections?: number;
 }
 
@@ -182,6 +190,8 @@ export async function startPhase4Daemon(
       tcpBind,
       sessionTtlSecs: opts.sessionTtlSecs,
       browserMaxLifetimeSecs: opts.browserMaxLifetimeSecs,
+      approveCmd: opts.approveCmd,
+      approvalGrantTtlSecs: opts.approvalGrantTtlSecs,
       maxPendingConnections: opts.maxPendingConnections,
       entries: opts.entries,
     }),
@@ -612,6 +622,8 @@ export async function startPhase4Stack(
     operator?: boolean;
     sessionTtlSecs?: number;
     browserMaxLifetimeSecs?: number;
+    approveCmd?: string;
+    approvalGrantTtlSecs?: number;
     maxPendingConnections?: number;
     entries?: (canaries: CanarySet) => MockEntry[];
   } = {},
@@ -638,6 +650,8 @@ export async function startPhase4Stack(
       tcp: opts.tcp,
       sessionTtlSecs: opts.sessionTtlSecs,
       browserMaxLifetimeSecs: opts.browserMaxLifetimeSecs,
+      approveCmd: opts.approveCmd,
+      approvalGrantTtlSecs: opts.approvalGrantTtlSecs,
       maxPendingConnections: opts.maxPendingConnections,
     });
     fixture = await startCountingFixture({

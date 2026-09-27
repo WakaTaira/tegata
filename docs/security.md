@@ -285,6 +285,12 @@ answered within `approve_timeout_secs` — 60 by default — has its whole proce
 group killed and the login fails with `APPROVAL_TIMEOUT`. The verdict is recorded
 as the login's audit outcome.
 
+With a positive `approval_grant_ttl_secs`, the same principal can reuse the same
+credential without another approval until the grant expires. This reduces prompts
+at the cost of a longer window in which an approved principal can use that
+credential. The approval number binds a response to its request; it is not a
+secret, and `get_totp` remains outside this gate.
+
 **Where the gate sits is itself a security decision.** It runs after the request
 is parsed and the credential is confirmed to exist and be reachable, and *before*
 any value is resolved or the executor is started.

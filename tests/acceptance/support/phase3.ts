@@ -82,6 +82,7 @@ export interface Phase3ConfigOptions {
   sessionTtlSecs?: number;
   approveCmd?: string;
   approveTimeoutSecs?: number;
+  approvalGrantTtlSecs?: number;
   auditLogMaxBytes?: number;
   providers: ProviderSpec[];
 }
@@ -100,6 +101,8 @@ export function renderPhase3Config(opts: Phase3ConfigOptions): string {
     lines.push(`approve_cmd = ${tomlString(opts.approveCmd)}`);
   if (opts.approveTimeoutSecs !== undefined)
     lines.push(`approve_timeout_secs = ${opts.approveTimeoutSecs}`);
+  if (opts.approvalGrantTtlSecs !== undefined)
+    lines.push(`approval_grant_ttl_secs = ${opts.approvalGrantTtlSecs}`);
   if (opts.auditLogMaxBytes !== undefined)
     lines.push(`audit_log_max_bytes = ${opts.auditLogMaxBytes}`);
   for (const p of opts.providers) {
@@ -402,6 +405,7 @@ export async function startPhase3Stack(opts: {
     sessionTtlSecs?: number;
     approveCmd?: string;
     approveTimeoutSecs?: number;
+    approvalGrantTtlSecs?: number;
     auditLogMaxBytes?: number;
   };
   makeProviders: (
@@ -435,6 +439,7 @@ export async function startPhase3Stack(opts: {
       sessionTtlSecs: opts.top?.sessionTtlSecs,
       approveCmd: opts.top?.approveCmd,
       approveTimeoutSecs: opts.top?.approveTimeoutSecs,
+      approvalGrantTtlSecs: opts.top?.approvalGrantTtlSecs,
       auditLogMaxBytes: opts.top?.auditLogMaxBytes,
     });
     fixture =

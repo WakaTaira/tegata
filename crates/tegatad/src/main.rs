@@ -2,6 +2,7 @@
 mod approvals;
 #[cfg(windows)]
 mod dpapi;
+mod grants;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod interop;
 mod peers;
@@ -107,6 +108,8 @@ struct Config {
     approve_cmd: Option<String>,
     approve_timeout_secs: Option<u64>,
     approve_operator: Option<bool>,
+    #[serde(default)]
+    approval_grant_ttl_secs: u64,
     executor_entry: Option<String>,
     #[cfg(unix)]
     executor_socket: Option<String>,
@@ -428,6 +431,7 @@ struct DaemonState {
     approve_operator: bool,
     #[cfg(windows)]
     approvals: approvals::ApprovalQueue,
+    approval_grants: grants::ApprovalGrants,
     peers: peers::SharedPeerStore,
     api_proxies: HashMap<String, ApiProxyConfig>,
     #[cfg(windows)]
@@ -533,6 +537,8 @@ struct AuditFields {
     #[serde(skip_serializing_if = "Option::is_none")]
     approval_allow: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    approval_grant: Option<grants::ApprovalGrant>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     proxy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     http_method: Option<String>,
@@ -559,6 +565,7 @@ struct HandledRequest {
     outcome: String,
     audit_shared: Option<bool>,
     audit_approval: Option<(String, bool)>,
+    audit_approval_grant: Option<grants::ApprovalGrant>,
     /// ハンドラが確定した監査項目。`Some` のとき、params から導いた項目の代わりに記録する。
     audit_fields: Option<AuditFields>,
 }
@@ -577,6 +584,11 @@ impl HandledRequest {
 
     fn with_audit_fields(mut self, fields: AuditFields) -> Self {
         self.audit_fields = Some(fields);
+        self
+    }
+
+    fn with_audit_approval_grant(mut self, grant: Option<grants::ApprovalGrant>) -> Self {
+        self.audit_approval_grant = grant;
         self
     }
 }
@@ -1103,6 +1115,7 @@ async fn build_state(
     let approve_timeout = Duration::from_secs(config.approve_timeout_secs.unwrap_or(60));
     #[cfg(windows)]
     let approve_operator = config.approve_operator.unwrap_or(false);
+    let approval_grant_ttl = Duration::from_secs(config.approval_grant_ttl_secs);
     let executor_entry = resolve_executor_entry(&config);
     #[cfg(unix)]
     let executor_socket = config.executor_socket.as_deref().map(PathBuf::from);
@@ -1213,6 +1226,7 @@ async fn build_state(
         approve_operator,
         #[cfg(windows)]
         approvals: approvals::ApprovalQueue::new(),
+        approval_grants: grants::ApprovalGrants::new(approval_grant_ttl),
         peers,
         api_proxies,
         #[cfg(windows)]
@@ -1547,6 +1561,9 @@ async fn serve_connection<S>(
                     fields.approval_id = Some(approval_id);
                     fields.approval_allow = Some(allow);
                 }
+                if let Some(grant) = handled.audit_approval_grant {
+                    fields.approval_grant = Some(grant);
+                }
                 (Some(request), handled.response, handled.outcome, fields)
             }
             Err(_) => (
@@ -1781,6 +1798,7 @@ async fn handle_request(
             outcome: "method_not_found".to_owned(),
             audit_shared: None,
             audit_approval: None,
+            audit_approval_grant: None,
             audit_fields: None,
         },
     }
@@ -2113,16 +2131,35 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
     let namespace = namespace.to_owned();
     let principal = peer.principal();
     let key = sessions::BrowserKey::new(principal.clone(), namespace, params.cred_id.clone());
-    if let Err(error) =
-        gate_on_approval(&state, &params.cred_id, &params.target_url, "login", peer).await
-    {
-        return classified(request.id.clone(), error);
-    }
+    let grant =
+        match gate_on_approval(&state, &params.cred_id, &params.target_url, "login", peer).await {
+            Ok(grant) => grant,
+            Err(error) => return classified(request.id.clone(), error),
+        };
+    start_login(
+        request,
+        state,
+        key,
+        principal,
+        params,
+        request_params.exclusive,
+    )
+    .await
+    .with_audit_approval_grant(grant)
+}
+
+/// 承認ゲートを通過した `login` について、既存ブラウザへの相乗りまたは新規起動を行う。
+async fn start_login(
+    request: &RpcRequest,
+    state: SharedState,
+    key: sessions::BrowserKey,
+    principal: String,
+    params: LoginParams,
+    exclusive: bool,
+) -> HandledRequest {
     let start_gate = start_control(&state, sessions::StartKey::Browser(key.clone())).await;
     let mut start_guard = start_gate.lock().await;
-    if !request_params.exclusive
-        && let Some(result) = join_browser(&state, &key, &principal).await
-    {
+    if !exclusive && let Some(result) = join_browser(&state, &key, &principal).await {
         return match result {
             Ok(result) => success(request.id.clone(), result).with_audit_shared(true),
             Err(error) => classified(request.id.clone(), error),
@@ -2207,7 +2244,7 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
                 target: sessions::LeaseTarget::Tab(target_id),
             },
         )]),
-        exclusive: request_params.exclusive,
+        exclusive,
     };
     let ports = state.lock().await.ports.clone();
     if let Ok(mut ports) = ports.write() {
@@ -2218,7 +2255,7 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
     }
     let mut daemon = state.lock().await;
     daemon.browsers.insert(browser_id.clone(), browser);
-    if !request_params.exclusive {
+    if !exclusive {
         daemon.shared_browsers.insert(key, browser_id.clone());
     }
     drop(daemon);
@@ -2249,16 +2286,16 @@ async fn start_control(
 }
 
 /// 承認ゲートが構成されている場合、資格の存在と施錠状態を確かめたうえで承認を求める。
-/// 施錠中の資格は承認を求める前に拒否する。
+/// 施錠中の資格は承認を求める前に拒否する。付与の扱いは `approve_with_grant` に従う。
 async fn gate_on_approval(
     state: &SharedState,
     cred_id: &str,
     target_url: &str,
     method: &str,
     peer: &PeerIdentity,
-) -> Result<(), ErrorCode> {
+) -> Result<Option<grants::ApprovalGrant>, ErrorCode> {
     if !approval_required(&*state.lock().await) {
-        return Ok(());
+        return Ok(None);
     }
     let locked = match credential_state(state, cred_id).await? {
         Some(locked) => locked,
@@ -2267,7 +2304,35 @@ async fn gate_on_approval(
     if locked {
         return Err(ErrorCode::VaultLocked);
     }
-    request_approval(state, cred_id, target_url, method, peer).await
+    approve_with_grant(state, cred_id, target_url, method, peer).await
+}
+
+/// (principal, cred_id) に有効な付与があれば承認を求めずに通し、無ければ承認を求める。
+/// 承認が成立した場合のみ付与を記録する。付与の有効期間が 0 の構成では `None` を返す。
+async fn approve_with_grant(
+    state: &SharedState,
+    cred_id: &str,
+    target_url: &str,
+    method: &str,
+    peer: &PeerIdentity,
+) -> Result<Option<grants::ApprovalGrant>, ErrorCode> {
+    let principal = peer.principal();
+    if state
+        .lock()
+        .await
+        .approval_grants
+        .reuse(&principal, cred_id, Instant::now())
+    {
+        return Ok(Some(grants::ApprovalGrant::Reused));
+    }
+    request_approval(state, cred_id, target_url, method, peer).await?;
+    let issued =
+        state
+            .lock()
+            .await
+            .approval_grants
+            .issue(principal, cred_id.to_owned(), Instant::now());
+    Ok(issued.then_some(grants::ApprovalGrant::Issued))
 }
 
 /// 資格を解決し、存在しなければ `INVALID_CREDENTIAL`、施錠中なら `VAULT_LOCKED` とする。
@@ -2312,14 +2377,19 @@ async fn authorize_device(
         .uri
         .filter(|uri| !uri.is_empty())
         .unwrap_or(verification_origin);
-    if approval_required(&*state.lock().await)
-        && let Err(error) = approve_authorize_device(&state, &params, peer).await
-    {
-        return classified(request.id.clone(), error);
-    }
+    let grant = if approval_required(&*state.lock().await) {
+        match approve_authorize_device(&state, &params, peer).await {
+            Ok(grant) => grant,
+            Err(error) => return classified(request.id.clone(), error),
+        }
+    } else {
+        None
+    };
     let credential = match resolve_unlocked_credential(&state, &params.cred_id).await {
         Ok(credential) => credential,
-        Err(error) => return classified(request.id.clone(), error),
+        Err(error) => {
+            return classified(request.id.clone(), error).with_audit_approval_grant(grant);
+        }
     };
     let (executor_entry, executor_socket, node_path, browsers_path) = {
         let daemon = state.lock().await;
@@ -2344,6 +2414,7 @@ async fn authorize_device(
         Ok(()) => success(request.id.clone(), json!({ "ok": true })),
         Err(error) => classified_with_step(request.id.clone(), error.code, error.step),
     }
+    .with_audit_approval_grant(grant)
 }
 
 /// 設定済みの注入プロキシを専用の executor 接続で起動し、排他リースとして登録する。
@@ -2370,6 +2441,18 @@ async fn open_api_proxy(
             .map(|(namespace, _)| namespace.to_owned()),
         ..AuditFields::default()
     };
+    let grant = match gate_on_approval(
+        &state,
+        &proxy.cred_id,
+        &proxy.upstream,
+        "open_api_proxy",
+        peer,
+    )
+    .await
+    {
+        Ok(grant) => grant,
+        Err(error) => return classified(request.id.clone(), error).with_audit_fields(fields),
+    };
     match start_api_proxy_session(&state, peer, proxy).await {
         Ok((session_id, base_url)) => {
             fields.session_id = Some(session_id.clone());
@@ -2381,9 +2464,11 @@ async fn open_api_proxy(
         }
         Err(error) => classified(request.id.clone(), error).with_audit_fields(fields),
     }
+    .with_audit_approval_grant(grant)
 }
 
-/// 承認と起動制御を経て注入プロキシを起動し、リースを登録して `(session_id, base_url)` を返す。
+/// 承認ゲートを通過した注入プロキシを起動制御を経て起動し、リースを登録して
+/// `(session_id, base_url)` を返す。
 async fn start_api_proxy_session(
     state: &SharedState,
     peer: &PeerIdentity,
@@ -2393,14 +2478,6 @@ async fn start_api_proxy_session(
         return Err(ErrorCode::InvalidCredential);
     };
     let namespace = namespace.to_owned();
-    gate_on_approval(
-        state,
-        &proxy.cred_id,
-        &proxy.upstream,
-        "open_api_proxy",
-        peer,
-    )
-    .await?;
     let principal = peer.principal();
     let start_gate = start_control(
         state,
@@ -2642,11 +2719,11 @@ async fn approve_authorize_device(
     state: &SharedState,
     params: &AuthorizeDeviceParams,
     peer: &PeerIdentity,
-) -> Result<(), ErrorCode> {
+) -> Result<Option<grants::ApprovalGrant>, ErrorCode> {
     // verification_uri_complete の query に載る user_code を承認フックや保留一覧へ
     // 広げないため、監査と同じく query・fragment・userinfo を除いた URL を渡す。
     let target_url = audit_target_url(&params.verification_url).ok_or(ErrorCode::Internal)?;
-    request_approval(
+    approve_with_grant(
         state,
         &params.cred_id,
         &target_url,
@@ -2664,13 +2741,19 @@ async fn approve_command(
     method: &str,
     peer: &PeerIdentity,
 ) -> Result<(), ErrorCode> {
-    let (approve_cmd, approve_timeout) = {
+    let (approve_cmd, approve_timeout, grant_ttl) = {
         let daemon = state.lock().await;
-        (daemon.approve_cmd.clone(), daemon.approve_timeout)
+        (
+            daemon.approve_cmd.clone(),
+            daemon.approve_timeout,
+            daemon.approval_grants.ttl(),
+        )
     };
     let Some(approve_cmd) = approve_cmd else {
         return Ok(());
     };
+    // 照合番号は要求ごとの束縛であり secret ではない。照合は hook 側の責務とする。
+    let approval_code = grants::approval_code().map_err(|_| ErrorCode::Internal)?;
     let peer_uid = match peer {
         PeerIdentity::Uid(uid) => uid.to_string(),
         _ => peer.principal(),
@@ -2682,6 +2765,11 @@ async fn approve_command(
         .env("TEGATA_TARGET_URL", target_url)
         .env("TEGATA_METHOD", method)
         .env("TEGATA_PEER", peer_uid)
+        .env("TEGATA_APPROVAL_CODE", approval_code.to_string())
+        .env(
+            "TEGATA_APPROVAL_GRANT_TTL_SECS",
+            grant_ttl.as_secs().to_string(),
+        )
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -2859,7 +2947,8 @@ async fn lock_vault(request: &RpcRequest, state: SharedState) -> HandledRequest 
         Err(error) => return classified(request.id.clone(), error),
     };
     let providers = {
-        let daemon = state.lock().await;
+        let mut daemon = state.lock().await;
+        daemon.approval_grants.revoke(namespace.as_deref());
         daemon
             .providers
             .iter()
@@ -3983,6 +4072,7 @@ fn success(id: Value, result: Value) -> HandledRequest {
         outcome: "ok".to_owned(),
         audit_shared: None,
         audit_approval: None,
+        audit_approval_grant: None,
         audit_fields: None,
     }
 }
@@ -3997,6 +4087,7 @@ fn classified_with_step(id: Value, error: ErrorCode, step: Option<usize>) -> Han
         outcome: error.as_str().to_owned(),
         audit_shared: None,
         audit_approval: None,
+        audit_approval_grant: None,
         audit_fields: None,
     }
 }

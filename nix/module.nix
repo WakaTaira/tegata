@@ -51,6 +51,7 @@ let
     browser_max_lifetime_secs = cfg.browserMaxLifetimeSecs;
   } // lib.optionalAttrs (cfg.approveCmd != null) {
     approve_cmd = cfg.approveCmd;
+    approval_grant_ttl_secs = cfg.approvalGrantTtlSecs;
   } // lib.optionalAttrs (cfg.approveTimeoutSecs != null) {
     approve_timeout_secs = cfg.approveTimeoutSecs;
   } // lib.optionalAttrs (cfg.auditLogMaxBytes != null) {
@@ -236,6 +237,12 @@ in
       type = lib.types.nullOr lib.types.ints.unsigned;
       default = null;
       description = "Approval command timeout in seconds.";
+    };
+
+    approvalGrantTtlSecs = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 0;
+      description = "Approval grant lifetime in seconds; zero requires approval every time.";
     };
 
     auditLogMaxBytes = lib.mkOption {

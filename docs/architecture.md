@@ -75,8 +75,9 @@ That has four consequences worth stating:
 ### AuthExecutor — where a secret becomes a session
 
 The executor consumes a secret and produces an authenticated session, then hands
-out a connection to it. It runs on the isolated side and returns a channel
-reference, never the material it consumed.
+out a raw CDP connection to it. It runs on the isolated side and returns a channel
+reference, never the material it consumed. The agent can inspect post-login session
+state through that CDP connection, including HttpOnly cookies.
 
 `packages/tegata-executor` is the implemented executor: a Playwright form login
 and device-flow approval. Device-flow approval always uses a dedicated browser,
@@ -235,11 +236,15 @@ handoff, not a port forwarder.
 
 One browser (one executor process) is shared per (principal, namespace, credential);
 each login is a lease with its own tab within that shared browser, and
-`exclusive: true` opts a login out of sharing with a dedicated browser. The daemon
-holds the child handle and an expiry, and a sweeper stops any session past its TTL
-— 300 seconds by default — auditing a `session_expired` event as it goes. `logout` does the same on demand and is
-idempotent, and `lock_vault` takes down every session belonging to the namespaces
-it locks. A daemon asked to stop — a service stop request, `SIGTERM`, or
+`exclusive: true` opts a login out of sharing with a dedicated browser. A browser
+has an absolute lifetime of `browser_max_lifetime_secs` (3600 seconds by default)
+from its launch, and sharing never extends that deadline. Each lease expires at
+the earlier of its `session_ttl_secs` deadline and the browser deadline. The daemon
+audits all leases as `session_expired` and closes the browser at the absolute
+deadline. A login at or after the deadline starts a new browser. `logout` does the
+same on demand and is idempotent, and `lock_vault` takes down every session belonging
+to the namespaces it locks. These actions close tegata's browser only; they do not
+invalidate site-side sessions extracted through CDP. A daemon asked to stop — a service stop request, `SIGTERM`, or
 `SIGINT` — reaps every live executor on its way out, and the executor treats its
 stdin closing as that same order, so even a daemon that dies without cleaning up
 does not leave browsers running.

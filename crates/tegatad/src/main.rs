@@ -111,6 +111,8 @@ struct Config {
     #[cfg(unix)]
     executor_socket: Option<String>,
     session_ttl_secs: Option<u64>,
+    #[serde(default = "default_browser_max_lifetime_secs")]
+    browser_max_lifetime_secs: u64,
     #[cfg(windows)]
     #[serde(default = "default_unlock_mode")]
     unlock_mode: UnlockMode,
@@ -131,6 +133,10 @@ struct Config {
 
 fn default_max_pending_connections() -> usize {
     8
+}
+
+fn default_browser_max_lifetime_secs() -> u64 {
+    3600
 }
 
 /// `[[api_proxy]]` の 1 項目。agent は `name` で選ぶだけで、上流・注入ヘッダは設定で固定される。
@@ -414,6 +420,7 @@ struct DaemonState {
     browsers_path: Option<PathBuf>,
     ports: Arc<std::sync::RwLock<HashMap<String, (String, u16)>>>,
     session_ttl: Duration,
+    browser_max_lifetime: Duration,
     #[cfg(unix)]
     approve_cmd: Option<String>,
     approve_timeout: Duration,
@@ -808,6 +815,9 @@ async fn run_daemon(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config_text = tokio::fs::read_to_string(config_path).await?;
     let config: Config = toml::from_str(&config_text)?;
+    if config.browser_max_lifetime_secs == 0 {
+        return Err("browser_max_lifetime_secs must be at least 1".into());
+    }
     let listeners = normalize_listeners(&config_text, &config)?;
     validate_api_proxies(&config.api_proxy)?;
     #[cfg(unix)]
@@ -1088,6 +1098,7 @@ async fn build_state(
     let browsers_path = resolve_browsers_path(&config);
     let bw_path = resolve_bw_path(&config);
     let session_ttl = Duration::from_secs(config.session_ttl_secs.unwrap_or(300));
+    let browser_max_lifetime = Duration::from_secs(config.browser_max_lifetime_secs);
     let state_dir = PathBuf::from(&config.state_dir);
     let api_proxies = config
         .api_proxy
@@ -1180,6 +1191,7 @@ async fn build_state(
         browsers_path,
         ports: Arc::new(std::sync::RwLock::new(HashMap::new())),
         session_ttl,
+        browser_max_lifetime,
         #[cfg(unix)]
         approve_cmd,
         approve_timeout,
@@ -1282,17 +1294,75 @@ fn resolve_windows_paths(config: &Config) -> (PathBuf, PathBuf) {
     (token_hash_path, sealed_blob_path)
 }
 
+fn lease_expiry(now: Instant, ttl: Duration, deadline: Instant) -> Instant {
+    (now + ttl).min(deadline)
+}
+
+fn take_browser_locked(daemon: &mut DaemonState, browser_id: &str) -> Option<sessions::Browser> {
+    let browser = daemon.browsers.remove(browser_id)?;
+    if !browser.exclusive {
+        daemon.shared_browsers.remove(&browser.key);
+    }
+    if let Ok(mut ports) = daemon.ports.write() {
+        for session_id in browser.leases.keys() {
+            ports.remove(session_id);
+        }
+    }
+    Some(browser)
+}
+
+async fn expire_browser_at_deadline(state: &SharedState, browser_id: &str) {
+    let browser = {
+        let mut daemon = state.lock().await;
+        let expired = daemon
+            .browsers
+            .get(browser_id)
+            .is_some_and(|browser| browser.deadline <= Instant::now());
+        if expired {
+            take_browser_locked(&mut daemon, browser_id)
+        } else {
+            None
+        }
+    };
+    if let Some(browser) = browser {
+        terminate_expired_browser(state, browser).await;
+    }
+}
+
+async fn terminate_expired_browser(state: &SharedState, browser: sessions::Browser) {
+    let namespace = browser.key.namespace.clone();
+    let leases = browser.leases.into_iter().collect::<Vec<_>>();
+    for (_, lease) in &leases {
+        let _ = release_lease(&browser.executor, &lease.target).await;
+    }
+    shutdown_executor(browser.executor).await;
+    for (session_id, _) in leases {
+        audit_system_session(state, "session_expired", session_id, namespace.clone()).await;
+    }
+}
+
 fn spawn_session_reaper(state: SharedState) {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(1));
         loop {
             ticker.tick().await;
-            let expired = {
+            let (deadline_expired, expired) = {
                 let mut daemon = state.lock().await;
                 let now = Instant::now();
+                let mut deadline_expired = Vec::new();
                 let mut expired = Vec::new();
                 let browser_ids = daemon.browsers.keys().cloned().collect::<Vec<_>>();
                 for browser_id in browser_ids {
+                    if daemon
+                        .browsers
+                        .get(&browser_id)
+                        .is_some_and(|browser| browser.deadline <= now)
+                    {
+                        if let Some(browser) = take_browser_locked(&mut daemon, &browser_id) {
+                            deadline_expired.push(browser);
+                        }
+                        continue;
+                    }
                     let mut removed_ids = Vec::new();
                     {
                         let Some(browser) = daemon.browsers.get_mut(&browser_id) else {
@@ -1337,8 +1407,11 @@ fn spawn_session_reaper(state: SharedState) {
                         daemon.shared_browsers.remove(&browser.key);
                     }
                 }
-                expired
+                (deadline_expired, expired)
             };
+            for browser in deadline_expired {
+                terminate_expired_browser(&state, browser).await;
+            }
             for (session_id, lease, executor, namespace, shutdown) in expired {
                 let release_failed = release_lease(&executor, &lease.target).await.is_err();
                 if shutdown || release_failed {
@@ -1937,7 +2010,7 @@ async fn join_browser(
     key: &sessions::BrowserKey,
     principal: &str,
 ) -> Option<Result<Value, ErrorCode>> {
-    let (browser_id, executor, endpoint, ttl) = {
+    let (browser_id, executor, endpoint, ttl, deadline) = {
         let daemon = state.lock().await;
         let browser_id = daemon.shared_browsers.get(key)?.clone();
         let browser = daemon.browsers.get(&browser_id)?;
@@ -1946,32 +2019,73 @@ async fn join_browser(
             browser.executor.clone(),
             browser.endpoint.clone(),
             daemon.session_ttl,
+            browser.deadline,
         )
     };
+    if deadline <= Instant::now() {
+        expire_browser_at_deadline(state, &browser_id).await;
+        return None;
+    }
     let target_id = match executor_lease(&executor).await {
         Ok(target_id) => target_id,
-        Err(error) => return Some(Err(error)),
+        Err(error) => {
+            let active = {
+                let daemon = state.lock().await;
+                daemon
+                    .browsers
+                    .get(&browser_id)
+                    .is_some_and(|browser| browser.deadline > Instant::now())
+            };
+            if !active {
+                expire_browser_at_deadline(state, &browser_id).await;
+                return None;
+            }
+            return Some(Err(error));
+        }
     };
     let session_id = Uuid::new_v4().to_string();
-    let lease = sessions::Lease {
-        principal: principal.to_owned(),
-        expires_at: Instant::now() + ttl,
-        target: sessions::LeaseTarget::Tab(target_id.clone()),
+    let now = Instant::now();
+    let (joined, expired_browser) = {
+        let mut daemon = state.lock().await;
+        let browser_expired = daemon
+            .browsers
+            .get(&browser_id)
+            .is_some_and(|browser| browser.deadline <= now);
+        if browser_expired {
+            (false, take_browser_locked(&mut daemon, &browser_id))
+        } else if let Some(port) = daemon.browsers.get(&browser_id).map(|browser| browser.port) {
+            let deadline = daemon
+                .browsers
+                .get(&browser_id)
+                .expect("browser exists")
+                .deadline;
+            let lease = sessions::Lease {
+                principal: principal.to_owned(),
+                expires_at: lease_expiry(now, ttl, deadline),
+                target: sessions::LeaseTarget::Tab(target_id.clone()),
+            };
+            daemon
+                .browsers
+                .get_mut(&browser_id)
+                .expect("browser checked above")
+                .leases
+                .insert(session_id.clone(), lease);
+            if let Ok(mut ports) = daemon.ports.write() {
+                ports.insert(session_id.clone(), (principal.to_owned(), port));
+            }
+            (true, None)
+        } else {
+            (false, None)
+        }
     };
-    let mut daemon = state.lock().await;
-    let Some(port) = daemon.browsers.get(&browser_id).map(|browser| browser.port) else {
-        drop(daemon);
+    if let Some(browser) = expired_browser {
+        let _ = executor_release(&executor, target_id).await;
+        terminate_expired_browser(state, browser).await;
+        return None;
+    }
+    if !joined {
         let _ = executor_release(&executor, target_id).await;
         return None;
-    };
-    daemon
-        .browsers
-        .get_mut(&browser_id)
-        .expect("browser checked above")
-        .leases
-        .insert(session_id.clone(), lease);
-    if let Ok(mut ports) = daemon.ports.write() {
-        ports.insert(session_id.clone(), (principal.to_owned(), port));
     }
     Some(Ok(json!({
         "session_id": session_id,
@@ -2014,7 +2128,7 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
         Ok(credential) => credential,
         Err(error) => return classified(request.id.clone(), error),
     };
-    let (executor_entry, executor_socket, node_path, browsers_path, ttl) = {
+    let (executor_entry, executor_socket, node_path, browsers_path, ttl, browser_max_lifetime) = {
         let daemon = state.lock().await;
         (
             daemon.executor_entry.clone(),
@@ -2022,6 +2136,7 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
             daemon.node_path.clone(),
             daemon.browsers_path.clone(),
             daemon.session_ttl,
+            daemon.browser_max_lifetime,
         )
     };
     start_guard.record_attempt(Instant::now());
@@ -2044,6 +2159,7 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
             return classified(request.id.clone(), error);
         }
     };
+    let deadline = Instant::now() + browser_max_lifetime;
     let session_id = Uuid::new_v4().to_string();
     let reader = executor
         .take_reader()
@@ -2068,16 +2184,18 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
     });
     let browser_id = Uuid::new_v4().to_string();
     let response_target_id = target_id.clone();
+    let now = Instant::now();
     let browser = sessions::Browser {
         key: key.clone(),
         executor: connection.clone(),
         port,
         endpoint: endpoint.clone(),
+        deadline,
         leases: HashMap::from([(
             session_id.clone(),
             sessions::Lease {
                 principal: principal.clone(),
-                expires_at: Instant::now() + ttl,
+                expires_at: lease_expiry(now, ttl, deadline),
                 target: sessions::LeaseTarget::Tab(target_id),
             },
         )]),
@@ -2289,7 +2407,7 @@ async fn start_api_proxy_session(
         return Err(ErrorCode::RateLimited);
     }
     let credential = resolve_unlocked_credential(state, &proxy.cred_id).await?;
-    let (executor_entry, executor_socket, node_path, browsers_path, ttl) = {
+    let (executor_entry, executor_socket, node_path, browsers_path, ttl, browser_max_lifetime) = {
         let daemon = state.lock().await;
         (
             daemon.executor_entry.clone(),
@@ -2297,6 +2415,7 @@ async fn start_api_proxy_session(
             daemon.node_path.clone(),
             daemon.browsers_path.clone(),
             daemon.session_ttl,
+            daemon.browser_max_lifetime,
         )
     };
     let header_value = Zeroizing::new(
@@ -2325,6 +2444,7 @@ async fn start_api_proxy_session(
             return Err(error);
         }
     };
+    let deadline = Instant::now() + browser_max_lifetime;
     drop(start_guard);
     let Some(reader) = executor.take_reader() else {
         stop_child(executor).await;
@@ -2338,6 +2458,7 @@ async fn start_api_proxy_session(
         next_id: AtomicU64::new(2),
     });
     let session_id = Uuid::new_v4().to_string();
+    let now = Instant::now();
     // プロキシは共有しないため shared_browsers には登録しない。endpoint は CDP の
     // 相乗りにのみ使われる値であり、path secret を残さないよう空とする。
     let browser = sessions::Browser {
@@ -2345,11 +2466,12 @@ async fn start_api_proxy_session(
         executor: connection.clone(),
         port,
         endpoint: String::new(),
+        deadline,
         leases: HashMap::from([(
             session_id.clone(),
             sessions::Lease {
                 principal: principal.clone(),
-                expires_at: Instant::now() + ttl,
+                expires_at: lease_expiry(now, ttl, deadline),
                 target: sessions::LeaseTarget::ApiProxy,
             },
         )]),

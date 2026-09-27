@@ -159,16 +159,23 @@ returns a connection to the resulting browser.
 }
 ```
 
-Connect a Playwright client to that endpoint with `chromium.connectOverCDP` and
-drive the authenticated browser directly. Keep the `session_id`; it is what
+Connect a Playwright client to that raw endpoint with `chromium.connectOverCDP` and
+drive the authenticated browser directly. CDP exposes the browser's post-login
+session state, including HttpOnly cookies through `Network.getAllCookies`; the RPC
+response leak scan does not inspect CDP traffic. Keep the `session_id`; it is what
 `logout` takes. `target_id` is the CDP target id of the lease's tab and is advisory.
 
 When a live, non-exclusive browser exists for the same principal (the UNIX socket
 uid, named token, or Windows SID), namespace, and `cred_id`, `login` issues a new
 lease with a new `session_id` and returns the same endpoint. `logout` returns only
 the caller's lease; the browser closes when its last lease ends. TTL is fixed per
-lease at issuance and a fresh `login` is required to extend it. `lock_vault` keeps
-its existing behavior and drops all browsers and leases in the namespace.
+lease at issuance and a fresh `login` is required to extend it. A shared browser
+also has an absolute lifetime controlled by `browser_max_lifetime_secs` (3600
+seconds by default); each lease ends at the earlier of its TTL and that deadline,
+and sharing never extends the browser deadline. At the deadline all leases are
+audited as `session_expired`, the browser closes, and a later `login` starts a new
+browser. `lock_vault` keeps its existing behavior and drops all browsers and leases
+in the namespace.
 
 ### Steps and the placeholder contract
 
@@ -238,7 +245,9 @@ answers through `approve_cmd` (Linux) or the operator approval hook (Windows,
 ### Session lifetime
 
 Each lease carries a TTL, 300 seconds by default, configurable with
-`session_ttl_secs`, fixed when issued. The whole login must also complete within
+`session_ttl_secs`, fixed when issued. The browser also has an absolute lifetime
+of 3600 seconds by default, configurable with `browser_max_lifetime_secs` (an
+integer of at least 1), measured from browser launch. The whole login must also complete within
 90 seconds. If startup fails for the same key, subsequent `login` calls wait for
 backoff periods of 2 seconds, 5 seconds, then 15 seconds; calls during backoff
 return `RATE_LIMITED`. More than 3 reauthentication attempts for the same key in
@@ -258,8 +267,9 @@ Returns the caller's lease and shuts down the browser when it was the last lease
 An absent session or a session held by another principal returns `NOT_FOUND`, so
 the daemon does not disclose whether the session exists.
 
-Call it when finished. The CDP endpoint stops being connectable and the browser
-takes its cookies with it.
+Call it when finished. The CDP endpoint stops being connectable and tegata's browser
+closes, but logout does not invalidate a site-side session. Cookies or other session
+state extracted through CDP remain usable until the site invalidates them.
 
 ## `authorize_device`
 
@@ -378,8 +388,8 @@ Locks the backend and discards the cached vault session. Subsequent `login` and
 `list_credentials` keeps listing its entries by name with `status: "locked"`.
 
 It also terminates the browser sessions belonging to that namespace, shutting each
-one down gracefully. Locking the vault and leaving an authenticated browser open
-would have defeated the point of locking it.
+one down gracefully. This closes tegata's browsers but does not invalidate any
+site-side session state already extracted through CDP.
 
 **There is no unlock RPC, and none is needed.** Unlocking is always implicit and
 always goes through the provider's own unlock ceremony — the askpass or sealed

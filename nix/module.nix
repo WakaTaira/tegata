@@ -47,6 +47,8 @@ let
     executor_entry = cfg.executorEntry;
   } // lib.optionalAttrs (cfg.sessionTtlSecs != null) {
     session_ttl_secs = cfg.sessionTtlSecs;
+  } // {
+    browser_max_lifetime_secs = cfg.browserMaxLifetimeSecs;
   } // lib.optionalAttrs (cfg.approveCmd != null) {
     approve_cmd = cfg.approveCmd;
   } // lib.optionalAttrs (cfg.approveTimeoutSecs != null) {
@@ -216,6 +218,12 @@ in
       type = lib.types.nullOr lib.types.ints.unsigned;
       default = null;
       description = "Default daemon session lifetime in seconds.";
+    };
+
+    browserMaxLifetimeSecs = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 3600;
+      description = "Absolute maximum browser lifetime in seconds.";
     };
 
     approveCmd = lib.mkOption {

@@ -35,9 +35,11 @@ already failed, regardless of what the code around it does with the value.
 
 - The vault master password
 - Every resolved username, password, and TOTP seed
-- Session cookies and any serialized browser state
 - The vault session token (`BW_SESSION` and equivalents)
 - The daemon's own configuration, which names the vault and the accounts
+
+Post-login session state is outside this list: the agent can access cookies,
+`localStorage`, `sessionStorage`, and page-held tokens through the raw CDP endpoint.
 
 ## The four invariants
 
@@ -132,15 +134,16 @@ audit record for the call records `INTERNAL`. This is defense in depth: if it ev
 fires, something above it is already broken, and the point is that the value still
 does not leave.
 
-### 4. What comes back is a session, not a credential
+### 4. Credentials stay behind the boundary; sessions do not
 
-`login` returns a CDP endpoint. Not a cookie jar, not a `storageState` file, not a
-bearer token. The agent connects to a browser that is already authenticated and
-drives it from there.
+`login` returns a raw CDP endpoint. The agent connects to a browser that is already
+authenticated and drives it from there. The agent can use CDP methods such as
+`Network.getAllCookies` to read HttpOnly cookies, as well as other session state.
+The RPC response leak scan does not cover CDP traffic.
 
-The executor never writes a trace, a video, a HAR file, or a screenshot — those
-would be a credential-bearing artifact on disk that the agent could read, and the
-acceptance suite asserts that no such file appears anywhere after a login.
+The executor never writes a trace, a video, a HAR file, or a screenshot. The
+guarantee against artifacts applies only to the executor's own behavior; anything
+the agent extracts through CDP is the agent's responsibility.
 
 ## How secrets move on the isolated side
 
@@ -232,9 +235,10 @@ in, and the ceremony terminates on the isolated side. A shorter
 material sits in the daemon's memory — at the cost of more frequent prompting,
 which is the trade an operator should be making deliberately.
 
-`lock_vault` also terminates the browser sessions in that namespace. Leaving an
-authenticated browser alive after locking the vault it came from would have
-undone the lock.
+`lock_vault` also terminates the tegata browser sessions in that namespace. This
+does not invalidate a site-side session already extracted by the agent. The same
+applies to `logout`, session TTL expiry, and `browser_max_lifetime_secs`; site-side
+logout and invalidation remain a future concern.
 
 ## TOTP
 
@@ -419,6 +423,8 @@ These are known, accepted, and out of scope for the boundary itself.
 **The session can do whatever the account can do.** Once the agent holds a CDP
 endpoint for an authenticated browser, it has the account's full authority on that
 site. tegata isolates the credential, not the consequences of being logged in.
+The agent can also extract cookies and other session state through CDP; those values
+remain usable until the site invalidates them, even after tegata closes its browser.
 Mitigate with the privileges, not with tegata: a dedicated account for agent use, a
 read-only role where the site offers one, and an allowlist of target sites.
 

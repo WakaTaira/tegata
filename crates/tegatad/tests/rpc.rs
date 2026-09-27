@@ -235,6 +235,38 @@ fn status_returns_ok() {
 }
 
 #[test]
+fn zero_browser_max_lifetime_refuses_startup() {
+    let directory = std::env::temp_dir().join(format!("tegatad-invalid-config-{}", Uuid::new_v4()));
+    std::fs::create_dir(&directory).expect("create test directory");
+    let state_dir = directory.join("state");
+    create_private_dir(&state_dir);
+    let config_path = directory.join("config.toml");
+    let socket_path = directory.join("tegatad.sock");
+    std::fs::write(
+        &config_path,
+        format!(
+            "socket_path = {:?}\nstate_dir = {:?}\naudit_log_path = {:?}\nallowed_uids = [{}]\nbrowser_max_lifetime_secs = 0\n",
+            socket_path,
+            state_dir,
+            state_dir.join("audit.log"),
+            unsafe { libc::geteuid() },
+        ),
+    )
+    .expect("write test config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tegatad"))
+        .arg("--config")
+        .arg(&config_path)
+        .output()
+        .expect("run tegatad");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    std::fs::remove_dir_all(&directory).expect("remove test directory");
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("browser_max_lifetime_secs must be at least 1"));
+}
+
+#[test]
 fn authorize_device_returns_only_ok_and_does_not_create_a_session() {
     let daemon = Daemon::start_with_executor(AUTHORIZE_SUCCESS_EXECUTOR);
     let response = rpc(

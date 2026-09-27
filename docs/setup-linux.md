@@ -276,6 +276,7 @@ the full option reference, the NixOS equivalent, and the residual risks.
 | `audit_log_max_bytes` | integer | no | Rotate to `<path>.1` past this size, at most once per daemon process. Unset means no rotation |
 | `max_pending_connections` | integer | no | Maximum unauthenticated concurrent TCP connections; default `8` |
 | `session_ttl_secs` | integer | no | Browser session lifetime; default `300` |
+| `browser_max_lifetime_secs` | integer | no | Absolute browser lifetime from launch; must be at least `1`; default `3600` |
 | `approve_cmd` | string | no | Command that must approve each `login`. Unset means no approval gate |
 | `approve_timeout_secs` | integer | no | How long to wait for that command; default `60` |
 | `executor_entry` | string | no | Path to the executor's `index.js`. May also come from `TEGATA_EXECUTOR_ENTRY` |

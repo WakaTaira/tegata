@@ -251,7 +251,8 @@ backends behind the provider trait — Bitwarden CLI, age-encrypted file, and GN
 pass — usable together; the Playwright form executor; the seven MCP tools;
 human-in-the-loop login approval — an external command on Linux, and on Windows
 an approval queue the operator answers from an elevated PowerShell with
-`tegatad approval allow/deny`; an audit log covering both agent calls and
+`tegatad approval allow/deny` — with optional time-limited grants per caller and
+credential, and a per-request number the Linux hook can match out of band; an audit log covering both agent calls and
 the daemon's own session and vault events; named tokens and shared sessions —
 one browser per credential and caller, leased to several agents on the same
 machine, with an owner on every session; the container boundary — the daemon on
@@ -275,6 +276,10 @@ Planned, tracked in the
 - **Injection proxy, remaining parts**
   ([#20](https://github.com/WakaTaira/tegata/issues/20)) — a tegata-owned OAuth
   client and hosted stdio MCP servers
+- **Approved privilege escalation**
+  ([#39](https://github.com/WakaTaira/tegata/issues/39)) — running an elevated
+  command behind the same out-of-band approval, without handing the agent a
+  password
 
 Each feature is designed in a private brief before implementation; what lands
 publicly is the design's contract, as acceptance tests under `tests/acceptance/`.

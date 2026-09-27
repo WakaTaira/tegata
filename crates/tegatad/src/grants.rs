@@ -31,6 +31,8 @@ pub(crate) enum ApprovalGrant {
 pub(crate) struct ApprovalGrants {
     ttl: Duration,
     issued: HashMap<(String, String), Instant>,
+    /// 破棄のたびに増える世代。承認待ちの間に破棄が起きたかを判定するために用いる。
+    generation: u64,
 }
 
 impl ApprovalGrants {
@@ -38,7 +40,13 @@ impl ApprovalGrants {
         Self {
             ttl,
             issued: HashMap::new(),
+            generation: 0,
         }
+    }
+
+    /// 現在の破棄の世代を返す。承認を求める前に控え、`issue` へ渡す。
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     #[cfg(unix)]
@@ -56,9 +64,16 @@ impl ApprovalGrants {
             .contains_key(&(principal.to_owned(), cred_id.to_owned()))
     }
 
-    /// 付与を記録し、記録したかを返す。有効期間が 0 の構成では記録しない。
-    pub(crate) fn issue(&mut self, principal: String, cred_id: String, now: Instant) -> bool {
-        if self.ttl.is_zero() {
+    /// 付与を記録し、記録したかを返す。有効期間が 0 の構成、および `observed` を控えた後に
+    /// 破棄が起きた場合は記録しない。承認待ちの間の `lock_vault` を付与が上書きしないためである。
+    pub(crate) fn issue(
+        &mut self,
+        principal: String,
+        cred_id: String,
+        now: Instant,
+        observed: u64,
+    ) -> bool {
+        if self.ttl.is_zero() || observed != self.generation {
             return false;
         }
         self.prune(now);
@@ -67,7 +82,9 @@ impl ApprovalGrants {
     }
 
     /// `namespace` に属する資格の付与を破棄する。`None` の場合はすべて破棄する。
+    /// 世代は namespace を問わず進め、承認待ちの付与の記録を保守的に取りやめさせる。
     pub(crate) fn revoke(&mut self, namespace: Option<&str>) {
+        self.generation = self.generation.wrapping_add(1);
         let Some(namespace) = namespace else {
             self.issued.clear();
             return;
@@ -114,7 +131,12 @@ mod tests {
     fn a_zero_ttl_never_issues_nor_reuses() {
         let now = Instant::now();
         let mut grants = ApprovalGrants::new(Duration::ZERO);
-        assert!(!grants.issue("uid:1000".to_owned(), "vault:a".to_owned(), now));
+        assert!(!grants.issue(
+            "uid:1000".to_owned(),
+            "vault:a".to_owned(),
+            now,
+            grants.generation()
+        ));
         assert!(!grants.reuse("uid:1000", "vault:a", now));
     }
 
@@ -123,7 +145,12 @@ mod tests {
         let now = Instant::now();
         let mut grants = ApprovalGrants::new(TTL);
         assert!(!grants.reuse("uid:1000", "vault:a", now));
-        assert!(grants.issue("uid:1000".to_owned(), "vault:a".to_owned(), now));
+        assert!(grants.issue(
+            "uid:1000".to_owned(),
+            "vault:a".to_owned(),
+            now,
+            grants.generation()
+        ));
         assert!(grants.reuse("uid:1000", "vault:a", now));
         assert!(!grants.reuse("uid:1000", "vault:b", now));
         assert!(!grants.reuse("peer:01ABC", "vault:a", now));
@@ -133,7 +160,12 @@ mod tests {
     fn a_grant_expires_at_a_fixed_time_after_issue_even_when_reused() {
         let issued_at = Instant::now();
         let mut grants = ApprovalGrants::new(TTL);
-        grants.issue("uid:1000".to_owned(), "vault:a".to_owned(), issued_at);
+        grants.issue(
+            "uid:1000".to_owned(),
+            "vault:a".to_owned(),
+            issued_at,
+            grants.generation(),
+        );
         assert!(grants.reuse("uid:1000", "vault:a", issued_at + TTL / 2));
         assert!(grants.reuse(
             "uid:1000",
@@ -147,8 +179,18 @@ mod tests {
     fn expired_grants_are_removed_on_lookup() {
         let issued_at = Instant::now();
         let mut grants = ApprovalGrants::new(TTL);
-        grants.issue("uid:1000".to_owned(), "vault:a".to_owned(), issued_at);
-        grants.issue("uid:1000".to_owned(), "vault:b".to_owned(), issued_at);
+        grants.issue(
+            "uid:1000".to_owned(),
+            "vault:a".to_owned(),
+            issued_at,
+            grants.generation(),
+        );
+        grants.issue(
+            "uid:1000".to_owned(),
+            "vault:b".to_owned(),
+            issued_at,
+            grants.generation(),
+        );
         assert!(!grants.reuse("uid:1000", "vault:a", issued_at + TTL));
         assert!(grants.issued.is_empty());
         assert!(!grants.reuse("uid:1000", "vault:a", issued_at));
@@ -158,9 +200,19 @@ mod tests {
     fn reissuing_restarts_the_validity_period() {
         let issued_at = Instant::now();
         let mut grants = ApprovalGrants::new(TTL);
-        grants.issue("uid:1000".to_owned(), "vault:a".to_owned(), issued_at);
+        grants.issue(
+            "uid:1000".to_owned(),
+            "vault:a".to_owned(),
+            issued_at,
+            grants.generation(),
+        );
         let reissued_at = issued_at + TTL;
-        grants.issue("uid:1000".to_owned(), "vault:a".to_owned(), reissued_at);
+        grants.issue(
+            "uid:1000".to_owned(),
+            "vault:a".to_owned(),
+            reissued_at,
+            grants.generation(),
+        );
         assert!(grants.reuse("uid:1000", "vault:a", reissued_at + TTL / 2));
     }
 
@@ -168,7 +220,12 @@ mod tests {
     fn a_huge_ttl_does_not_overflow() {
         let now = Instant::now();
         let mut grants = ApprovalGrants::new(Duration::from_secs(u64::MAX));
-        grants.issue("uid:1000".to_owned(), "vault:a".to_owned(), now);
+        grants.issue(
+            "uid:1000".to_owned(),
+            "vault:a".to_owned(),
+            now,
+            grants.generation(),
+        );
         assert!(grants.reuse("uid:1000", "vault:a", now + Duration::from_secs(3600)));
     }
 
@@ -176,9 +233,24 @@ mod tests {
     fn revoking_a_namespace_keeps_other_namespaces() {
         let now = Instant::now();
         let mut grants = ApprovalGrants::new(TTL);
-        grants.issue("uid:1000".to_owned(), "vault:a".to_owned(), now);
-        grants.issue("uid:1000".to_owned(), "vaultx:a".to_owned(), now);
-        grants.issue("peer:01ABC".to_owned(), "other:a".to_owned(), now);
+        grants.issue(
+            "uid:1000".to_owned(),
+            "vault:a".to_owned(),
+            now,
+            grants.generation(),
+        );
+        grants.issue(
+            "uid:1000".to_owned(),
+            "vaultx:a".to_owned(),
+            now,
+            grants.generation(),
+        );
+        grants.issue(
+            "peer:01ABC".to_owned(),
+            "other:a".to_owned(),
+            now,
+            grants.generation(),
+        );
         grants.revoke(Some("vault"));
         assert!(!grants.reuse("uid:1000", "vault:a", now));
         assert!(grants.reuse("uid:1000", "vaultx:a", now));
@@ -189,10 +261,52 @@ mod tests {
     fn revoking_without_a_namespace_clears_every_grant() {
         let now = Instant::now();
         let mut grants = ApprovalGrants::new(TTL);
-        grants.issue("uid:1000".to_owned(), "vault:a".to_owned(), now);
-        grants.issue("peer:01ABC".to_owned(), "other:a".to_owned(), now);
+        grants.issue(
+            "uid:1000".to_owned(),
+            "vault:a".to_owned(),
+            now,
+            grants.generation(),
+        );
+        grants.issue(
+            "peer:01ABC".to_owned(),
+            "other:a".to_owned(),
+            now,
+            grants.generation(),
+        );
         grants.revoke(None);
         assert!(grants.issued.is_empty());
+    }
+
+    #[test]
+    fn a_revoke_while_awaiting_approval_prevents_the_grant() {
+        let now = Instant::now();
+        let mut grants = ApprovalGrants::new(TTL);
+        let observed = grants.generation();
+        grants.revoke(Some("vault"));
+        assert!(!grants.issue("uid:1000".to_owned(), "vault:a".to_owned(), now, observed));
+        assert!(!grants.reuse("uid:1000", "vault:a", now));
+    }
+
+    #[test]
+    fn a_revoke_of_another_namespace_also_prevents_a_pending_grant() {
+        let now = Instant::now();
+        let mut grants = ApprovalGrants::new(TTL);
+        let observed = grants.generation();
+        grants.revoke(Some("other"));
+        assert!(!grants.issue("uid:1000".to_owned(), "vault:a".to_owned(), now, observed));
+        let observed = grants.generation();
+        grants.revoke(None);
+        assert!(!grants.issue("uid:1000".to_owned(), "vault:a".to_owned(), now, observed));
+    }
+
+    #[test]
+    fn a_grant_observed_after_a_revoke_is_issued() {
+        let now = Instant::now();
+        let mut grants = ApprovalGrants::new(TTL);
+        grants.revoke(None);
+        let observed = grants.generation();
+        assert!(grants.issue("uid:1000".to_owned(), "vault:a".to_owned(), now, observed));
+        assert!(grants.reuse("uid:1000", "vault:a", now));
     }
 
     #[test]

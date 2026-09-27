@@ -35,6 +35,11 @@ let oauthIssued = 0;
 let oauthExpiresIn = 3600;
 let oauthDeny = false;
 let observedSecChUa: string | null = null;
+let receivedUsername: string | null = null;
+let mutatingFillState: {
+  nickname: string;
+  passwordLength: number;
+} | null = null;
 
 function usageError(message: string): never {
   throw new Error(message);
@@ -273,6 +278,87 @@ ${errorMessage}
 ${totpInput}
 <button id="submit" type="submit">Log in</button>
 </form>
+</body>
+</html>`;
+}
+
+function focusThiefForm(passwordType: "password" | "text"): string {
+  const focusListener =
+    passwordType === "password"
+      ? `<script>
+const password = document.getElementById("password");
+password?.addEventListener("focus", () => {
+  document.getElementById("username")?.focus();
+});
+</script>`
+      : "";
+  return `<!doctype html>
+<html lang="en">
+<body>
+<form method="POST" action="/login">
+<input id="username" name="username" type="text">
+<input id="password" name="password" type="${passwordType}">
+<button id="submit" type="submit">Log in</button>
+</form>
+${focusListener}
+</body>
+</html>`;
+}
+
+function mutatingFillForm(): string {
+  return `<!doctype html>
+<html lang="en">
+<body>
+<form method="POST" action="/login">
+<input id="username" name="username" type="text">
+<input id="password" name="password" type="password">
+<input id="nickname" name="nickname" type="text">
+<button id="submit" type="submit">Log in</button>
+</form>
+<script>
+const password = document.getElementById("password");
+const nickname = document.getElementById("nickname");
+// 同期要求で報告する。FILL_MISMATCH 後のブラウザ破棄で最後の報告が失われないよう、
+// executor の検査が戻る前に fixture へ状態を届けるためである。
+const reportState = () => {
+  const request = new XMLHttpRequest();
+  request.open("POST", "/mutating-fill-state", false);
+  request.setRequestHeader("Content-Type", "application/json");
+  request.send(JSON.stringify({
+    nickname: nickname?.value ?? "",
+    passwordLength: password?.value.length ?? 0
+  }));
+};
+password?.addEventListener("input", () => {
+  if (nickname !== null) nickname.value = "tampered";
+  reportState();
+});
+nickname?.addEventListener("input", reportState);
+</script>
+</body>
+</html>`;
+}
+
+function delayedStepForm(): string {
+  return `<!doctype html>
+<html lang="en">
+<body>
+<form method="POST" action="/login" id="login-form">
+<input id="username" name="username" type="text">
+<button id="next" type="button">Next</button>
+</form>
+<script>
+document.getElementById("next")?.addEventListener("click", () => {
+  setTimeout(() => {
+    const form = document.getElementById("login-form");
+    if (form === null || document.getElementById("password") !== null) return;
+    form.insertAdjacentHTML(
+      "beforeend",
+      '<input id="password" name="password" type="password"><button id="submit" type="submit">Log in</button>',
+    );
+  }, 2000);
+});
+</script>
 </body>
 </html>`;
 }
@@ -603,6 +689,44 @@ function handleRequest(
     return;
   }
 
+  if (request.method === "GET" && request.url === "/focus-thief/") {
+    receivedUsername = null;
+    writePage(response, focusThiefForm("password"));
+    return;
+  }
+
+  if (request.method === "GET" && request.url === "/password-as-text/") {
+    receivedUsername = null;
+    writePage(response, focusThiefForm("text"));
+    return;
+  }
+
+  if (request.method === "GET" && request.url === "/mutating-fill/") {
+    receivedUsername = null;
+    mutatingFillState = null;
+    writePage(response, mutatingFillForm());
+    return;
+  }
+
+  if (request.method === "GET" && request.url === "/delayed-step/") {
+    receivedUsername = null;
+    writePage(response, delayedStepForm());
+    return;
+  }
+
+  if (request.method === "GET" && request.url === "/received-submission") {
+    writeJson(response, 200, { username: receivedUsername });
+    return;
+  }
+
+  if (request.method === "GET" && request.url === "/mutating-fill-state") {
+    writeJson(response, 200, {
+      nickname: mutatingFillState?.nickname ?? null,
+      password_length: mutatingFillState?.passwordLength ?? null,
+    });
+    return;
+  }
+
   if (
     request.method === "GET" &&
     (request.url === "/" ||
@@ -668,6 +792,7 @@ function handleRequest(
     });
     request.on("end", () => {
       const form = new URLSearchParams(body);
+      receivedUsername = form.get("username");
       if (
         form.get("username") === credentials.username &&
         form.get("password") === credentials.password &&
@@ -686,6 +811,29 @@ function handleRequest(
             ? busyLoginForm(true, credentials.totp_seed !== undefined)
             : loginForm(true, credentials.totp_seed !== undefined),
         );
+      }
+    });
+    return;
+  }
+
+  if (request.method === "POST" && request.url === "/mutating-fill-state") {
+    readRequestBody(request, (body) => {
+      try {
+        const value = JSON.parse(body) as Record<string, unknown>;
+        if (
+          typeof value.nickname !== "string" ||
+          typeof value.passwordLength !== "number"
+        ) {
+          writeJson(response, 400, { error: "invalid_state" });
+          return;
+        }
+        mutatingFillState = {
+          nickname: value.nickname,
+          passwordLength: value.passwordLength,
+        };
+        writeJson(response, 200, { ok: true });
+      } catch {
+        writeJson(response, 400, { error: "invalid_state" });
       }
     });
     return;

@@ -55,6 +55,7 @@ pub(crate) struct Browser {
     pub(crate) executor: Arc<ExecutorConnection>,
     pub(crate) port: u16,
     pub(crate) endpoint: String,
+    pub(crate) deadline: Instant,
     pub(crate) leases: HashMap<String, Lease>,
     pub(crate) exclusive: bool,
 }

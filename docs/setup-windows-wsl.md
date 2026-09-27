@@ -217,6 +217,7 @@ browsers_path   = "C:\\ProgramData\\tegata-rig\\browsers"
 | `audit_log_max_bytes` | integer | no | Rotate to `<path>.1` past this size, at most once per daemon process |
 | `unlock_mode` | string | no | `sealed` (default) or `askpass` |
 | `session_ttl_secs` | integer | no | Browser session lifetime; default `300` |
+| `browser_max_lifetime_secs` | integer | no | Absolute browser lifetime from launch; must be at least `1`; default `3600` |
 | `executor_entry` | string | no | Path to the executor's `index.js` |
 | `approve_operator` | boolean | no | Hold every `login`, `authorize_device`, and `open_api_proxy` for an operator decision; default `false` — see [The approval hook](#the-approval-hook) |
 | `approve_timeout_secs` | integer | no | How long a pending approval waits for a decision; default `60` |

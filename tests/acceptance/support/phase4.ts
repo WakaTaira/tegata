@@ -64,6 +64,7 @@ export interface Phase4ConfigOptions {
    */
   tcpBind?: string;
   sessionTtlSecs?: number;
+  browserMaxLifetimeSecs?: number;
   maxPendingConnections?: number;
   entries: MockEntry[];
 }
@@ -76,6 +77,8 @@ export function renderPhase4Config(opts: Phase4ConfigOptions): string {
   ];
   if (opts.sessionTtlSecs !== undefined)
     lines.push(`session_ttl_secs = ${opts.sessionTtlSecs}`);
+  if (opts.browserMaxLifetimeSecs !== undefined)
+    lines.push(`browser_max_lifetime_secs = ${opts.browserMaxLifetimeSecs}`);
   if (opts.maxPendingConnections !== undefined)
     lines.push(`max_pending_connections = ${opts.maxPendingConnections}`);
   lines.push(
@@ -151,6 +154,7 @@ export interface Phase4DaemonOptions {
   /** Address for the TCP listener (default 127.0.0.1); needs `tcp: true`. */
   tcpBind?: string;
   sessionTtlSecs?: number;
+  browserMaxLifetimeSecs?: number;
   maxPendingConnections?: number;
 }
 
@@ -177,6 +181,7 @@ export async function startPhase4Daemon(
       tcpPort,
       tcpBind,
       sessionTtlSecs: opts.sessionTtlSecs,
+      browserMaxLifetimeSecs: opts.browserMaxLifetimeSecs,
       maxPendingConnections: opts.maxPendingConnections,
       entries: opts.entries,
     }),
@@ -606,6 +611,7 @@ export async function startPhase4Stack(
     tcp?: boolean;
     operator?: boolean;
     sessionTtlSecs?: number;
+    browserMaxLifetimeSecs?: number;
     maxPendingConnections?: number;
     entries?: (canaries: CanarySet) => MockEntry[];
   } = {},
@@ -631,6 +637,7 @@ export async function startPhase4Stack(
       operatorUids: opts.operator === false ? [] : [os.userInfo().uid],
       tcp: opts.tcp,
       sessionTtlSecs: opts.sessionTtlSecs,
+      browserMaxLifetimeSecs: opts.browserMaxLifetimeSecs,
       maxPendingConnections: opts.maxPendingConnections,
     });
     fixture = await startCountingFixture({

@@ -1,0 +1,11 @@
+#!/bin/sh
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+node_path=${TEGATA_HERDR_NODE:-node}
+shim_path="$script_dir/../src/shim.ts"
+
+if bash_path=$(command -v bash 2>/dev/null); then
+  exec "$bash_path" -c 'exec -a tegata-chrome-shim "$0" "$@"' "$node_path" "$shim_path" "$@"
+fi
+
+exec "$node_path" "$shim_path" "$@"

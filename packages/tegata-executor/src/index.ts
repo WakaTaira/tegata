@@ -13,6 +13,12 @@ import {
   startApiProxy,
 } from "./api-proxy.js";
 import {
+  createStreamSecret,
+  type McpServerEvent,
+  type McpServerHost,
+  startMcpServer,
+} from "./mcp-host.js";
+import {
   abortableSleep,
   type DeviceAuthorization,
   isRecord,
@@ -117,6 +123,17 @@ type ApiProxyStartRequest =
 
 type ApiProxyStopRequest = { op: "api_proxy_stop"; id?: RequestId };
 
+type McpServerStartRequest = {
+  op: "mcp_server_start";
+  id?: RequestId;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  scan: string[];
+};
+
+type McpServerStopRequest = { op: "mcp_server_stop"; id?: RequestId };
+
 type Request =
   | LoginRequest
   | AuthorizeDeviceRequest
@@ -124,6 +141,8 @@ type Request =
   | ReleaseRequest
   | ApiProxyStartRequest
   | ApiProxyStopRequest
+  | McpServerStartRequest
+  | McpServerStopRequest
   | { op: "hello"; id?: RequestId }
   | { op: "shutdown"; id?: RequestId };
 
@@ -153,12 +172,13 @@ export class DeviceCodeRejectedError extends Error {}
 
 export class LoginResultTimeoutError extends Error {}
 
-type ExecutionStage = "login" | "device" | "oauth";
+type ExecutionStage = "login" | "device" | "oauth" | "mcp_server";
 
 type DiagnosticRequest =
   | LoginRequest
   | AuthorizeDeviceRequest
-  | ApiProxyStartRequest;
+  | ApiProxyStartRequest
+  | McpServerStartRequest;
 
 /** 診断行から置換する秘密の候補。未設定の値（null・undefined・空文字）は無視される。 */
 type SecretCandidates = Array<string | null | undefined>;
@@ -199,6 +219,10 @@ function removeUrlQueryAndFragment(value: string): string {
 }
 
 function requestSecrets(request: DiagnosticRequest): SecretCandidates {
+  // env にはリテラルも含まれるが、秘密との区別を executor では行わず、すべて置換対象とする。
+  if (request.op === "mcp_server_start") {
+    return [...Object.values(request.env), ...request.scan];
+  }
   if (request.op === "api_proxy_start") {
     return "oauth" in request
       ? [
@@ -260,6 +284,7 @@ export function classifyError(
   if (stage === "oauth") {
     return error instanceof OAuthGrantError ? "OAUTH_GRANT_FAILED" : "INTERNAL";
   }
+  if (stage === "mcp_server") return "INTERNAL";
   if (stage === "device") {
     return error instanceof DeviceCodeRejectedError
       ? "DEVICE_CODE_REJECTED"
@@ -325,6 +350,8 @@ let activeGuard: CdpGuard | undefined;
 let activeTempDir: string | undefined;
 let activeBrowserContextId: string | undefined;
 let activeApiProxy: { close: () => Promise<void> } | undefined;
+let activeMcpServer: McpServerHost | undefined;
+let activeMcpStart: Promise<void> | undefined;
 let activeOAuthStart:
   | { controller: AbortController; done: Promise<void> }
   | undefined;
@@ -711,6 +738,61 @@ function parseApiProxyStart(
   };
 }
 
+function isStringArray(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) && value.every((item) => typeof item === "string")
+  );
+}
+
+function hasNul(value: string): boolean {
+  return value.includes("\0");
+}
+
+/** 環境変数名として spawn が受け付けない名前（空・`=`・NUL を含む）を拒否する。 */
+function isEnvRecord(value: unknown): value is Record<string, string> {
+  return (
+    isRecord(value) &&
+    !Array.isArray(value) &&
+    Object.entries(value).every(
+      ([name, item]) =>
+        name !== "" &&
+        !name.includes("=") &&
+        !hasNul(name) &&
+        typeof item === "string" &&
+        !hasNul(item),
+    )
+  );
+}
+
+/**
+ * spawn が同期的に投げる引数検査の例外は値を引用するため、NUL を含む値はここで拒否し、
+ * 例外経路へ秘密を運ばせない。
+ */
+function parseMcpServerStart(
+  value: Record<string, unknown>,
+  id?: RequestId,
+): McpServerStartRequest {
+  if (
+    typeof value.command !== "string" ||
+    hasNul(value.command) ||
+    !path.isAbsolute(value.command) ||
+    !isStringArray(value.args) ||
+    value.args.some(hasNul) ||
+    !isEnvRecord(value.env) ||
+    !isStringArray(value.scan)
+  ) {
+    throw new InvalidRequestError(id);
+  }
+  return {
+    op: "mcp_server_start",
+    id,
+    command: value.command,
+    args: [...value.args],
+    env: Object.fromEntries(Object.entries(value.env)),
+    scan: [...value.scan],
+  };
+}
+
 export function parseRequest(line: string): Request {
   let value: unknown;
   try {
@@ -728,6 +810,8 @@ export function parseRequest(line: string): Request {
   if (value.op === "lease") return { op: "lease", id };
   if (value.op === "api_proxy_stop") return { op: "api_proxy_stop", id };
   if (value.op === "api_proxy_start") return parseApiProxyStart(value, id);
+  if (value.op === "mcp_server_stop") return { op: "mcp_server_stop", id };
+  if (value.op === "mcp_server_start") return parseMcpServerStart(value, id);
   if (value.op === "release") {
     if (typeof value.target_id !== "string") {
       throw new InvalidRequestError(id);
@@ -1750,11 +1834,20 @@ function writeOAuthTokenEvent(action: OAuthTokenAction): void {
   process.stdout.write(`${JSON.stringify(formatOAuthTokenEvent(action))}\n`);
 }
 
+export function formatMcpServerEvent(event: McpServerEvent): unknown {
+  return { event: "mcp_server", ...event };
+}
+
+function writeMcpServerEvent(event: McpServerEvent): void {
+  process.stdout.write(`${JSON.stringify(formatMcpServerEvent(event))}\n`);
+}
+
 function monitorGuardFailure(guard: CdpGuard): void {
   void guard.failure.then(undefined, async () => {
     if (shuttingDown) return;
     shuttingDown = true;
     await closeApiProxy();
+    await closeMcpServer();
     await cleanupResources();
     process.exit(1);
   });
@@ -2197,6 +2290,72 @@ async function handleApiProxyStop(request: ApiProxyStopRequest): Promise<void> {
   writeResponse({ ok: true }, request.id);
 }
 
+async function closeMcpServer(): Promise<void> {
+  const host = activeMcpServer;
+  activeMcpServer = undefined;
+  if (host !== undefined) await host.close();
+}
+
+async function runMcpServerStart(
+  request: McpServerStartRequest,
+): Promise<void> {
+  // 1 executor が保持するリソースは 1 種類 1 個に限り、ブラウザ・注入プロキシとも併存させない。
+  if (
+    activeMcpServer !== undefined ||
+    activeApiProxy !== undefined ||
+    activeBrowser !== undefined ||
+    activeOAuthStart !== undefined
+  ) {
+    writeResponse(
+      { ok: false, error: "INTERNAL" satisfies ErrorCode },
+      request.id,
+    );
+    return;
+  }
+  const streamSecret = createStreamSecret();
+  try {
+    const host = await startMcpServer({
+      command: request.command,
+      args: request.args,
+      env: request.env,
+      scan: request.scan,
+      streamSecret,
+      onEvent: writeMcpServerEvent,
+    });
+    activeMcpServer = host;
+    writeResponse(
+      { ok: true, port: host.port, stream_secret: streamSecret },
+      request.id,
+    );
+  } catch (error) {
+    const classified = classifyExecutionError(error, "mcp_server");
+    writeExecutorErrorLine(request, "mcp_server", classified, error, [
+      streamSecret,
+    ]);
+    writeResponse(formatErrorResponse(classified), request.id);
+  }
+}
+
+/** 起動中の要求を記録し、shutdown が起動の完了を待ってから後始末できるようにする。 */
+async function handleMcpServerStart(
+  request: McpServerStartRequest,
+): Promise<void> {
+  const done = runMcpServerStart(request);
+  activeMcpStart = done;
+  try {
+    await done;
+  } finally {
+    activeMcpStart = undefined;
+  }
+}
+
+async function handleMcpServerStop(
+  request: McpServerStopRequest,
+): Promise<void> {
+  await closeMcpServer();
+  writeResponse({ ok: true }, request.id);
+}
+
 async function shutdown(request?: { id?: RequestId }): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -2205,7 +2364,9 @@ async function shutdown(request?: { id?: RequestId }): Promise<void> {
     oauthStart.controller.abort();
     await oauthStart.done;
   }
+  await activeMcpStart;
   await closeApiProxy();
+  await closeMcpServer();
   await cleanupResources();
   if (request !== undefined) writeResponse({ ok: true }, request.id);
   process.exit(0);
@@ -2258,6 +2419,14 @@ async function main(): Promise<void> {
       }
       if (request.op === "api_proxy_stop") {
         await handleApiProxyStop(request);
+        continue;
+      }
+      if (request.op === "mcp_server_start") {
+        await handleMcpServerStart(request);
+        continue;
+      }
+      if (request.op === "mcp_server_stop") {
+        await handleMcpServerStop(request);
         continue;
       }
       await handleLogin(request);

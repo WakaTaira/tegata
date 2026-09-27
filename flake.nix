@@ -187,6 +187,12 @@
                         successSelector = "#device-ok";
                       };
                     };
+                    mcpServers.fake = {
+                      credId = "vault:fake";
+                      command = "/nix/store/fake/bin/fake-mcp-server";
+                      args = [ "--stdio" ];
+                      env = { TOKEN = "{{secret}}"; };
+                    };
                   };
                 }
               ];
@@ -216,6 +222,11 @@
             assert containsLine configText "client_id = \"Iv1.test\"";
             assert containsLine configText "login_cred_id = \"vault:gh\"";
             assert containsLine configText "steps = [{ action = \"fill\", selector = \"#login_field\", value = \"{{username}}\" }]";
+            assert containsLine configText "[[mcp_server]]";
+            assert containsLine configText "cred_id = \"vault:fake\"";
+            assert containsLine configText "command = \"/nix/store/fake/bin/fake-mcp-server\"";
+            assert containsLine configText "[mcp_server.env]";
+            assert containsLine configText "TOKEN = \"{{secret}}\"";
             assert builtins.replaceStrings [ "clientId" ] [ "" ] configText == configText;
             assert builtins.replaceStrings [ "socket_path" ] [ "" ] configText == configText;
             assert !(containsLine defaultConfigText "kind = \"tcp\"");

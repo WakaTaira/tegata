@@ -69,6 +69,8 @@ export interface ApiProxyDaemonOptions {
   tcpPort?: number;
   operatorUids?: number[];
   captureStderr?: boolean;
+  /** config の末尾へそのまま連結する TOML 断片（`[[mcp_server]]` など）である。 */
+  extraToml?: string;
 }
 
 export interface ApiProxyStack {
@@ -200,6 +202,7 @@ export function renderApiProxyConfig(
         );
     }
   }
+  if (opts.extraToml !== undefined) lines.push("", opts.extraToml.trimEnd());
   return `${lines.join("\n")}\n`;
 }
 

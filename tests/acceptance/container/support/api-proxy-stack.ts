@@ -44,7 +44,7 @@ export interface ApiProxyContainerStack {
   observe(label: string, value: unknown): void;
 }
 
-async function startBridge(
+export async function startBridge(
   agent: Container,
   peer: Peer,
   daemonAddr: string,

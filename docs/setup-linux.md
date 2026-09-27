@@ -56,6 +56,7 @@ written in terms of user names and enforced in terms of uids.
 | `services.tegata.auditLogMaxBytes` | null or unsigned | `null` | Rotate the audit log past this size |
 | `services.tegata.approveCmd` | null or string | `null` | Approval command gating each login |
 | `services.tegata.approveTimeoutSecs` | null or unsigned | `null` (60s) | Approval command timeout |
+| `services.tegata.approvalGrantTtlSecs` | unsigned | `0` | Approval grant lifetime; zero asks every time |
 | `services.tegata.listen.tcp` | null or submodule | `null` | Optional TCP listener for a container bridge |
 | `services.tegata.operatorUids` | list of unsigned | `[]` | Uids permitted to call peer administration RPCs over the UNIX socket |
 
@@ -528,14 +529,17 @@ approve_timeout_secs = 60
 The daemon runs the command through `sh -c` on the isolated side and reads the exit
 status: **zero approves, anything else denies.** No answer within
 `approve_timeout_secs` kills the command's whole process group and fails the login
-with `APPROVAL_TIMEOUT`. Three environment variables describe the request, and
+with `APPROVAL_TIMEOUT`. Six environment variables describe the request, and
 nothing else is passed — no credential value ever reaches the hook:
 
 | Variable | Contents |
 | --- | --- |
 | `TEGATA_CRED_ID` | The namespaced credential reference |
 | `TEGATA_TARGET_URL` | The login destination |
-| `TEGATA_PEER` | The calling peer's uid, in decimal |
+| `TEGATA_METHOD` | The gated method: `login`, `authorize_device`, or `open_api_proxy` |
+| `TEGATA_APPROVAL_CODE` | A two-digit number, 10–99, generated per request by the daemon |
+| `TEGATA_APPROVAL_GRANT_TTL_SECS` | The configured approval grant lifetime in seconds |
+| `TEGATA_PEER` | The calling peer: its uid in decimal, or its principal (such as `peer:<id>`) for a token peer |
 
 A graphical prompt is the simplest workable hook, since the exit status is already
 the answer:
@@ -553,6 +557,25 @@ sends a push notification and blocks on the reply, exiting non-zero on refusal a
 letting the timeout handle silence. Either way the command runs as the daemon's
 user, so an approval prompt is not something the agent can draw, dismiss, or
 answer.
+
+When `approval_grant_ttl_secs` is positive, a successful approval grants the same
+`(principal, credential)` pair access to `login`, `open_api_proxy`, and
+`authorize_device` for that many seconds from the approval time. The grant expires
+when the TTL elapses, `lock_vault` is called, or the daemon restarts; refusals and
+timeouts never create one. The audit record identifies `approval_grant: "issued"`
+or `"reused"`. The default `0` asks every time, and `get_totp` is outside this gate.
+
+The approval code binds the response to the request; it is not a secret. A hook can
+send the number and credential id through an operator-only notification channel and
+return success only when the operator confirms the same number:
+
+```sh
+send_notification "$TEGATA_APPROVAL_CODE" "$TEGATA_CRED_ID"
+[ "$(read_operator_reply)" = "$TEGATA_APPROVAL_CODE" ]
+```
+
+A terminal is not a boundary: an agent can type into other panes such as tmux, so
+confirmation must use a channel the agent cannot operate.
 
 Two ordering details worth knowing:
 

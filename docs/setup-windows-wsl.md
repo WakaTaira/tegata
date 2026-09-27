@@ -221,6 +221,7 @@ browsers_path   = "C:\\ProgramData\\tegata-rig\\browsers"
 | `executor_entry` | string | no | Path to the executor's `index.js` |
 | `approve_operator` | boolean | no | Hold every `login`, `authorize_device`, and `open_api_proxy` for an operator decision; default `false` — see [The approval hook](#the-approval-hook) |
 | `approve_timeout_secs` | integer | no | How long a pending approval waits for a decision; default `60` |
+| `approval_grant_ttl_secs` | integer | no | Approval grant lifetime in seconds; `0` asks every time |
 
 `approve_cmd` remains UNIX-only. A Windows configuration containing it is refused
 at startup with an explicit error rather than silently ignored — see
@@ -287,6 +288,10 @@ refused at startup with an explicit error. Raise `approve_timeout_secs` well
 above its default of 60 when using this hook — a human reading a pending list
 and typing a command needs longer than a scripted `approve_cmd` does. 300
 seconds is a reasonable starting point.
+
+When `approval_grant_ttl_secs` is positive, an approved `(principal, credential)`
+pair can use the gated methods without another operator decision until the TTL
+expires. The grant also ends when `lock_vault` is called or the daemon restarts.
 
 With the hook enabled, every `login`, `authorize_device`, and `open_api_proxy`
 registers a pending approval at the same point `approve_cmd` would gate it —

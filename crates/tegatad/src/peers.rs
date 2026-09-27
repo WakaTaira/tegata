@@ -193,7 +193,7 @@ fn generate_ulid() -> io::Result<String> {
     Ok(encoded)
 }
 
-fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
+pub(crate) fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
         std::fs::File::open("/dev/urandom")?.read_exact(bytes)

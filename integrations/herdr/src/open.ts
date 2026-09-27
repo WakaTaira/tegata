@@ -2,10 +2,11 @@ import type { ChildProcess } from "node:child_process";
 import { execFileSync, spawn } from "node:child_process";
 import { chmod, mkdir } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 type Placement = "split" | "tab" | "zoomed" | "overlay";
 type Direction = "right" | "down";
+const TARGET_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
 type OpenOptions = {
   endpoint: string;
@@ -79,7 +80,7 @@ async function main(): Promise<number> {
   }
 }
 
-function parseArgs(args: string[]): OpenOptions {
+export function parseArgs(args: string[]): OpenOptions {
   let endpoint: string | undefined;
   let targetId: string | undefined;
   let url: string | undefined;
@@ -128,6 +129,11 @@ function parseArgs(args: string[]): OpenOptions {
   }
   if (!targetId) {
     throw new Error("--target-id is required");
+  }
+  if (!isValidTargetId(targetId)) {
+    throw new Error(
+      "--target-id must contain 1-128 ASCII letters, digits, underscores, or hyphens",
+    );
   }
   if (!isWebSocketEndpoint(endpoint)) {
     throw new Error("--endpoint must be a ws:// or wss:// URL");
@@ -277,13 +283,23 @@ function isWebSocketEndpoint(value: string): boolean {
   }
 }
 
-void main()
-  .then((code) => {
-    process.exitCode = code;
-  })
-  .catch((error: unknown) => {
-    console.error(
-      `tegata-herdr-open: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    process.exitCode = 1;
-  });
+export function isValidTargetId(value: string): boolean {
+  return TARGET_ID_PATTERN.test(value);
+}
+
+const isMainModule =
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+
+if (isMainModule) {
+  void main()
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((error: unknown) => {
+      console.error(
+        `tegata-herdr-open: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      process.exitCode = 1;
+    });
+}

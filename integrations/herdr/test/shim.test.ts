@@ -306,7 +306,12 @@ describe("tegata Herdr shim", () => {
     const current = requireFixture(fixture);
     const firstPort = await freePort();
     shim = spawnShim(current.endpoint, current.loginTargetId, firstPort);
-    await waitForJson(`http://127.0.0.1:${firstPort}/json/version`, shim);
+    const firstVersion = await waitForJson(
+      `http://127.0.0.1:${firstPort}/json/version`,
+      shim,
+    );
+    plugin = new CdpClient();
+    await plugin.connect(firstVersion.webSocketDebuggerUrl as string);
     const startedAt = Date.now();
     shim.kill("SIGTERM");
     await waitForChildExit(shim, 1_500);

@@ -260,7 +260,9 @@ token; OAuth device-flow approval — the daemon logs in and approves a
 device-code grant the agent's own tool started, without handing out a browser;
 an injection proxy for static API tokens — `open_api_proxy` hands the agent a
 loopback base URL and adds the stored token to every request for one configured
-upstream, so the agent never holds it;
+upstream, so the agent never holds it; an experimental Herdr integration in
+[`integrations/herdr`](integrations/herdr) that shows a logged-in session in a
+Herdr browser pane;
 and prebuilt release binaries and bundles for non-Nix deployments,
 published from tags on the
 [releases page](https://github.com/WakaTaira/tegata/releases).

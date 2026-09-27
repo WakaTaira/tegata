@@ -2287,6 +2287,7 @@ async fn start_control(
 
 /// 承認ゲートが構成されている場合、資格の存在と施錠状態を確かめたうえで承認を求める。
 /// 施錠中の資格は承認を求める前に拒否する。付与の扱いは `approve_with_grant` に従う。
+/// 存在を確認できなかった資格は、付与を参照・記録せずに承認のみを求める。
 async fn gate_on_approval(
     state: &SharedState,
     cred_id: &str,
@@ -2297,12 +2298,16 @@ async fn gate_on_approval(
     if !approval_required(&*state.lock().await) {
         return Ok(None);
     }
-    let locked = match credential_state(state, cred_id).await? {
-        Some(locked) => locked,
+    let credential = match credential_state(state, cred_id).await? {
+        Some(credential) => credential,
         None => return Err(ErrorCode::InvalidCredential),
     };
-    if locked {
+    if credential.locked {
         return Err(ErrorCode::VaultLocked);
+    }
+    if !credential.confirmed {
+        request_approval(state, cred_id, target_url, method, peer).await?;
+        return Ok(None);
     }
     approve_with_grant(state, cred_id, target_url, method, peer).await
 }
@@ -2317,21 +2322,25 @@ async fn approve_with_grant(
     peer: &PeerIdentity,
 ) -> Result<Option<grants::ApprovalGrant>, ErrorCode> {
     let principal = peer.principal();
-    if state
-        .lock()
-        .await
-        .approval_grants
-        .reuse(&principal, cred_id, Instant::now())
-    {
-        return Ok(Some(grants::ApprovalGrant::Reused));
-    }
-    request_approval(state, cred_id, target_url, method, peer).await?;
-    let issued =
-        state
-            .lock()
-            .await
+    let observed = {
+        let mut daemon = state.lock().await;
+        if daemon
             .approval_grants
-            .issue(principal, cred_id.to_owned(), Instant::now());
+            .reuse(&principal, cred_id, Instant::now())
+        {
+            return Ok(Some(grants::ApprovalGrant::Reused));
+        }
+        daemon.approval_grants.generation()
+    };
+    request_approval(state, cred_id, target_url, method, peer).await?;
+    // 承認待ちの間に lock_vault が付与を破棄した場合、この承認は当該要求にのみ効かせ、
+    // 付与としては記録しない。
+    let issued = state.lock().await.approval_grants.issue(
+        principal,
+        cred_id.to_owned(),
+        Instant::now(),
+        observed,
+    );
     Ok(issued.then_some(grants::ApprovalGrant::Issued))
 }
 
@@ -2441,6 +2450,11 @@ async fn open_api_proxy(
             .map(|(namespace, _)| namespace.to_owned()),
         ..AuditFields::default()
     };
+    let Some((namespace, _)) = proxy.cred_id.split_once(':') else {
+        return classified(request.id.clone(), ErrorCode::InvalidCredential)
+            .with_audit_fields(fields);
+    };
+    let namespace = namespace.to_owned();
     let grant = match gate_on_approval(
         &state,
         &proxy.cred_id,
@@ -2453,7 +2467,7 @@ async fn open_api_proxy(
         Ok(grant) => grant,
         Err(error) => return classified(request.id.clone(), error).with_audit_fields(fields),
     };
-    match start_api_proxy_session(&state, peer, proxy).await {
+    match start_api_proxy_session(&state, peer, proxy, namespace).await {
         Ok((session_id, base_url)) => {
             fields.session_id = Some(session_id.clone());
             success(
@@ -2468,16 +2482,13 @@ async fn open_api_proxy(
 }
 
 /// 承認ゲートを通過した注入プロキシを起動制御を経て起動し、リースを登録して
-/// `(session_id, base_url)` を返す。
+/// `(session_id, base_url)` を返す。`namespace` は `proxy.cred_id` から分割済みの値である。
 async fn start_api_proxy_session(
     state: &SharedState,
     peer: &PeerIdentity,
     proxy: ApiProxyConfig,
+    namespace: String,
 ) -> Result<(String, String), ErrorCode> {
-    let Some((namespace, _)) = proxy.cred_id.split_once(':') else {
-        return Err(ErrorCode::InvalidCredential);
-    };
-    let namespace = namespace.to_owned();
     let principal = peer.principal();
     let start_gate = start_control(
         state,
@@ -2699,7 +2710,17 @@ fn valid_authorize_steps(steps: Option<&[tegata_core::wire::LoginStep]>) -> bool
     })
 }
 
-async fn credential_state(state: &SharedState, cred_id: &str) -> Result<Option<bool>, ErrorCode> {
+/// 承認ゲートが確かめた資格の状態。
+struct CredentialState {
+    locked: bool,
+    /// 列挙結果に資格が含まれ、存在を確認できたか。
+    confirmed: bool,
+}
+
+async fn credential_state(
+    state: &SharedState,
+    cred_id: &str,
+) -> Result<Option<CredentialState>, ErrorCode> {
     let Some((_, entry_id)) = cred_id.split_once(':') else {
         return Ok(None);
     };
@@ -2707,10 +2728,17 @@ async fn credential_state(state: &SharedState, cred_id: &str) -> Result<Option<b
         return Ok(None);
     };
     if refs.iter().any(|credential| credential.id == entry_id) {
-        return Ok(Some(false));
+        return Ok(Some(CredentialState {
+            locked: false,
+            confirmed: true,
+        }));
     }
+    // 施錠中は列挙が空になりうるため通すが、存在は確認できていない。
     if locked && refs.is_empty() {
-        return Ok(Some(false));
+        return Ok(Some(CredentialState {
+            locked: false,
+            confirmed: false,
+        }));
     }
     Ok(None)
 }

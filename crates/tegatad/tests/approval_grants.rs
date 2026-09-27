@@ -1,6 +1,5 @@
-//! Approval grants (`approval_grant_ttl_secs`) driven over the UNIX domain
-//! socket with a fake `approve_cmd` hook, so these tests only exist on UNIX
-//! targets.
+//! 承認の付与（`approval_grant_ttl_secs`）を、偽の `approve_cmd` hook を用いて検証する。
+//! UNIX ドメインソケット経由で RPC を送るため、UNIX でのみ実行する。
 #![cfg(unix)]
 
 use std::path::PathBuf;
@@ -18,8 +17,8 @@ const USERNAME: &str = "grant-user-secret";
 const PASSWORD: &str = "grant-password-secret";
 const TOTP_SEED: &str = "grant-totp-seed-canary";
 
-/// A fake executor that completes logins and device authorizations and
-/// answers lease requests, so a second login can share the first browser.
+/// login と端末認可を成功させ、リース要求にも応答する偽 executor。
+/// 2 回目の login が 1 回目のブラウザに相乗りできるようにする。
 const EXECUTOR: &str = r#"
 const readline = require("node:readline");
 const rl = readline.createInterface({ input: process.stdin });
@@ -49,9 +48,9 @@ struct Daemon {
 }
 
 impl Daemon {
-    /// Starts the daemon with a hook that appends one line per call to
-    /// `hook.log` and denies while `hook.deny` exists. The hook environment is
-    /// appended to `hook.env`.
+    /// 呼び出しごとに `hook.log` へ 1 行を追記し、`hook.deny` が存在する間は拒否する hook を
+    /// 構成してデーモンを起動する。hook は `hook.hold` が存在する間は返答を保留し、
+    /// 受け取った環境変数を `hook.env` へ追記する。
     #[allow(clippy::zombie_processes)]
     fn start(grant_ttl_secs: Option<u64>) -> Self {
         let directory = std::env::temp_dir().join(format!("tegatad-grants-{}", Uuid::new_v4()));
@@ -63,9 +62,10 @@ impl Daemon {
         let script_path = directory.join("executor.js");
         std::fs::write(&script_path, EXECUTOR).expect("write executor script");
         let hook = format!(
-            "echo \"$TEGATA_APPROVAL_CODE $TEGATA_APPROVAL_GRANT_TTL_SECS $TEGATA_CRED_ID $TEGATA_METHOD\" >> {:?}; env >> {:?}; test ! -e {:?}",
+            "echo \"$TEGATA_APPROVAL_CODE $TEGATA_APPROVAL_GRANT_TTL_SECS $TEGATA_CRED_ID $TEGATA_METHOD\" >> {:?}; env >> {:?}; while test -e {:?}; do sleep 0.05; done; test ! -e {:?}",
             directory.join("hook.log"),
             directory.join("hook.env"),
+            directory.join("hook.hold"),
             directory.join("hook.deny"),
         );
         let ttl_line = grant_ttl_secs
@@ -77,7 +77,7 @@ impl Daemon {
             )
         };
         let config = format!(
-            "socket_path = {:?}\nstate_dir = {:?}\naudit_log_path = {:?}\nallowed_uids = [{}]\nexecutor_entry = {:?}\napprove_cmd = {:?}\n{}\n[[providers]]\nnamespace = \"mock\"\ntype = \"mock\"\n\n{}{}[[providers]]\nnamespace = \"other\"\ntype = \"mock\"\n\n{}",
+            "socket_path = {:?}\nstate_dir = {:?}\naudit_log_path = {:?}\nallowed_uids = [{}]\nexecutor_entry = {:?}\napprove_cmd = {:?}\n{}\n[[providers]]\nnamespace = \"mock\"\ntype = \"mock\"\n\n{}{}[[providers]]\nnamespace = \"other\"\ntype = \"mock\"\n\n{}[[providers]]\nnamespace = \"empty\"\ntype = \"mock\"\n",
             socket_path,
             state_dir,
             state_dir.join("audit.log"),
@@ -146,7 +146,7 @@ impl Daemon {
         }
     }
 
-    /// Returns the audit records of `method` in order.
+    /// `method` の監査行を記録順に返す。
     fn audit(&self, method: &str) -> Vec<Value> {
         std::fs::read_to_string(self.directory.join("state/audit.log"))
             .unwrap_or_default()
@@ -177,10 +177,9 @@ fn call_field(call: &str, index: usize) -> &str {
     call.split(' ').nth(index).expect("hook log field")
 }
 
-/// Given: `approve_cmd` without `approval_grant_ttl_secs`
-/// When: the same credential logs in twice
-/// Then: the hook runs both times with a zero TTL and no audit line carries
-/// `approval_grant`.
+/// 前提: `approve_cmd` があり、`approval_grant_ttl_secs` が無い。
+/// 操作: 同じ資格で 2 回 login する。
+/// 結果: hook は 2 回とも有効期間 0 で呼ばれ、どの監査行にも `approval_grant` が無い。
 #[test]
 fn without_a_grant_ttl_every_login_asks_the_hook() {
     let daemon = Daemon::start(None);
@@ -199,9 +198,9 @@ fn without_a_grant_ttl_every_login_asks_the_hook() {
     );
 }
 
-/// Given: `approval_grant_ttl_secs = 60`
-/// When: the same principal logs in to the same credential twice
-/// Then: the hook runs once and the audit lines read `issued` then `reused`.
+/// 前提: `approval_grant_ttl_secs = 60` である。
+/// 操作: 同じ principal が同じ資格で 2 回 login する。
+/// 結果: hook は 1 回だけ呼ばれ、監査行は `issued`、`reused` の順となる。
 #[test]
 fn a_grant_skips_the_hook_for_the_same_principal_and_credential() {
     let daemon = Daemon::start(Some(60));
@@ -217,9 +216,9 @@ fn a_grant_skips_the_hook_for_the_same_principal_and_credential() {
     assert_eq!(audit[1]["approval_grant"], json!("reused"));
 }
 
-/// Given: a one second grant
-/// When: the second login comes after the grant expired
-/// Then: the hook runs again.
+/// 前提: 付与の有効期間が 1 秒である。
+/// 操作: 付与の満了後に 2 回目の login を行う。
+/// 結果: hook が再度呼ばれる。
 #[test]
 fn an_expired_grant_asks_the_hook_again() {
     let daemon = Daemon::start(Some(1));
@@ -232,9 +231,9 @@ fn an_expired_grant_asks_the_hook_again() {
     assert_eq!(audit[1]["approval_grant"], json!("issued"));
 }
 
-/// Given: a grant for one credential
-/// When: another credential logs in
-/// Then: the hook runs for that credential.
+/// 前提: ある資格に付与がある。
+/// 操作: 別の資格で login する。
+/// 結果: その資格について hook が呼ばれる。
 #[test]
 fn a_grant_does_not_cover_another_credential() {
     let daemon = Daemon::start(Some(60));
@@ -246,9 +245,9 @@ fn a_grant_does_not_cover_another_credential() {
     assert_eq!(call_field(&calls[1], 2), "mock:second");
 }
 
-/// Given: a hook that denies first and approves afterwards
-/// When: the same credential logs in twice
-/// Then: the denial creates no grant, so the second login asks again.
+/// 前提: hook が 1 回目は拒否し、以後は許可する。
+/// 操作: 同じ資格で 2 回 login する。
+/// 結果: 拒否は付与を作らないため、2 回目の login で再度承認を求める。
 #[test]
 fn a_denial_creates_no_grant() {
     let daemon = Daemon::start(Some(60));
@@ -263,9 +262,9 @@ fn a_denial_creates_no_grant() {
     assert_eq!(audit[1]["approval_grant"], json!("issued"));
 }
 
-/// Given: a grant from `login`
-/// When: `authorize_device` runs for the same credential
-/// Then: the grant is shared across methods.
+/// 前提: `login` による付与がある。
+/// 操作: 同じ資格で `authorize_device` を行う。
+/// 結果: 付与はメソッドを問わず共有される。
 #[test]
 fn authorize_device_reuses_a_login_grant() {
     let daemon = Daemon::start(Some(60));
@@ -287,9 +286,9 @@ fn authorize_device_reuses_a_login_grant() {
     assert_eq!(audit[0]["approval_grant"], json!("reused"));
 }
 
-/// Given: grants in two namespaces
-/// When: `lock_vault` locks one namespace
-/// Then: only that namespace's grant is revoked.
+/// 前提: 2 つの namespace に付与がある。
+/// 操作: `lock_vault` で一方の namespace を施錠する。
+/// 結果: その namespace の付与のみが破棄される。
 #[test]
 fn lock_vault_revokes_the_grants_of_its_namespace() {
     let daemon = Daemon::start(Some(60));
@@ -310,9 +309,9 @@ fn lock_vault_revokes_the_grants_of_its_namespace() {
     assert_eq!(call_field(&calls[2], 2), "mock:site");
 }
 
-/// Given: grants in two namespaces
-/// When: `lock_vault` runs without a namespace
-/// Then: every grant is revoked.
+/// 前提: 2 つの namespace に付与がある。
+/// 操作: namespace を指定せずに `lock_vault` を行う。
+/// 結果: すべての付与が破棄される。
 #[test]
 fn lock_vault_without_a_namespace_revokes_every_grant() {
     let daemon = Daemon::start(Some(60));
@@ -326,10 +325,9 @@ fn lock_vault_without_a_namespace_revokes_every_grant() {
     assert_eq!(daemon.hook_calls().len(), 4);
 }
 
-/// Given: a hook that records its environment
-/// When: it is asked five times
-/// Then: every approval code is a two digit number, the codes are not all
-/// equal, and no credential secret reaches the hook.
+/// 前提: hook が受け取った環境変数を記録する。
+/// 操作: 承認を 5 回求める。
+/// 結果: 照合番号はいずれも 2 桁の整数で、すべてが同じ値ではなく、資格の secret は hook に渡らない。
 #[test]
 fn the_hook_receives_fresh_two_digit_codes_and_no_secrets() {
     let daemon = Daemon::start(Some(60));
@@ -355,4 +353,95 @@ fn the_hook_receives_fresh_two_digit_codes_and_no_secrets() {
     for secret in [USERNAME, PASSWORD, TOTP_SEED] {
         assert!(!env.contains(secret), "hook env leaked {secret}");
     }
+}
+
+/// 前提: hook が返答を保留している。
+/// 操作: 保留中に同じ namespace を `lock_vault` で施錠してから承認を成立させ、再び login する。
+/// 結果: 施錠後に付与は復活せず、次の login で hook が再度呼ばれる。
+#[test]
+fn a_lock_during_a_pending_approval_leaves_no_grant() {
+    let daemon = Daemon::start(Some(60));
+    let hold = daemon.directory.join("hook.hold");
+    std::fs::write(&hold, "").expect("create hold file");
+    let socket_path = daemon.socket_path.clone();
+    let pending = std::thread::spawn(move || {
+        rpc(
+            &socket_path,
+            "login",
+            json!({ "cred_id": "mock:site", "target_url": "http://127.0.0.1" }),
+        )
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while daemon.hook_calls().is_empty() {
+        assert!(Instant::now() < deadline, "hook was not called");
+        sleep(Duration::from_millis(20));
+    }
+    let locked = rpc(
+        &daemon.socket_path,
+        "lock_vault",
+        json!({ "namespace": "mock" }),
+    );
+    assert_eq!(locked["result"]["ok"], true);
+    std::fs::remove_file(&hold).expect("remove hold file");
+    pending.join().expect("join pending login");
+
+    let audit = daemon.audit("login");
+    assert_eq!(audit.len(), 1);
+    assert!(audit[0].get("approval_grant").is_none(), "{}", audit[0]);
+    daemon.login("mock:site");
+    let calls = daemon.hook_calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(call_field(&calls[1], 2), "mock:site");
+}
+
+/// 前提: 施錠中で列挙結果が空の namespace がある。
+/// 操作: その namespace の資格で 2 回 login する。
+/// 結果: 存在を確認できない資格には付与を作らず、2 回とも hook が呼ばれ、監査行に
+/// `approval_grant` が無い。
+#[test]
+fn an_unconfirmed_credential_receives_no_grant() {
+    let daemon = Daemon::start(Some(60));
+    let locked = rpc(
+        &daemon.socket_path,
+        "lock_vault",
+        json!({ "namespace": "empty" }),
+    );
+    assert_eq!(locked["result"]["ok"], true);
+
+    assert!(daemon.login("empty:ghost").get("error").is_some());
+    assert!(daemon.login("empty:ghost").get("error").is_some());
+
+    let calls = daemon.hook_calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    let audit = daemon.audit("login");
+    assert_eq!(audit.len(), 2);
+    assert!(
+        audit
+            .iter()
+            .all(|record| record.get("approval_grant").is_none())
+    );
+}
+
+/// 前提: 承認ゲートが構成されている。
+/// 操作: 存在しない資格で `authorize_device` を行う。
+/// 結果: 承認を求める前に `INVALID_CREDENTIAL` で拒否され、hook は呼ばれない。
+#[test]
+fn authorize_device_rejects_an_unknown_credential_before_asking_the_hook() {
+    let daemon = Daemon::start(Some(60));
+    let response = rpc(
+        &daemon.socket_path,
+        "authorize_device",
+        json!({
+            "cred_id": "mock:missing",
+            "verification_url": "https://example.test/device",
+            "user_code": "grant-device-code",
+            "success_selector": "#device-ok"
+        }),
+    );
+    assert_error(&response, "INVALID_CREDENTIAL");
+
+    assert!(daemon.hook_calls().is_empty());
+    let audit = daemon.audit("authorize_device");
+    assert_eq!(audit.len(), 1);
+    assert!(audit[0].get("approval_grant").is_none(), "{}", audit[0]);
 }

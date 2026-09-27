@@ -59,13 +59,18 @@ value = "Bearer {{secret}}"
 client_id = "Iv1.xxxx"
 device_authorization_url = "https://github.com/login/device/code"
 token_url = "https://github.com/login/oauth/access_token"
-scope = "repo"
+revocation_url = "https://auth.example.com/oauth/revoke"   # optional
+scope = "repo"                                              # optional
 login_cred_id = "vw:github-login"
-steps = [ ... ]
+steps = [ ... ]                                             # optional
 success_selector = "[data-testid=authorized]"
+failure_selector = "[data-testid=denied]"                   # optional
 ```
 
-`login_cred_id` and `steps` use the same browser-login configuration as
+`device_authorization_url`, `token_url`, and `revocation_url` follow the same
+rule as `upstream`: `https://`, or `http://` to a loopback host; any other URL
+refuses startup. `revocation_url`, `scope`, `steps`, and `failure_selector` are
+optional. `login_cred_id` and `steps` use the same browser-login configuration as
 `authorize_device`; `success_selector` identifies successful approval and
 `failure_selector` can identify a rejected approval. tegata logs into the
 provider in a browser using the vault credential and approves the device grant.
@@ -79,7 +84,19 @@ requests return `503`; the agent must open the proxy again. Client secrets and
 authorization-code grants are not supported. Grant failures return
 `OAUTH_GRANT_FAILED`; browser-stage failures use the same codes as
 `authorize_device`. Audit records use `api_proxy_oauth` with `oauth_action` set
-to `issued`, `refreshed`, `refresh_failed`, or `revoked`.
+to `issued`, `refreshed`, `refresh_failed`, or `revoked`; `revoked` is recorded
+only when every revocation request succeeded.
+
+Opening an OAuth proxy runs the whole grant before it returns, which can take up
+to 80 seconds. Set the agent's MCP client request timeout to at least 90
+seconds. With a shorter timeout, the client gives up while the daemon still
+completes the grant, and the resulting lease stays open, unused, until its TTL
+expires.
+
+An approval grant from `approval_grant_ttl_secs` is keyed by
+`(principal, credential)`, not by method. A grant earned by a `login` with the
+proxy's `login_cred_id` also lets the same principal call `open_api_proxy` for
+the OAuth proxy without a new approval, and the reverse holds as well.
 
 ## Calling it
 

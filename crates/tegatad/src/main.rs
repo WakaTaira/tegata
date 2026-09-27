@@ -66,6 +66,9 @@ const METHOD_NOT_FOUND: i32 = -32601;
 const CLASSIFICATION_ERROR: i32 = -32000;
 const EXECUTOR_TIMEOUT: Duration = Duration::from_secs(90);
 const EXECUTOR_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+/// `api_proxy_stop` の応答待ちの上限。executor の revocation 上限 5 秒
+/// （packages/tegata-executor/src/oauth.ts の `REVOCATION_TIMEOUT_MS`）に余裕を足した値である。
+/// 変更時は両方を揃える。
 const API_PROXY_STOP_TIMEOUT: Duration = Duration::from_secs(8);
 const EXECUTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const PASSWORD_FILE_DIR: &str = ".bw-passwords";
@@ -157,6 +160,8 @@ struct ApiProxyConfig {
     oauth: Option<ApiProxyOAuthConfig>,
 }
 
+/// `[api_proxy.oauth]` の設定。注入する値を、executor が device-code grant で得るトークンから作る。
+/// `login_cred_id` は認可画面でのブラウザログインに使う資格であり、承認の対象でもある。
 #[derive(Clone, Debug, Deserialize)]
 struct ApiProxyOAuthConfig {
     client_id: String,
@@ -170,6 +175,10 @@ struct ApiProxyOAuthConfig {
     failure_selector: Option<String>,
 }
 
+/// `api_proxy_start` に載せる注入値の指定。
+///
+/// 静的な資格では `header_value` のみを、OAuth では `value_template` と `oauth` の組のみを持つ。
+/// 両者は排他であり、同時に持つことも、どちらも持たないこともない。
 struct ApiProxyStartOptions {
     value_template: Option<String>,
     header_value: Option<Zeroizing<String>>,
@@ -231,40 +240,7 @@ fn validate_api_proxies(proxies: &[ApiProxyConfig]) -> Result<(), String> {
             ));
         }
         if let Some(oauth) = &proxy.oauth {
-            if oauth.login_cred_id.split_once(':').is_none() {
-                return Err(format!(
-                    "api_proxy \"{}\": login_cred_id must be <namespace>:<entry id>",
-                    proxy.name
-                ));
-            }
-            for (name, url) in [
-                (
-                    "device_authorization_url",
-                    oauth.device_authorization_url.as_str(),
-                ),
-                ("token_url", oauth.token_url.as_str()),
-            ] {
-                if !api_proxy_upstream_allowed(url) {
-                    return Err(format!(
-                        "api_proxy \"{}\": {name} must be https:// or http:// on a loopback host (127.0.0.1, ::1, localhost)",
-                        proxy.name
-                    ));
-                }
-            }
-            if let Some(url) = &oauth.revocation_url
-                && !api_proxy_upstream_allowed(url)
-            {
-                return Err(format!(
-                    "api_proxy \"{}\": revocation_url must be https:// or http:// on a loopback host (127.0.0.1, ::1, localhost)",
-                    proxy.name
-                ));
-            }
-            if !valid_authorize_steps(oauth.steps.as_deref()) {
-                return Err(format!(
-                    "api_proxy \"{}\": oauth steps contain an unsupported action or value",
-                    proxy.name
-                ));
-            }
+            validate_api_proxy_oauth(&proxy.name, oauth)?;
         }
         if !proxy.value.contains(API_PROXY_SECRET_PLACEHOLDER) {
             return Err(format!(
@@ -272,6 +248,37 @@ fn validate_api_proxies(proxies: &[ApiProxyConfig]) -> Result<(), String> {
                 proxy.name
             ));
         }
+    }
+    Ok(())
+}
+
+/// 起動を拒否すべき `[api_proxy.oauth]` の設定誤りを検出する。`name` はエラーに載せるプロキシ名である。
+fn validate_api_proxy_oauth(name: &str, oauth: &ApiProxyOAuthConfig) -> Result<(), String> {
+    if oauth.login_cred_id.split_once(':').is_none() {
+        return Err(format!(
+            "api_proxy \"{name}\": login_cred_id must be <namespace>:<entry id>"
+        ));
+    }
+    for (field, url) in [
+        (
+            "device_authorization_url",
+            Some(oauth.device_authorization_url.as_str()),
+        ),
+        ("token_url", Some(oauth.token_url.as_str())),
+        ("revocation_url", oauth.revocation_url.as_deref()),
+    ] {
+        if let Some(url) = url
+            && !api_proxy_upstream_allowed(url)
+        {
+            return Err(format!(
+                "api_proxy \"{name}\": {field} must be https:// or http:// on a loopback host (127.0.0.1, ::1, localhost)"
+            ));
+        }
+    }
+    if !valid_authorize_steps(oauth.steps.as_deref()) {
+        return Err(format!(
+            "api_proxy \"{name}\": oauth steps contain an unsupported action or value"
+        ));
     }
     Ok(())
 }
@@ -2531,6 +2538,7 @@ async fn open_api_proxy(
         namespace: cred_id
             .split_once(':')
             .map(|(namespace, _)| namespace.to_owned()),
+        proxy: Some(proxy.name.clone()),
         ..AuditFields::default()
     };
     let Some((namespace, _)) = cred_id.split_once(':') else {
@@ -2591,39 +2599,18 @@ async fn start_api_proxy_session(
             daemon.browser_max_lifetime,
         )
     };
-    let (header_value, value_template, oauth) = if let Some(oauth) = &proxy.oauth {
-        let login_url = credential_metadata(state, &cred_id)
-            .await?
-            .and_then(|metadata| metadata.uri)
-            .filter(|uri| !uri.is_empty())
-            .or_else(|| http_origin(&oauth.device_authorization_url))
-            .ok_or(ErrorCode::Internal)?;
-        let oauth = ExecutorApiProxyOAuth {
-            client_id: oauth.client_id.clone(),
-            device_authorization_url: oauth.device_authorization_url.clone(),
-            token_url: oauth.token_url.clone(),
-            revocation_url: oauth.revocation_url.clone(),
-            scope: oauth.scope.clone(),
-            login_url,
-            steps: oauth.steps.clone(),
-            success_selector: oauth.success_selector.clone(),
-            failure_selector: oauth.failure_selector.clone(),
-            secret: ExecutorApiProxyOAuthSecret {
-                username: Zeroizing::new(credential.username.as_str().to_owned()),
-                password: Zeroizing::new(credential.password.as_str().to_owned()),
-                totp: current_totp(&credential).map(Zeroizing::new),
-            },
-        };
-        (None, Some(proxy.value.clone()), Some(oauth))
+    let options = if let Some(oauth) = &proxy.oauth {
+        build_oauth_start(&proxy.value, oauth, &credential)?
     } else {
-        (
-            Some(Zeroizing::new(proxy.value.replace(
-                API_PROXY_SECRET_PLACEHOLDER,
-                credential.password.as_str(),
-            ))),
-            None,
-            None,
-        )
+        ApiProxyStartOptions {
+            value_template: None,
+            header_value: Some(Zeroizing::new(
+                proxy
+                    .value
+                    .replace(API_PROXY_SECRET_PLACEHOLDER, credential.password.as_str()),
+            )),
+            oauth: None,
+        }
     };
     drop(credential);
     start_guard.record_attempt(Instant::now());
@@ -2634,11 +2621,7 @@ async fn start_api_proxy_session(
         &node_path,
         browsers_path.as_deref(),
         &proxy,
-        ApiProxyStartOptions {
-            value_template,
-            header_value,
-            oauth,
-        },
+        options,
     )
     .await
     {
@@ -2711,6 +2694,42 @@ async fn start_api_proxy_session(
         }),
     );
     Ok((session_id, format!("http://127.0.0.1:{port}/{secret}")))
+}
+
+/// OAuth の注入プロキシについて `api_proxy_start` に載せる値を組み立てる。
+/// ログイン URL は資格の URI を優先し、無いか空であれば device authorization endpoint の origin とする。
+fn build_oauth_start(
+    value_template: &str,
+    oauth: &ApiProxyOAuthConfig,
+    credential: &ResolvedCredential,
+) -> Result<ApiProxyStartOptions, ErrorCode> {
+    let login_url = credential
+        .uri
+        .clone()
+        .filter(|uri| !uri.is_empty())
+        .or_else(|| http_origin(&oauth.device_authorization_url))
+        .ok_or(ErrorCode::Internal)?;
+    let oauth = ExecutorApiProxyOAuth {
+        client_id: oauth.client_id.clone(),
+        device_authorization_url: oauth.device_authorization_url.clone(),
+        token_url: oauth.token_url.clone(),
+        revocation_url: oauth.revocation_url.clone(),
+        scope: oauth.scope.clone(),
+        login_url,
+        steps: oauth.steps.clone(),
+        success_selector: oauth.success_selector.clone(),
+        failure_selector: oauth.failure_selector.clone(),
+        secret: ExecutorApiProxyOAuthSecret {
+            username: Zeroizing::new(credential.username.as_str().to_owned()),
+            password: Zeroizing::new(credential.password.as_str().to_owned()),
+            totp: current_totp(credential).map(Zeroizing::new),
+        },
+    };
+    Ok(ApiProxyStartOptions {
+        value_template: Some(value_template.to_owned()),
+        header_value: None,
+        oauth: Some(oauth),
+    })
 }
 
 async fn credential_metadata(
@@ -3162,14 +3181,17 @@ async fn terminate_browser(
     let leases = browser.leases.into_iter().collect::<Vec<_>>();
     // executor が応答しない場合に全リース分の待機を積み上げないよう、最初の失敗で個別解放を打ち切る。
     // executor の停止でブラウザ全体が閉じるため、残りのタブは停止処理で回収される。
-    if release_leases {
-        for (_, lease) in &leases {
-            if release_lease(&browser.executor, &lease.target)
-                .await
-                .is_err()
-            {
-                break;
-            }
+    // 注入プロキシのリースは release_leases が偽でも api_proxy_stop で解放する。executor は
+    // この要求の中で OAuth トークンを失効させるため、停止処理の短い待機で打ち切らせない。
+    for (_, lease) in &leases {
+        if !release_leases && !matches!(lease.target, sessions::LeaseTarget::ApiProxy) {
+            continue;
+        }
+        if release_lease(&browser.executor, &lease.target)
+            .await
+            .is_err()
+        {
+            break;
         }
     }
     shutdown_executor(browser.executor).await;
@@ -3768,14 +3790,8 @@ fn parse_error_code(value: &str) -> ErrorCode {
 
 fn parse_api_proxy_error_code(value: &str) -> ErrorCode {
     match value {
-        "OAUTH_GRANT_FAILED"
-        | "INVALID_CREDENTIAL"
-        | "MFA_REQUIRED"
-        | "SELECTOR_NOT_FOUND"
-        | "DEVICE_CODE_REJECTED"
-        | "LOGIN_RESULT_TIMEOUT"
-        | "INTERNAL" => parse_error_code(value),
-        _ => ErrorCode::Internal,
+        "OAUTH_GRANT_FAILED" | "INTERNAL" => parse_error_code(value),
+        _ => parse_authorize_error_code(value),
     }
 }
 
@@ -4011,6 +4027,19 @@ struct ApiProxyAuditContext {
     peer: PeerIdentity,
 }
 
+impl ApiProxyAuditContext {
+    /// セッションに共通する監査項目（資格・セッション・namespace・プロキシ名）を埋めた値を返す。
+    fn audit_fields(&self) -> AuditFields {
+        AuditFields {
+            cred_id: Some(self.cred_id.clone()),
+            session_id: Some(self.session_id.clone()),
+            namespace: Some(self.namespace.clone()),
+            proxy: Some(self.name.clone()),
+            ..AuditFields::default()
+        }
+    }
+}
+
 /// `id` を持たず `event` を持つ行を executor のイベントとして取り出す。
 /// イベント行を応答チャネルへ流すと、id 照合中の要求が取り違えを検出して executor を停止させるため、ここで分離する。
 fn executor_event(line: &str) -> Option<Value> {
@@ -4025,27 +4054,14 @@ async fn audit_api_proxy_event(state: &SharedState, context: &ApiProxyAuditConte
                 eprintln!("tegatad: ignored an unrecognized executor event");
                 return;
             };
-            let daemon = state.lock().await;
-            if let Err(error) = append_audit(
-                &daemon,
-                AuditPeer::Peer(&context.peer),
-                "api_proxy_request".to_owned(),
-                AuditFields {
-                    cred_id: Some(context.cred_id.clone()),
-                    session_id: Some(context.session_id.clone()),
-                    namespace: Some(context.namespace.clone()),
-                    proxy: Some(context.name.clone()),
-                    http_method: Some(event.http_method),
-                    path: Some(audit_proxy_path(&event.path)),
-                    status: Some(event.status),
-                    ..AuditFields::default()
-                },
-                api_proxy_outcome(event.status).to_owned(),
-            )
-            .await
-            {
-                eprintln!("tegatad: audit append failed: {error}");
-            }
+            let fields = AuditFields {
+                http_method: Some(event.http_method),
+                path: Some(audit_proxy_path(&event.path)),
+                status: Some(event.status),
+                ..context.audit_fields()
+            };
+            let outcome = api_proxy_outcome(event.status).to_owned();
+            append_api_proxy_audit(state, context, "api_proxy_request", fields, outcome).await;
         }
         Some("oauth_token") => {
             let Ok(event) = serde_json::from_value::<ExecutorApiProxyOAuthTokenEvent>(event) else {
@@ -4063,27 +4079,35 @@ async fn audit_api_proxy_event(state: &SharedState, context: &ApiProxyAuditConte
             } else {
                 "ok".to_owned()
             };
-            let daemon = state.lock().await;
-            if let Err(error) = append_audit(
-                &daemon,
-                AuditPeer::Peer(&context.peer),
-                "api_proxy_oauth".to_owned(),
-                AuditFields {
-                    cred_id: Some(context.cred_id.clone()),
-                    session_id: Some(context.session_id.clone()),
-                    namespace: Some(context.namespace.clone()),
-                    proxy: Some(context.name.clone()),
-                    oauth_action: Some(event.action),
-                    ..AuditFields::default()
-                },
-                outcome,
-            )
-            .await
-            {
-                eprintln!("tegatad: audit append failed: {error}");
-            }
+            let fields = AuditFields {
+                oauth_action: Some(event.action),
+                ..context.audit_fields()
+            };
+            append_api_proxy_audit(state, context, "api_proxy_oauth", fields, outcome).await;
         }
         _ => eprintln!("tegatad: ignored an unrecognized executor event"),
+    }
+}
+
+/// 注入プロキシの監査行を追記し、失敗は stderr へ報告する。
+async fn append_api_proxy_audit(
+    state: &SharedState,
+    context: &ApiProxyAuditContext,
+    method: &str,
+    fields: AuditFields,
+    outcome: String,
+) {
+    let daemon = state.lock().await;
+    if let Err(error) = append_audit(
+        &daemon,
+        AuditPeer::Peer(&context.peer),
+        method.to_owned(),
+        fields,
+        outcome,
+    )
+    .await
+    {
+        eprintln!("tegatad: audit append failed: {error}");
     }
 }
 

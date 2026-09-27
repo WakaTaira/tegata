@@ -15,6 +15,7 @@ import {
 import {
   abortableSleep,
   type DeviceAuthorization,
+  isRecord,
   OAUTH_REQUEST_TIMEOUT_MS,
   OAuthGrantError,
   OAuthProxySession,
@@ -159,6 +160,9 @@ type DiagnosticRequest =
   | AuthorizeDeviceRequest
   | ApiProxyStartRequest;
 
+/** 診断行から置換する秘密の候補。未設定の値（null・undefined・空文字）は無視される。 */
+type SecretCandidates = Array<string | null | undefined>;
+
 function truncateUtf8(value: string, maxBytes: number): string {
   let bytes = 0;
   let end = 0;
@@ -173,7 +177,7 @@ function truncateUtf8(value: string, maxBytes: number): string {
 
 function redactExecutorErrorMessage(
   message: string,
-  secrets: Array<string | null | undefined>,
+  secrets: SecretCandidates,
 ): string {
   const nonEmptySecrets = secrets.filter(
     (secret): secret is string =>
@@ -194,9 +198,7 @@ function removeUrlQueryAndFragment(value: string): string {
   });
 }
 
-function requestSecrets(
-  request: DiagnosticRequest,
-): Array<string | null | undefined> {
+function requestSecrets(request: DiagnosticRequest): SecretCandidates {
   if (request.op === "api_proxy_start") {
     return "oauth" in request
       ? [
@@ -225,7 +227,7 @@ export function formatExecutorErrorLine(
   stage: ExecutionStage,
   code: ErrorCode,
   error: unknown,
-  runtimeSecrets: Array<string | null | undefined> = [],
+  runtimeSecrets: SecretCandidates = [],
 ): string {
   const secrets = [...requestSecrets(request), ...runtimeSecrets];
   const rawMessage = error instanceof Error ? error.message : "";
@@ -304,7 +306,7 @@ function writeExecutorErrorLine(
   stage: ExecutionStage,
   error: ClassifiedExecutionError,
   cause: unknown,
-  runtimeSecrets: Array<string | null | undefined> = [],
+  runtimeSecrets: SecretCandidates = [],
 ): void {
   if (
     error.code !== "INTERNAL" &&
@@ -388,10 +390,6 @@ export type UserAgentOverride = {
   userAgent: string;
   userAgentMetadata: UserAgentMetadata;
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
 
 export function headfulUserAgent(ua: string): string {
   return ua.replaceAll("HeadlessChrome", "Chrome");
@@ -1677,25 +1675,39 @@ type ExecutionErrorWriter = (
   cause: unknown,
 ) => void;
 
+function throwIfDeviceAuthorizationAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new Error("device authorization was aborted");
+}
+
+/**
+ * device 承認をブラウザで行う。`signal` が中断された場合は、ブラウザ起動の後および各段の前で打ち切る。
+ * ブラウザの後始末は呼び出し側が行う。
+ */
 async function executeAuthorizeDevice(
   request: AuthorizeDeviceRequest,
   writeError: ExecutionErrorWriter = (stage, classified, cause) =>
     writeExecutorErrorLine(request, stage, classified, cause),
+  signal?: AbortSignal,
 ): Promise<ClassifiedExecutionError | undefined> {
   let stage: ExecutionStage = "login";
   try {
+    throwIfDeviceAuthorizationAborted(signal);
     const { page, pageSession } = await openBrowserPage();
     const guard = activeGuard;
     if (guard === undefined) throw new Error("CDP guard is not available");
+    const runStage = <T>(action: () => Promise<T>): Promise<T> => {
+      throwIfDeviceAuthorizationAborted(signal);
+      return withGuard(guard, action);
+    };
     try {
-      await withGuard(guard, () => page.goto(request.login_url));
-      await withGuard(guard, () =>
+      await runStage(() => page.goto(request.login_url));
+      await runStage(() =>
         runSteps(page, null, request.secret, { automaticTotp: true }),
       );
-      await withGuard(guard, () => waitForLoginResult(page, null, null));
+      await runStage(() => waitForLoginResult(page, null, null));
       stage = "device";
-      await withGuard(guard, () => page.goto(request.verification_url));
-      await withGuard(guard, () => executeDeviceFlow(page, request));
+      await runStage(() => page.goto(request.verification_url));
+      await runStage(() => executeDeviceFlow(page, request));
     } finally {
       await pageSession.detach().catch(() => undefined);
     }
@@ -1946,9 +1958,12 @@ async function handleApiProxyStart(
   }
 }
 
-// 応答はデーモンの初回要求の上限（90 秒）の内側で返す必要がある。grant の各段はこの期限で打ち切り、
-// 残りを後始末（ブラウザの終了・token の失効）と応答に充てる。
-const OAUTH_GRANT_BUDGET_MS = 70_000;
+// 応答は最初の要求から 80 秒以内（デーモンの初回要求の上限 90 秒の内側）に返す。grant の各段はこの期限で
+// 打ち切り、残りを後始末（打ち切った承認処理の完了待ち 5 秒・ブラウザの終了 5 秒、または token の失効 5 秒）と
+// 応答に充てる。
+const OAUTH_GRANT_BUDGET_MS = 65_000;
+// 期限超過・中断で見切った承認処理が、起動し終えたブラウザを残さず終わるまで待つ上限。
+const ORPHAN_AUTHORIZATION_WAIT_MS = 5_000;
 
 function toAuthorizeDeviceRequest(
   request: OAuthApiProxyStartRequest,
@@ -1967,9 +1982,25 @@ function toAuthorizeDeviceRequest(
   };
 }
 
+/** `promise` の完了を最大 `ms` ミリ秒待つ。結果・失敗は問わない。 */
+async function waitAtMost(
+  promise: Promise<unknown>,
+  ms: number,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    promise.catch(() => undefined),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, ms);
+    }),
+  ]);
+  if (timer !== undefined) clearTimeout(timer);
+}
+
 /**
  * device 承認をブラウザで行い、成否にかかわらずブラウザを閉じる。
- * 期限超過または中断の場合は OAuthGrantError とし、以後に届く遅れた診断行は出力しない。
+ * 期限超過または中断の場合は承認処理を打ち切って OAuthGrantError とし、以後に届く遅れた診断行は出力しない。
+ * 打ち切った承認処理がブラウザの起動を終える前に後始末すると、ブラウザが残るため、その完了を短く待ってから閉じる。
  */
 async function authorizeDeviceInBrowser(
   request: OAuthApiProxyStartRequest,
@@ -1978,11 +2009,22 @@ async function authorizeDeviceInBrowser(
   signal: AbortSignal,
   runtimeSecrets: string[],
 ): Promise<ClassifiedExecutionError | undefined> {
-  let settled = false;
+  const cancel = new AbortController();
+  const onAbort = (): void => cancel.abort();
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) cancel.abort();
+  const timer = setTimeout(onAbort, Math.max(0, deadline - Date.now()));
+  const expired = new Promise<"expired">((resolve) => {
+    cancel.signal.addEventListener("abort", () => resolve("expired"), {
+      once: true,
+    });
+    if (cancel.signal.aborted) resolve("expired");
+  });
   const authorization = executeAuthorizeDevice(
     toAuthorizeDeviceRequest(request, device),
     (stage, classified, cause) => {
-      if (!settled) {
+      // 打ち切った後の失敗は、打ち切りの理由として別に報告するため出力しない。
+      if (!cancel.signal.aborted) {
         writeExecutorErrorLine(
           request,
           stage,
@@ -1992,15 +2034,8 @@ async function authorizeDeviceInBrowser(
         );
       }
     },
+    cancel.signal,
   );
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let onAbort: (() => void) | undefined;
-  const expired = new Promise<"expired">((resolve) => {
-    onAbort = () => resolve("expired");
-    timer = setTimeout(onAbort, Math.max(0, deadline - Date.now()));
-    signal.addEventListener("abort", onAbort, { once: true });
-    if (signal.aborted) onAbort();
-  });
   try {
     const result = await Promise.race([authorization, expired]);
     if (result === "expired") {
@@ -2010,9 +2045,10 @@ async function authorizeDeviceInBrowser(
     }
     return result;
   } finally {
-    settled = true;
-    if (timer !== undefined) clearTimeout(timer);
-    if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+    clearTimeout(timer);
+    signal.removeEventListener("abort", onAbort);
+    cancel.abort();
+    await waitAtMost(authorization, ORPHAN_AUTHORIZATION_WAIT_MS);
     await cleanupResources();
   }
 }
@@ -2128,7 +2164,16 @@ async function runOAuthApiProxyStart(
     writeOAuthTokenEvent("issued");
   } catch (error) {
     const classified = classifyExecutionError(error, "oauth");
-    writeExecutorErrorLine(request, "oauth", classified, error, runtimeSecrets);
+    // shutdown による中断は grant の失敗ではないため、診断行を出さない。
+    if (!signal.aborted) {
+      writeExecutorErrorLine(
+        request,
+        "oauth",
+        classified,
+        error,
+        runtimeSecrets,
+      );
+    }
     writeResponse(formatErrorResponse(classified), request.id);
   }
 }

@@ -14,19 +14,21 @@ interface Credentials {
   totp_seed?: string;
 }
 
-const sessions = new Map<string, true>();
-const deviceCodes = new Map<string, boolean>();
 interface OAuthDeviceCode {
   userCode: string;
   expiresAt: number;
   consumed: boolean;
 }
 
+const sessions = new Map<string, true>();
+const deviceCodes = new Map<string, boolean>();
 const oauthDeviceCodes = new Map<string, OAuthDeviceCode>();
-const oauthAccessTokens = new Map<string, number>();
-const oauthRefreshTokens = new Map<string, string>();
-const oauthAccessTokenValues: string[] = [];
-const oauthRefreshTokenValues: string[] = [];
+// 現在有効な token。access token は失効時刻、refresh token は対応する access token を値とする。
+const activeAccessTokens = new Map<string, number>();
+const activeRefreshTokens = new Map<string, string>();
+// 失効・期限切れにかかわらず発行したすべての token の履歴（/oauth/state で公開する）。
+const issuedAccessTokens: string[] = [];
+const issuedRefreshTokens: string[] = [];
 const oauthRevokedTokens = new Set<string>();
 const oauthGrantCounts = { device_code: 0, refresh_token: 0 };
 let oauthIssued = 0;
@@ -210,10 +212,10 @@ function issueOAuthTokens(): {
 } {
   const accessToken = newOAuthToken();
   const refreshToken = newOAuthToken();
-  oauthAccessTokens.set(accessToken, Date.now() + oauthExpiresIn * 1000);
-  oauthRefreshTokens.set(refreshToken, accessToken);
-  oauthAccessTokenValues.push(accessToken);
-  oauthRefreshTokenValues.push(refreshToken);
+  activeAccessTokens.set(accessToken, Date.now() + oauthExpiresIn * 1000);
+  activeRefreshTokens.set(refreshToken, accessToken);
+  issuedAccessTokens.push(accessToken);
+  issuedRefreshTokens.push(refreshToken);
   oauthIssued += 1;
   return { access_token: accessToken, refresh_token: refreshToken };
 }
@@ -223,22 +225,22 @@ function markOAuthTokenRevoked(token: string): void {
 }
 
 function revokeOAuthAccessToken(token: string): void {
-  if (oauthAccessTokens.delete(token)) markOAuthTokenRevoked(token);
+  if (activeAccessTokens.delete(token)) markOAuthTokenRevoked(token);
 }
 
 function revokeOAuthRefreshToken(token: string): void {
-  const accessToken = oauthRefreshTokens.get(token);
+  const accessToken = activeRefreshTokens.get(token);
   if (accessToken === undefined) return;
-  oauthRefreshTokens.delete(token);
+  activeRefreshTokens.delete(token);
   markOAuthTokenRevoked(token);
   revokeOAuthAccessToken(accessToken);
 }
 
 function validOAuthAccessToken(token: string): boolean {
-  const expiresAt = oauthAccessTokens.get(token);
+  const expiresAt = activeAccessTokens.get(token);
   if (expiresAt === undefined) return false;
   if (expiresAt <= Date.now()) {
-    oauthAccessTokens.delete(token);
+    activeAccessTokens.delete(token);
     return false;
   }
   return true;
@@ -371,6 +373,209 @@ function sessionFrom(request: IncomingMessage): string | undefined {
   return undefined;
 }
 
+function handleOAuthDeviceAuthorization(
+  request: IncomingMessage,
+  response: ServerResponse,
+): void {
+  readRequestBody(request, (body) => {
+    const form = new URLSearchParams(body);
+    if (form.get("client_id") === null || form.get("client_id") === "") {
+      writeJson(response, 400, { error: "invalid_request" });
+      return;
+    }
+    const userCode = newDeviceCode();
+    const deviceCode = newOAuthToken();
+    deviceCodes.set(userCode, false);
+    oauthDeviceCodes.set(deviceCode, {
+      userCode,
+      expiresAt: Date.now() + 300_000,
+      consumed: false,
+    });
+    writeJson(response, 200, {
+      device_code: deviceCode,
+      user_code: userCode,
+      verification_uri: `${requestOrigin(request)}/device`,
+      expires_in: 300,
+      interval: 1,
+    });
+  });
+}
+
+function handleDeviceCodeGrant(
+  form: URLSearchParams,
+  response: ServerResponse,
+): void {
+  const deviceCode = form.get("device_code");
+  const grant =
+    deviceCode === null ? undefined : oauthDeviceCodes.get(deviceCode);
+  if (grant === undefined) {
+    writeJson(response, 400, { error: "invalid_grant" });
+    return;
+  }
+  if (grant.expiresAt <= Date.now()) {
+    writeJson(response, 400, { error: "expired_token" });
+    return;
+  }
+  if (oauthDeny) {
+    writeJson(response, 400, { error: "access_denied" });
+    return;
+  }
+  if (grant.consumed) {
+    writeJson(response, 400, { error: "invalid_grant" });
+    return;
+  }
+  if (deviceCodes.get(grant.userCode) !== true) {
+    writeJson(response, 400, { error: "authorization_pending" });
+    return;
+  }
+  grant.consumed = true;
+  oauthGrantCounts.device_code += 1;
+  writeJson(response, 200, {
+    ...issueOAuthTokens(),
+    token_type: "Bearer",
+    expires_in: oauthExpiresIn,
+  });
+}
+
+function handleRefreshTokenGrant(
+  form: URLSearchParams,
+  response: ServerResponse,
+): void {
+  const refreshToken = form.get("refresh_token");
+  const oldAccessToken =
+    refreshToken === null ? undefined : activeRefreshTokens.get(refreshToken);
+  if (refreshToken === null || oldAccessToken === undefined) {
+    writeJson(response, 400, { error: "invalid_grant" });
+    return;
+  }
+  revokeOAuthRefreshToken(refreshToken);
+  oauthGrantCounts.refresh_token += 1;
+  writeJson(response, 200, {
+    ...issueOAuthTokens(),
+    token_type: "Bearer",
+    expires_in: oauthExpiresIn,
+  });
+}
+
+function handleOAuthToken(
+  request: IncomingMessage,
+  response: ServerResponse,
+): void {
+  readRequestBody(request, (body) => {
+    const form = new URLSearchParams(body);
+    const grantType = form.get("grant_type");
+    if (grantType === "urn:ietf:params:oauth:grant-type:device_code") {
+      handleDeviceCodeGrant(form, response);
+    } else if (grantType === "refresh_token") {
+      handleRefreshTokenGrant(form, response);
+    } else {
+      writeJson(response, 400, { error: "unsupported_grant_type" });
+    }
+  });
+}
+
+function handleOAuthRevoke(
+  request: IncomingMessage,
+  response: ServerResponse,
+): void {
+  readRequestBody(request, (body) => {
+    const token = new URLSearchParams(body).get("token");
+    if (token === null || token === "") {
+      writeJson(response, 400, { error: "invalid_request" });
+      return;
+    }
+    if (activeAccessTokens.has(token)) revokeOAuthAccessToken(token);
+    else revokeOAuthRefreshToken(token);
+    writeJson(response, 200, {});
+  });
+}
+
+function handleOAuthState(response: ServerResponse): void {
+  writeJson(response, 200, {
+    grants: oauthGrantCounts,
+    issued: oauthIssued,
+    revoked: oauthRevokedTokens.size,
+    access_tokens: issuedAccessTokens,
+    refresh_tokens: issuedRefreshTokens,
+  });
+}
+
+function handleOAuthConfig(
+  request: IncomingMessage,
+  response: ServerResponse,
+): void {
+  readRequestBody(request, (body) => {
+    let value: unknown;
+    try {
+      value = JSON.parse(body);
+    } catch {
+      writeJson(response, 400, { error: "invalid_request" });
+      return;
+    }
+    if (typeof value !== "object" || value === null) {
+      writeJson(response, 400, { error: "invalid_request" });
+      return;
+    }
+    const config = value as Record<string, unknown>;
+    if ("expires_in" in config) {
+      if (
+        typeof config.expires_in !== "number" ||
+        !Number.isInteger(config.expires_in) ||
+        config.expires_in <= 0
+      ) {
+        writeJson(response, 400, { error: "invalid_request" });
+        return;
+      }
+      oauthExpiresIn = config.expires_in;
+    }
+    if ("deny" in config) {
+      if (typeof config.deny !== "boolean") {
+        writeJson(response, 400, { error: "invalid_request" });
+        return;
+      }
+      oauthDeny = config.deny;
+    }
+    writeJson(response, 200, {});
+  });
+}
+
+function handleApiMe(request: IncomingMessage, response: ServerResponse): void {
+  const authorization = request.headers.authorization;
+  const token =
+    authorization?.startsWith("Bearer ") === true
+      ? authorization.slice("Bearer ".length)
+      : undefined;
+  if (token !== undefined && validOAuthAccessToken(token)) {
+    writeJson(response, 200, { user: "fixture" });
+  } else {
+    writeJson(response, 401, { error: "unauthorized" });
+  }
+}
+
+/** OAuth 認可サーバーと保護 API の経路を処理する。該当しない要求には false を返す。 */
+function handleOAuthRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+): boolean {
+  const route = `${request.method} ${request.url}`;
+  if (route === "POST /oauth/device_authorization") {
+    handleOAuthDeviceAuthorization(request, response);
+  } else if (route === "POST /oauth/token") {
+    handleOAuthToken(request, response);
+  } else if (route === "POST /oauth/revoke") {
+    handleOAuthRevoke(request, response);
+  } else if (route === "GET /oauth/state") {
+    handleOAuthState(response);
+  } else if (route === "POST /oauth/config") {
+    handleOAuthConfig(request, response);
+  } else if (route === "GET /api/me") {
+    handleApiMe(request, response);
+  } else {
+    return false;
+  }
+  return true;
+}
+
 function handleRequest(
   request: IncomingMessage,
   response: ServerResponse,
@@ -486,173 +691,7 @@ function handleRequest(
     return;
   }
 
-  if (
-    request.method === "POST" &&
-    request.url === "/oauth/device_authorization"
-  ) {
-    readRequestBody(request, (body) => {
-      const form = new URLSearchParams(body);
-      if (form.get("client_id") === null || form.get("client_id") === "") {
-        writeJson(response, 400, { error: "invalid_request" });
-        return;
-      }
-      const userCode = newDeviceCode();
-      const deviceCode = newOAuthToken();
-      deviceCodes.set(userCode, false);
-      oauthDeviceCodes.set(deviceCode, {
-        userCode,
-        expiresAt: Date.now() + 300_000,
-        consumed: false,
-      });
-      writeJson(response, 200, {
-        device_code: deviceCode,
-        user_code: userCode,
-        verification_uri: `${requestOrigin(request)}/device`,
-        expires_in: 300,
-        interval: 1,
-      });
-    });
-    return;
-  }
-
-  if (request.method === "POST" && request.url === "/oauth/token") {
-    readRequestBody(request, (body) => {
-      const form = new URLSearchParams(body);
-      const grantType = form.get("grant_type");
-      if (grantType === "urn:ietf:params:oauth:grant-type:device_code") {
-        const deviceCode = form.get("device_code");
-        const grant =
-          deviceCode === null ? undefined : oauthDeviceCodes.get(deviceCode);
-        if (grant === undefined) {
-          writeJson(response, 400, { error: "invalid_grant" });
-          return;
-        }
-        if (grant.expiresAt <= Date.now()) {
-          writeJson(response, 400, { error: "expired_token" });
-          return;
-        }
-        if (oauthDeny) {
-          writeJson(response, 400, { error: "access_denied" });
-          return;
-        }
-        if (grant.consumed) {
-          writeJson(response, 400, { error: "invalid_grant" });
-          return;
-        }
-        if (deviceCodes.get(grant.userCode) !== true) {
-          writeJson(response, 400, { error: "authorization_pending" });
-          return;
-        }
-        grant.consumed = true;
-        oauthGrantCounts.device_code += 1;
-        writeJson(response, 200, {
-          ...issueOAuthTokens(),
-          token_type: "Bearer",
-          expires_in: oauthExpiresIn,
-        });
-        return;
-      }
-
-      if (grantType === "refresh_token") {
-        const refreshToken = form.get("refresh_token");
-        const oldAccessToken =
-          refreshToken === null
-            ? undefined
-            : oauthRefreshTokens.get(refreshToken);
-        if (refreshToken === null || oldAccessToken === undefined) {
-          writeJson(response, 400, { error: "invalid_grant" });
-          return;
-        }
-        revokeOAuthRefreshToken(refreshToken);
-        oauthGrantCounts.refresh_token += 1;
-        writeJson(response, 200, {
-          ...issueOAuthTokens(),
-          token_type: "Bearer",
-          expires_in: oauthExpiresIn,
-        });
-        return;
-      }
-
-      writeJson(response, 400, { error: "unsupported_grant_type" });
-    });
-    return;
-  }
-
-  if (request.method === "POST" && request.url === "/oauth/revoke") {
-    readRequestBody(request, (body) => {
-      const token = new URLSearchParams(body).get("token");
-      if (token === null || token === "") {
-        writeJson(response, 400, { error: "invalid_request" });
-        return;
-      }
-      if (oauthAccessTokens.has(token)) revokeOAuthAccessToken(token);
-      else revokeOAuthRefreshToken(token);
-      writeJson(response, 200, {});
-    });
-    return;
-  }
-
-  if (request.method === "GET" && request.url === "/oauth/state") {
-    writeJson(response, 200, {
-      grants: oauthGrantCounts,
-      issued: oauthIssued,
-      revoked: oauthRevokedTokens.size,
-      access_tokens: oauthAccessTokenValues,
-      refresh_tokens: oauthRefreshTokenValues,
-    });
-    return;
-  }
-
-  if (request.method === "POST" && request.url === "/oauth/config") {
-    readRequestBody(request, (body) => {
-      let value: unknown;
-      try {
-        value = JSON.parse(body);
-      } catch {
-        writeJson(response, 400, { error: "invalid_request" });
-        return;
-      }
-      if (typeof value !== "object" || value === null) {
-        writeJson(response, 400, { error: "invalid_request" });
-        return;
-      }
-      const config = value as Record<string, unknown>;
-      if ("expires_in" in config) {
-        if (
-          typeof config.expires_in !== "number" ||
-          !Number.isInteger(config.expires_in) ||
-          config.expires_in <= 0
-        ) {
-          writeJson(response, 400, { error: "invalid_request" });
-          return;
-        }
-        oauthExpiresIn = config.expires_in;
-      }
-      if ("deny" in config) {
-        if (typeof config.deny !== "boolean") {
-          writeJson(response, 400, { error: "invalid_request" });
-          return;
-        }
-        oauthDeny = config.deny;
-      }
-      writeJson(response, 200, {});
-    });
-    return;
-  }
-
-  if (request.method === "GET" && request.url === "/api/me") {
-    const authorization = request.headers.authorization;
-    const token =
-      authorization?.startsWith("Bearer ") === true
-        ? authorization.slice("Bearer ".length)
-        : undefined;
-    if (token !== undefined && validOAuthAccessToken(token)) {
-      writeJson(response, 200, { user: "fixture" });
-    } else {
-      writeJson(response, 401, { error: "unauthorized" });
-    }
-    return;
-  }
+  if (handleOAuthRequest(request, response)) return;
 
   if (request.method === "POST" && request.url === "/device/issue") {
     const userCode = newDeviceCode();

@@ -242,6 +242,8 @@ fn to_resolved(entry: &PassEntry) -> ResolvedCredential {
     ResolvedCredential {
         locked: false,
         secrets_preregistered: false,
+        // pass のエントリは URI を持たない（list_refs も空文字列を返す）。
+        uri: None,
         username: Secret::new(entry.username.as_str()),
         password: Secret::new(entry.password.as_str()),
         totp_seed: entry

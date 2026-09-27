@@ -757,6 +757,69 @@ describe("OAuth proxy session", () => {
     expect(proxy.closed).toBe(true);
   });
 
+  test.each([
+    {
+      name: "the revocation endpoint answers 500",
+      responses: [
+        { status: 500, body: undefined },
+        { status: 500, body: undefined },
+      ],
+    },
+    {
+      name: "only the refresh token revocation fails",
+      responses: [
+        { status: 200, body: undefined },
+        { status: 500, body: undefined },
+      ],
+    },
+    {
+      name: "the revocation endpoint is unreachable",
+      responses: [new Error("ECONNREFUSED"), new Error("ECONNREFUSED")],
+    },
+  ])("closes without a revoked event when $name", async ({ responses }) => {
+    const proxy = fakeProxy();
+    const events: OAuthTokenAction[] = [];
+    const { post, calls } = stubPost([...responses]);
+    const session = new OAuthProxySession({
+      endpoints: ENDPOINTS,
+      proxy,
+      valueTemplate: "Bearer {{secret}}",
+      tokens: {
+        accessToken: "access-1",
+        refreshToken: "refresh-1",
+        expiresIn: null,
+      },
+      issuedAt: Date.now(),
+      onEvent: (action) => events.push(action),
+      post,
+    });
+
+    await session.close();
+
+    expect(calls).toHaveLength(2);
+    expect(events).toEqual([]);
+    expect(proxy.closed).toBe(true);
+  });
+
+  test("closes without a revoked event when the revocation request cannot connect", async () => {
+    const proxy = fakeProxy();
+    const events: OAuthTokenAction[] = [];
+    // ENDPOINTS の revocation_url は 127.0.0.1 の 1 番ポートであり、既定の postForm は接続を拒否される。
+    const session = new OAuthProxySession({
+      endpoints: ENDPOINTS,
+      proxy,
+      valueTemplate: "Bearer {{secret}}",
+      tokens: { accessToken: "access-1", refreshToken: null, expiresIn: null },
+      issuedAt: Date.now(),
+      onEvent: (action) => events.push(action),
+    });
+
+    await session.close();
+
+    expect(events).toEqual([]);
+    expect(proxy.closed).toBe(true);
+  });
+
   test("closes without a revoked event when no revocation endpoint is set", async () => {
     vi.useFakeTimers();
     const proxy = fakeProxy();

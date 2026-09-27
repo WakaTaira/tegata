@@ -115,10 +115,39 @@ rl.on("line", (line) => {
 });
 "#;
 
+/// `api_proxy_stop` の応答を、デーモンの停止処理の待機（1 秒）より長く遅らせる OAuth の偽 executor。
+/// 応答の直前に失効のイベント行を書き、executor が停止要求の中で行う revocation を模す。
+const SLOW_REVOKING_OAUTH_PROXY_EXECUTOR: &str = r#"
+const fs = require("node:fs");
+const readline = require("node:readline");
+const log = (value) => fs.appendFileSync(__filename + ".log", JSON.stringify(value) + "\n");
+const event = (action) =>
+  process.stdout.write(JSON.stringify({ event: "oauth_token", action }) + "\n");
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  log(request);
+  if (request.op === "api_proxy_start") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true, port: 38998, secret: "fake-path-secret_A1" }) + "\n");
+    event("issued");
+  } else if (request.op === "api_proxy_stop") {
+    setTimeout(() => {
+      event("revoked");
+      process.stdout.write(JSON.stringify({ id: request.id, ok: true }) + "\n");
+    }, 2000);
+  } else if (request.op === "shutdown") {
+    process.stdout.write(JSON.stringify({ id: request.id, ok: true }) + "\n");
+    process.exit(0);
+  }
+});
+rl.on("close", () => { setInterval(() => {}, 1000); });
+"#;
+
 struct Options<'a> {
     executor: &'a str,
     api_proxies: String,
     session_ttl_secs: Option<u64>,
+    browser_max_lifetime_secs: Option<u64>,
     approve_cmd: Option<String>,
 }
 
@@ -128,6 +157,7 @@ impl<'a> Options<'a> {
             executor,
             api_proxies: api_proxy_section("fx", UPSTREAM, None),
             session_ttl_secs: None,
+            browser_max_lifetime_secs: None,
             approve_cmd: None,
         }
     }
@@ -179,6 +209,9 @@ impl Layout {
         );
         if let Some(ttl) = options.session_ttl_secs {
             top.push_str(&format!("session_ttl_secs = {ttl}\n"));
+        }
+        if let Some(lifetime) = options.browser_max_lifetime_secs {
+            top.push_str(&format!("browser_max_lifetime_secs = {lifetime}\n"));
         }
         if let Some(command) = &options.approve_cmd {
             top.push_str(&format!("approve_cmd = {command:?}\n"));
@@ -452,6 +485,92 @@ fn proxy_sessions_expire_with_the_session_ttl() {
         executor_ops(&daemon),
         ["api_proxy_start", "api_proxy_stop", "shutdown"]
     );
+}
+
+#[test]
+fn static_proxy_is_stopped_when_the_browser_lifetime_ends() {
+    let mut options = Options::new(PROXY_EXECUTOR);
+    options.browser_max_lifetime_secs = Some(1);
+    let daemon = Daemon::start(options);
+    let session_id = open(&daemon);
+
+    wait_for(
+        "session_expired audit record",
+        Duration::from_secs(8),
+        || has_record(&daemon.audit_records(), "session_expired", &session_id),
+    );
+    assert_eq!(
+        executor_ops(&daemon),
+        ["api_proxy_start", "api_proxy_stop", "shutdown"]
+    );
+}
+
+#[test]
+fn oauth_proxy_revocation_completes_when_the_browser_lifetime_ends() {
+    let mut options = Options::new(SLOW_REVOKING_OAUTH_PROXY_EXECUTOR);
+    options.api_proxies =
+        oauth_api_proxy_section("fx", UPSTREAM, "https://oauth.example/token", "mock:site");
+    options.browser_max_lifetime_secs = Some(1);
+    let daemon = Daemon::start(options);
+    let session_id = open(&daemon);
+
+    wait_for(
+        "session_expired audit record",
+        Duration::from_secs(12),
+        || has_record(&daemon.audit_records(), "session_expired", &session_id),
+    );
+    assert_eq!(
+        executor_ops(&daemon),
+        ["api_proxy_start", "api_proxy_stop", "shutdown"]
+    );
+    assert!(
+        daemon.audit_records().iter().any(|record| {
+            record["method"] == "api_proxy_oauth"
+                && record["session_id"] == session_id
+                && record["oauth_action"] == "revoked"
+        }),
+        "revocation was cut short: {}",
+        daemon.audit_text()
+    );
+}
+
+#[test]
+fn open_api_proxy_audit_names_the_proxy_on_success_and_failure() {
+    let daemon = Daemon::start(Options::new(PROXY_EXECUTOR));
+    let session_id = open(&daemon);
+    wait_for(
+        "open_api_proxy audit record",
+        Duration::from_secs(5),
+        || has_record(&daemon.audit_records(), "open_api_proxy", &session_id),
+    );
+    let records = daemon.audit_records();
+    let opened = records
+        .iter()
+        .find(|record| record["method"] == "open_api_proxy")
+        .expect("open_api_proxy audit record");
+    assert_eq!(opened["proxy"], json!("fx"));
+
+    let mut options = Options::new(OAUTH_FAILING_PROXY_EXECUTOR);
+    options.api_proxies =
+        oauth_api_proxy_section("fx", UPSTREAM, "https://oauth.example/token", "mock:site");
+    let failing = Daemon::start(options);
+    let response = rpc(failing.socket(), "open_api_proxy", json!({ "name": "fx" }));
+    error_message(&response, "OAUTH_GRANT_FAILED");
+    wait_for(
+        "failed open_api_proxy audit record",
+        Duration::from_secs(5),
+        || {
+            failing.audit_records().iter().any(|record| {
+                record["method"] == "open_api_proxy" && record["outcome"] == "OAUTH_GRANT_FAILED"
+            })
+        },
+    );
+    let failed = failing
+        .audit_records()
+        .into_iter()
+        .find(|record| record["method"] == "open_api_proxy")
+        .expect("failed open_api_proxy audit record");
+    assert_eq!(failed["proxy"], json!("fx"));
 }
 
 #[test]

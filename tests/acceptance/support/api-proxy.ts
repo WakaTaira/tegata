@@ -15,7 +15,7 @@ import {
   rawRpc,
 } from "./harness.js";
 
-/** `[[api_proxy]]` の受け入れテストで固定する設定形状。 */
+/** `[[api_proxy]]` 内の `[api_proxy.oauth]` の受け入れテストで固定する設定形状。 */
 export interface ApiProxyOAuthSpec {
   client_id: string;
   device_authorization_url: string;
@@ -27,6 +27,7 @@ export interface ApiProxyOAuthSpec {
   failure_selector?: string;
 }
 
+/** `[[api_proxy]]` の受け入れテストで固定する設定形状。 */
 export interface ApiProxySpec {
   name: string;
   cred_id?: string;

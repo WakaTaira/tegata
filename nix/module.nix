@@ -220,15 +220,46 @@ in
           oauth = lib.mkOption {
             type = lib.types.nullOr (lib.types.submodule {
               options = {
-                clientId = lib.mkOption { type = lib.types.str; };
-                deviceAuthorizationUrl = lib.mkOption { type = lib.types.str; };
-                tokenUrl = lib.mkOption { type = lib.types.str; };
-                revocationUrl = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
-                scope = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
-                loginCredId = lib.mkOption { type = lib.types.str; };
-                steps = lib.mkOption { type = lib.types.nullOr (lib.types.listOf lib.types.attrs); default = null; };
-                successSelector = lib.mkOption { type = lib.types.str; };
-                failureSelector = lib.mkOption { type = lib.types.nullOr lib.types.str; default = null; };
+                clientId = lib.mkOption {
+                  type = lib.types.str;
+                  description = "The public OAuth client ID sent with the device authorization, token, and revocation requests.";
+                };
+                deviceAuthorizationUrl = lib.mkOption {
+                  type = lib.types.str;
+                  description = "The device authorization endpoint; https://, or http:// to a loopback host, as for upstream.";
+                };
+                tokenUrl = lib.mkOption {
+                  type = lib.types.str;
+                  description = "The token endpoint for the device-code and refresh-token grants; https://, or http:// to a loopback host, as for upstream.";
+                };
+                revocationUrl = lib.mkOption {
+                  type = lib.types.nullOr lib.types.str;
+                  default = null;
+                  description = "The RFC 7009 revocation endpoint called when the lease ends; https://, or http:// to a loopback host, as for upstream. null = no revocation.";
+                };
+                scope = lib.mkOption {
+                  type = lib.types.nullOr lib.types.str;
+                  default = null;
+                  description = "The scope requested with the device authorization; null = no scope parameter.";
+                };
+                loginCredId = lib.mkOption {
+                  type = lib.types.str;
+                  description = "The namespaced credential reference used to log into the provider in the browser.";
+                };
+                steps = lib.mkOption {
+                  type = lib.types.nullOr (lib.types.listOf lib.types.attrs);
+                  default = null;
+                  description = "Explicit device-approval steps, as for authorize_device; null = the default device-flow procedure.";
+                };
+                successSelector = lib.mkOption {
+                  type = lib.types.str;
+                  description = "The selector that identifies a successful approval.";
+                };
+                failureSelector = lib.mkOption {
+                  type = lib.types.nullOr lib.types.str;
+                  default = null;
+                  description = "The selector that identifies a rejected approval; null = no rejection check.";
+                };
               };
             });
             default = null;

@@ -188,6 +188,10 @@ pub struct ExecutorApiProxyOAuth {
 }
 
 /// OAuth のブラウザログイン資格。直列化後も秘密の保持領域をゼロ化する。
+///
+/// `login` の `ExecutorSecret` は、executor への書き込みの直前に要求を組み立てる閉包の中で作られる。
+/// これに対しこちらは、デーモンが解決済み資格を破棄した後も executor の起動を待つ間保持されるため、
+/// `Zeroizing` で持つ。
 #[derive(Serialize)]
 pub struct ExecutorApiProxyOAuthSecret {
     #[serde(serialize_with = "serialize_zeroizing")]
@@ -206,6 +210,7 @@ fn serialize_zeroizing<S: serde::Serializer>(
     serializer.serialize_str(value.as_str())
 }
 
+/// `Option<Zeroizing<String>>` を、値があれば文字列、無ければ null として直列化する。
 fn serialize_optional_zeroizing<S: serde::Serializer>(
     value: &Option<Zeroizing<String>>,
     serializer: S,

@@ -255,6 +255,20 @@ provider past its TTL locks itself, per namespace, and the reaper audits
 off — both discard the vault session material, and the next call that needs a
 credential value runs the provider's unlock ceremony again.
 
+### Persistent cookies
+
+For a credential opted into `persist_cookies`, a saved cookie set travels only
+between the daemon and the executor, never through the broker or the agent. On a
+new, non-shared browser's `login` the daemon reads the saved file and hands the
+cookies to the executor alongside the secret; on a successful login the executor
+hands its current cookies back in the response, and on session end — `logout`,
+TTL expiry, or `lock_vault` — the daemon asks the executor to export cookies one
+last time before tearing the browser down. Either exchange is dropped from the
+RPC response, the audit log, and the daemon's stderr; only a `"restored"` /
+`"none"` marker and a `steps_skipped` flag reach the audit record. See
+[security.md](security.md#persistent-cookies) for what is kept, where it is
+stored, and how it is removed.
+
 ## The WSL bridge
 
 `crates/tegata-bridge` runs as the agent's user inside WSL. It listens on a UNIX

@@ -28,6 +28,7 @@ The flake exposes `nixosModules.tegata`. A minimal deployment:
       email = "vault-account@example.com";
       askpass_cmd = "/run/current-system/sw/bin/tegata-askpass";
       totp_exposable = [ "Example Service" ];
+      persist_cookies = [ "Example Service" ];  # or [ "*" ] for every credential
     }];
   };
 }
@@ -68,8 +69,8 @@ services.tegata.operatorUids = [ 1000 ];
 ```
 
 Provider submodule fields: `namespace`, `type`, `server_url`, `email`,
-`askpass_cmd`, `totp_exposable`, `session_ttl_secs`, and `entries` (used only by
-the mock provider in tests).
+`askpass_cmd`, `totp_exposable`, `persist_cookies`, `session_ttl_secs`, and
+`entries` (used only by the mock provider in tests).
 
 The module ships the Bitwarden CLI from the flake's nixpkgs, and the CLI only
 talks to servers over HTTPS. For a vault whose certificate comes from a private
@@ -259,6 +260,7 @@ server_url     = "https://vault.example.com"
 email          = "vault-account@example.com"
 askpass_cmd    = "/usr/local/libexec/tegata-askpass"
 totp_exposable = ["Example Service"]
+persist_cookies = ["Example Service"]
 session_ttl_secs = 900
 ```
 
@@ -309,6 +311,8 @@ refuses startup.
 tegatad peer issue --label <label>
 tegatad peer revoke <peer_id>
 tegatad peer list
+tegatad cookies forget <cred_id> [--socket <path>]
+tegatad cookies forget --all [--socket <path>]
 ```
 
 `peer issue` prints the plaintext token exactly once. Named tokens are stored in
@@ -320,6 +324,14 @@ issue` command is an alias for `peer issue --label default` and is deprecated; i
 will be removed in the next release.
 
 Root and uids listed in `operator_uids` can connect to the socket and call administrative RPCs such as `admin_peer_issue`, while normal RPCs such as `login` are limited to uids listed in `allowed_uids`. The expected invocation is `sudo tegatad peer issue --socket /run/tegata/tegatad.sock`.
+
+`cookies forget` removes saved [persistent-cookie](security.md#persistent-cookies)
+files: `tegatad cookies forget <cred_id>` for one credential, `tegatad cookies
+forget --all` for every saved credential. `--socket` defaults to the same path as
+`peer issue`, and the RPC behind it (`admin_cookies_forget`) is reachable only to
+`operator_uids` and root, exactly like `peer issue`. It does not end a live
+browser session — that session re-saves its cookies when it closes, so forget a
+credential's cookies for good by running `logout` first.
 
 ### `[[providers]]`
 
@@ -343,6 +355,7 @@ Vaultwarden.
 | `email` | string | yes | Vault account address |
 | `askpass_cmd` | string | yes | Command that supplies the master password |
 | `totp_exposable` | list of string | no | Item **names** whose current code `get_totp` may return |
+| `persist_cookies` | list of string | no | Backend ids (or `["*"]`) whose device-trust cookies are saved across `login`s |
 | `session_ttl_secs` | integer | no | Unlock lifetime; defaults to the global value |
 
 The daemon runs `bw sync` when it establishes a session and, while that session remains within its TTL, at most once every 60 seconds from the previous sync attempt. A failed periodic sync is non-fatal: the daemon continues with the local cache. A timeout or process-start failure during the initial sync discards the session and returns `PROVIDER_UNAVAILABLE` without retrying login, and `bw sync` is limited to 30 seconds; other `bw` commands retain their 60-second limit.
@@ -356,6 +369,7 @@ age crate — no CLI to install, no agent to keep running.
 | --- | --- | --- | --- |
 | `entries_path` | string | yes | The age-encrypted entries file |
 | `identity_path` | string | yes | X25519 identity file. **Must be mode 0600**, or the daemon refuses to start |
+| `persist_cookies` | list of string | no | Backend ids (or `["*"]`) whose device-trust cookies are saved across `login`s |
 | `session_ttl_secs` | integer | no | Lifetime of the decrypted entries in memory |
 
 The plaintext inside `entries_path` is a TOML document of `[[entries]]` tables:
@@ -404,6 +418,7 @@ refused at startup with an explicit error.
 | `gnupghome` | string | no | Passed to `pass` as `GNUPGHOME` |
 | `pass_bin` | string | no | The `pass` executable; defaults to `pass` |
 | `totp_exposable` | list of string | no | Entry **names** whose current code `get_totp` may return |
+| `persist_cookies` | list of string | no | Backend ids (or `["*"]`) whose device-trust cookies are saved across `login`s |
 | `session_ttl_secs` | integer | no | Lifetime of resolved values in memory |
 
 The catalog comes from scanning `store_dir` for `*.gpg`. An entry's name and its id
@@ -469,6 +484,11 @@ should stay open. Locking one leaves the others listing and resolving normally.
 `totp_exposable` matches an entry's **name**, and the default is an empty list: no
 credential exposes a code to the agent unless it is named there. See
 [security.md](security.md#totp) before adding anything to it.
+
+`persist_cookies` matches a credential's backend id, `["*"]` matches every
+credential of that provider, and the default is an empty list: no cookie is
+saved to disk unless a provider names it there. See
+[security.md](security.md#persistent-cookies) before enabling it.
 
 ## The askpass command
 

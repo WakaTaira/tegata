@@ -70,6 +70,9 @@ pub(crate) struct Browser {
     pub(crate) deadline: Instant,
     pub(crate) leases: HashMap<String, Lease>,
     pub(crate) exclusive: bool,
+    /// `login` が起動したブラウザで、その資格が `persist_cookies` の対象であるか。
+    /// 真のとき、ブラウザの終了時に cookie を書き出して保管する。
+    pub(crate) persist_cookies: bool,
 }
 
 impl Browser {

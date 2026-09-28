@@ -1,5 +1,6 @@
 #[cfg(any(windows, test))]
 mod approvals;
+mod cookie_store;
 #[cfg(windows)]
 mod dpapi;
 mod grants;
@@ -515,6 +516,9 @@ fn default_unlock_mode() -> UnlockMode {
 #[derive(Debug, Deserialize)]
 struct ProviderConfig {
     namespace: String,
+    /// cookie を永続化する資格の backend id。`"*"` はその provider の全資格を表す。全 provider 種別に共通する。
+    #[serde(default)]
+    persist_cookies: Vec<String>,
     #[serde(flatten)]
     kind: ProviderConfigKind,
 }
@@ -619,6 +623,7 @@ struct DaemonState {
     peers: peers::SharedPeerStore,
     api_proxies: HashMap<String, ApiProxyConfig>,
     mcp_servers: HashMap<String, McpServerConfig>,
+    cookie_store: Arc<cookie_store::CookieStore>,
     #[cfg(windows)]
     sealed_blob_path: PathBuf,
 }
@@ -743,6 +748,50 @@ struct AuditFields {
     mcp_action: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_code: Option<i64>,
+    /// 永続化対象の資格の login 行で、保管済み cookie を復元したか（`"restored"` / `"none"`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cookies: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    steps_skipped: Option<bool>,
+    /// 永続化対象の資格のブラウザが終了した行で、cookie を保管できたか。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cookies_saved: Option<bool>,
+    /// `admin_cookies_forget` の行で、削除したファイル数と全削除であるか。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    all: Option<bool>,
+}
+
+/// login 行・セッション終了行に載せる cookie 永続化の監査項目。永続化対象の資格でのみ値を持つ。
+#[derive(Clone, Copy, Default)]
+struct CookieAudit {
+    cookies: Option<&'static str>,
+    steps_skipped: Option<bool>,
+    cookies_saved: Option<bool>,
+}
+
+impl CookieAudit {
+    fn login(restored: bool, steps_skipped: bool) -> Self {
+        Self {
+            cookies: Some(if restored { "restored" } else { "none" }),
+            steps_skipped: Some(steps_skipped),
+            cookies_saved: None,
+        }
+    }
+
+    fn session_end(cookies_saved: Option<bool>) -> Self {
+        Self {
+            cookies_saved,
+            ..Self::default()
+        }
+    }
+
+    fn apply(self, fields: &mut AuditFields) {
+        fields.cookies = self.cookies.or(fields.cookies);
+        fields.steps_skipped = self.steps_skipped.or(fields.steps_skipped);
+        fields.cookies_saved = self.cookies_saved.or(fields.cookies_saved);
+    }
 }
 
 #[derive(Deserialize)]
@@ -765,6 +814,8 @@ struct HandledRequest {
     audit_approval_grant: Option<grants::ApprovalGrant>,
     /// ハンドラが確定した監査項目。`Some` のとき、params から導いた項目の代わりに記録する。
     audit_fields: Option<AuditFields>,
+    /// cookie 永続化の監査項目。上記の監査項目に重ねて記録する。
+    audit_cookies: Option<CookieAudit>,
 }
 
 impl HandledRequest {
@@ -786,6 +837,11 @@ impl HandledRequest {
 
     fn with_audit_approval_grant(mut self, grant: Option<grants::ApprovalGrant>) -> Self {
         self.audit_approval_grant = grant;
+        self
+    }
+
+    fn with_audit_cookies(mut self, cookies: Option<CookieAudit>) -> Self {
+        self.audit_cookies = cookies;
         self
     }
 }
@@ -816,6 +872,10 @@ enum UnixCommand {
         #[command(subcommand)]
         command: UnixTokenCommand,
     },
+    Cookies {
+        #[command(subcommand)]
+        command: UnixCookiesCommand,
+    },
 }
 
 #[cfg(unix)]
@@ -845,6 +905,29 @@ enum UnixTokenCommand {
         #[arg(long, default_value = "/run/tegata/tegatad.sock")]
         socket: PathBuf,
     },
+}
+
+#[cfg(unix)]
+#[derive(clap::Subcommand)]
+enum UnixCookiesCommand {
+    /// Delete the stored cookies of one credential (every principal) or of all credentials.
+    Forget {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        cred_id: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value = "/run/tegata/tegatad.sock")]
+        socket: PathBuf,
+    },
+}
+
+/// `cookies forget` の CLI 引数から `admin_cookies_forget` の params を組み立てる。
+/// cred_id と `--all` のどちらか一方だけが与えられることは clap が保証する。
+fn cookies_forget_params(cred_id: Option<String>, all: bool) -> Value {
+    match cred_id {
+        Some(cred_id) => json!({ "cred_id": cred_id }),
+        None => json!({ "all": all }),
+    }
 }
 
 fn main() {
@@ -917,6 +1000,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         json!({ "id": id, "allow": allow }),
                     )
                 }
+                windows_cli::WindowsCommand::Cookies { command } => match command {
+                    windows_cli::CookiesCommand::Forget { cred_id, all, pipe } => {
+                        windows_cli::run_windows_cli(
+                            &pipe,
+                            "admin_cookies_forget",
+                            cookies_forget_params(cred_id, all),
+                        )
+                    }
+                },
                 windows_cli::WindowsCommand::Service { command } => match command {
                     windows_service::ServiceCommand::Install { config } => {
                         windows_service::install_service(&config)
@@ -986,6 +1078,23 @@ fn run_unix_command(command: UnixCommand) -> Result<(), Box<dyn std::error::Erro
                     .and_then(Value::as_str)
                     .ok_or("admin_token_issue returned no token")?;
                 println!("{token}");
+            }
+        },
+        UnixCommand::Cookies { command } => match command {
+            UnixCookiesCommand::Forget {
+                cred_id,
+                all,
+                socket,
+            } => {
+                let response = call_unix_rpc(
+                    &socket,
+                    "admin_cookies_forget",
+                    cookies_forget_params(cred_id, all),
+                )?;
+                let result = response
+                    .get("result")
+                    .ok_or("admin_cookies_forget returned no result")?;
+                println!("{}", serde_json::to_string(result)?);
             }
         },
     }
@@ -1336,9 +1445,11 @@ async fn build_state(
         .map(|server| (server.name.clone(), server.clone()))
         .collect();
     let mut providers = Vec::new();
+    let mut cookie_policy = cookie_store::CookiePolicy::default();
     let mut version_logged = false;
     for provider in config.providers {
         let namespace = provider.namespace;
+        cookie_policy.insert(namespace.clone(), provider.persist_cookies);
         let provider: Arc<Mutex<dyn CredentialProvider + Send>> = match provider.kind {
             #[cfg(feature = "mock-provider")]
             ProviderConfigKind::Mock { entries } => Arc::new(Mutex::new(
@@ -1404,6 +1515,8 @@ async fn build_state(
             provider,
         });
     }
+    let cookie_store = cookie_store::CookieStore::new(&state_dir, cookie_policy);
+    cookie_store.prepare()?;
     Ok(DaemonState {
         providers,
         browsers: HashMap::new(),
@@ -1433,6 +1546,7 @@ async fn build_state(
         peers,
         api_proxies,
         mcp_servers,
+        cookie_store: Arc::new(cookie_store),
         #[cfg(windows)]
         sealed_blob_path,
     })
@@ -1604,8 +1718,9 @@ fn spawn_session_reaper(state: SharedState) {
                                 session_id,
                                 lease,
                                 browser.executor.clone(),
-                                browser.key.namespace.clone(),
+                                browser.key.clone(),
                                 browser.leases.is_empty(),
+                                browser.persist_cookies,
                             ));
                         }
                     }
@@ -1635,7 +1750,13 @@ fn spawn_session_reaper(state: SharedState) {
                     terminate_browser(&state, browser, "session_expired", false).await;
                 });
             }
-            for (session_id, lease, executor, namespace, shutdown) in expired {
+            for (session_id, lease, executor, key, shutdown, persist_cookies) in expired {
+                // 最後のリースの満了ではブラウザが閉じるため、タブを閉じる前に cookie を書き出す。
+                let cookies_saved = if shutdown && persist_cookies {
+                    Some(export_browser_cookies(&state, &key, &executor).await)
+                } else {
+                    None
+                };
                 let release_failed = release_lease(&executor, &lease.target).await.is_err();
                 if shutdown || release_failed {
                     shutdown_executor(executor).await;
@@ -1647,7 +1768,8 @@ fn spawn_session_reaper(state: SharedState) {
                     "session_expired".to_owned(),
                     AuditFields {
                         session_id: Some(session_id),
-                        namespace: Some(namespace),
+                        namespace: Some(key.namespace),
+                        cookies_saved,
                         ..AuditFields::default()
                     },
                     "ok".to_owned(),
@@ -1767,6 +1889,9 @@ async fn serve_connection<S>(
                 }
                 if let Some(grant) = handled.audit_approval_grant {
                     fields.approval_grant = Some(grant);
+                }
+                if let Some(cookies) = handled.audit_cookies {
+                    cookies.apply(&mut fields);
                 }
                 (Some(request), handled.response, handled.outcome, fields)
             }
@@ -1967,6 +2092,7 @@ async fn handle_request(
             "admin_peer_revoke" => admin_peer_revoke(request, state).await,
             "admin_peer_list" => admin_peer_list(request, state).await,
             "admin_token_issue" => admin_token_issue(request, state).await,
+            "admin_cookies_forget" => admin_cookies_forget(request, state).await,
             #[cfg(windows)]
             "admin_seal" => admin_seal(request, state).await,
             #[cfg(windows)]
@@ -2005,6 +2131,7 @@ async fn handle_request(
             audit_approval: None,
             audit_approval_grant: None,
             audit_fields: None,
+            audit_cookies: None,
         },
     }
 }
@@ -2089,6 +2216,44 @@ async fn admin_peer_list(request: &RpcRequest, state: SharedState) -> HandledReq
                 .collect::<Vec<_>>()
         ),
     )
+}
+
+#[derive(Deserialize)]
+struct AdminCookiesForgetParams {
+    cred_id: Option<String>,
+    #[serde(default)]
+    all: bool,
+}
+
+/// 保管済み cookie を削除する。`cred_id` 指定ではその資格の全 principal 分、`all` では全件を削除する。
+/// 実行中のセッションは終了させないため、そのセッションの終了時に再び保存される。
+async fn admin_cookies_forget(request: &RpcRequest, state: SharedState) -> HandledRequest {
+    let params = match parse_params::<AdminCookiesForgetParams>(&request.params) {
+        Ok(params) => params,
+        Err(error) => return classified(request.id.clone(), error),
+    };
+    let audit = AuditFields {
+        cred_id: params.cred_id.clone(),
+        all: params.all.then_some(true),
+        ..AuditFields::default()
+    };
+    let target = match (params.cred_id.as_deref(), params.all) {
+        (Some(cred_id), false) => cookie_store::ForgetTarget::Credential(cred_id),
+        (None, true) => cookie_store::ForgetTarget::All,
+        _ => return classified(request.id.clone(), ErrorCode::Internal).with_audit_fields(audit),
+    };
+    let store = state.lock().await.cookie_store.clone();
+    match store.forget(target) {
+        Ok(removed) => success(request.id.clone(), json!({ "removed": removed }))
+            .with_audit_fields(AuditFields {
+                removed: Some(removed),
+                ..audit
+            }),
+        Err(error) => {
+            eprintln!("tegatad: cookie store: forget failed: {error}");
+            classified(request.id.clone(), ErrorCode::Internal).with_audit_fields(audit)
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -2377,7 +2542,15 @@ async fn start_login(
         Ok(credential) => credential,
         Err(error) => return classified(request.id.clone(), error),
     };
-    let (executor_entry, executor_socket, node_path, browsers_path, ttl, browser_max_lifetime) = {
+    let (
+        executor_entry,
+        executor_socket,
+        node_path,
+        browsers_path,
+        ttl,
+        browser_max_lifetime,
+        cookie_store,
+    ) = {
         let daemon = state.lock().await;
         (
             daemon.executor_entry.clone(),
@@ -2386,17 +2559,24 @@ async fn start_login(
             daemon.browsers_path.clone(),
             daemon.session_ttl,
             daemon.browser_max_lifetime,
+            daemon.cookie_store.clone(),
         )
     };
+    // 承認ゲートとアンロック確認を通過した後にのみ、保管済み cookie を読み出す。
+    let persist_cookies = cookie_store.persists(&params.cred_id);
+    let restored_cookies = persist_cookies
+        .then(|| cookie_store.load(&key, cookie_store::unix_now()))
+        .flatten();
     start_guard.record_attempt(Instant::now());
     let browser_started_at = Instant::now();
-    let (endpoint, target_id, mut executor) = match start_executor(
+    let started = match start_executor(
         &executor_entry,
         executor_socket.as_deref(),
         &node_path,
         browsers_path.as_deref(),
         &params,
         &credential,
+        restored_cookies.as_deref(),
     )
     .await
     {
@@ -2409,6 +2589,13 @@ async fn start_login(
             return classified_with_step(request.id.clone(), error.code, error.step);
         }
     };
+    let ExecutorLoginStarted {
+        endpoint,
+        target_id,
+        mut executor,
+        cookies: returned_cookies,
+        steps_skipped,
+    } = started;
     let deadline = browser_started_at + browser_max_lifetime;
     let session_id = Uuid::new_v4().to_string();
     let reader = executor
@@ -2450,6 +2637,7 @@ async fn start_login(
             },
         )]),
         exclusive,
+        persist_cookies,
     };
     let ports = state.lock().await.ports.clone();
     if let Ok(mut ports) = ports.write() {
@@ -2458,6 +2646,12 @@ async fn start_login(
         shutdown_executor(connection).await;
         return classified(request.id.clone(), ErrorCode::Internal);
     }
+    let cookie_audit = persist_cookies.then(|| {
+        if let Some(cookies) = returned_cookies.as_ref() {
+            save_cookies(&cookie_store, &key, cookies);
+        }
+        CookieAudit::login(restored_cookies.is_some(), steps_skipped)
+    });
     let mut daemon = state.lock().await;
     daemon.browsers.insert(browser_id.clone(), browser);
     if !exclusive {
@@ -2474,6 +2668,7 @@ async fn start_login(
         }),
     )
     .with_audit_shared(false)
+    .with_audit_cookies(cookie_audit)
 }
 
 /// 起動制御を鍵ごとに取り出す。無ければ作成する。
@@ -2969,6 +3164,7 @@ async fn register_service_lease(
             },
         )]),
         exclusive: true,
+        persist_cookies: false,
     };
     let ports = state.lock().await.ports.clone();
     if let Ok(mut ports) = ports.write() {
@@ -3463,7 +3659,7 @@ async fn logout(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) -
         let Some(browser_id) = browser_id else {
             return classified(request.id.clone(), ErrorCode::NotFound);
         };
-        let (lease, executor, empty, namespace) = {
+        let (lease, executor, empty, cookie_key) = {
             let browser = daemon
                 .browsers
                 .get_mut(&browser_id)
@@ -3471,8 +3667,8 @@ async fn logout(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) -
             let lease = browser.leases.remove(&session_id).expect("lease exists");
             let executor = browser.executor.clone();
             let empty = browser.leases.is_empty();
-            let namespace = browser.key.namespace.clone();
-            (lease, executor, empty, namespace)
+            let cookie_key = browser.persist_cookies.then(|| browser.key.clone());
+            (lease, executor, empty, cookie_key)
         };
         if empty {
             let browser = daemon.browsers.remove(&browser_id).expect("browser exists");
@@ -3484,15 +3680,21 @@ async fn logout(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) -
             .ports
             .write()
             .map(|mut ports| ports.remove(&session_id));
-        Some((lease, executor, empty, namespace))
+        Some((lease, executor, empty, cookie_key))
     };
-    if let Some((lease, executor, empty, _)) = removed {
+    let mut cookie_audit = None;
+    if let Some((lease, executor, empty, cookie_key)) = removed {
+        // 最後のリースの終了ではブラウザが閉じるため、タブを閉じる前に cookie を書き出す。
+        if empty && let Some(key) = cookie_key {
+            let saved = export_browser_cookies(&state, &key, &executor).await;
+            cookie_audit = Some(CookieAudit::session_end(Some(saved)));
+        }
         let release_failed = release_lease(&executor, &lease.target).await.is_err();
         if empty || release_failed {
             shutdown_executor(executor).await;
         }
     }
-    success(request.id.clone(), json!({ "ok": true }))
+    success(request.id.clone(), json!({ "ok": true })).with_audit_cookies(cookie_audit)
 }
 
 async fn get_totp(request: &RpcRequest, state: SharedState) -> HandledRequest {
@@ -3614,6 +3816,12 @@ async fn terminate_browser(
     release_leases: bool,
 ) {
     let namespace = browser.key.namespace.clone();
+    // ブラウザ全体が閉じる前に、永続化対象であれば cookie を書き出す。
+    let cookies_saved = if browser.persist_cookies {
+        Some(export_browser_cookies(state, &browser.key, &browser.executor).await)
+    } else {
+        None
+    };
     let leases = browser.leases.into_iter().collect::<Vec<_>>();
     // executor が応答しない場合に全リース分の待機を積み上げないよう、最初の失敗で個別解放を打ち切る。
     // executor の停止でブラウザ全体が閉じるため、残りのタブは停止処理で回収される。
@@ -3633,7 +3841,14 @@ async fn terminate_browser(
     }
     shutdown_executor(browser.executor).await;
     for (session_id, _) in leases {
-        audit_system_session(state, audit_method, session_id, namespace.clone()).await;
+        audit_system_session(
+            state,
+            audit_method,
+            session_id,
+            namespace.clone(),
+            cookies_saved,
+        )
+        .await;
     }
 }
 
@@ -3660,6 +3875,7 @@ async fn terminate_peer_leases(state: SharedState, peer_id: &str) {
                     browser.executor.clone(),
                     browser.key.namespace.clone(),
                     browser.leases.is_empty(),
+                    browser.persist_cookies,
                 ));
             }
         }
@@ -3675,7 +3891,7 @@ async fn terminate_peer_leases(state: SharedState, peer_id: &str) {
                 daemon.shared_browsers.remove(&browser.key);
             }
         }
-        for (session_id, _, _, _, _) in &removed {
+        for (session_id, _, _, _, _, _) in &removed {
             let _ = daemon
                 .ports
                 .write()
@@ -3683,11 +3899,13 @@ async fn terminate_peer_leases(state: SharedState, peer_id: &str) {
         }
         removed
     };
-    for (session_id, lease, executor, namespace, shutdown) in removed {
+    for (session_id, lease, executor, namespace, shutdown, persist_cookies) in removed {
         let _ = release_lease(&executor, &lease.target).await;
         if shutdown {
             shutdown_executor(executor).await;
         }
+        // 失効した peer の cookie は以後使われないため書き出さず、保管しなかったことを記録する。
+        let cookies_saved = (shutdown && persist_cookies).then_some(false);
         let daemon = state.lock().await;
         if let Err(error) = append_audit(
             &daemon,
@@ -3696,6 +3914,7 @@ async fn terminate_peer_leases(state: SharedState, peer_id: &str) {
             AuditFields {
                 session_id: Some(session_id),
                 namespace: Some(namespace),
+                cookies_saved,
                 ..AuditFields::default()
             },
             "ok".to_owned(),
@@ -3712,6 +3931,7 @@ async fn audit_system_session(
     method: &str,
     session_id: String,
     namespace: String,
+    cookies_saved: Option<bool>,
 ) {
     let daemon = state.lock().await;
     if let Err(error) = append_audit(
@@ -3721,6 +3941,7 @@ async fn audit_system_session(
         AuditFields {
             session_id: Some(session_id),
             namespace: Some(namespace),
+            cookies_saved,
             ..AuditFields::default()
         },
         "ok".to_owned(),
@@ -3990,6 +4211,33 @@ fn current_totp(credential: &ResolvedCredential) -> Option<String> {
     })
 }
 
+/// executor への `login` 要求。`cookies` は復元する保管済み cookie であり、復元しない場合は null とする。
+#[derive(Serialize)]
+struct ExecutorLoginWithCookies<'a> {
+    #[serde(flatten)]
+    login: ExecutorLoginRequest,
+    cookies: Option<&'a [cookie_store::Cookie]>,
+}
+
+/// executor の `login` 成功応答から取り出した値。
+struct ParsedLoginResponse {
+    endpoint: String,
+    target_id: String,
+    /// そのときの context の全 cookie。古い executor では欠ける。
+    cookies: Option<Value>,
+    /// 復元した cookie によりステップを省略したか。欠けている場合は偽とみなす。
+    steps_skipped: bool,
+}
+
+/// 起動した login ブラウザの executor と、その成功応答。
+struct ExecutorLoginStarted {
+    endpoint: String,
+    target_id: String,
+    executor: ExecutorHandle,
+    cookies: Option<Value>,
+    steps_skipped: bool,
+}
+
 async fn start_executor(
     entry: &Path,
     executor_socket: Option<&Path>,
@@ -3997,21 +4245,25 @@ async fn start_executor(
     browsers_path: Option<&Path>,
     params: &LoginParams,
     credential: &ResolvedCredential,
-) -> Result<(String, String, ExecutorHandle), ExecutorFailure> {
-    let build_request = || ExecutorLoginRequest {
-        op: "login",
-        id: 1,
-        target_url: params.target_url.clone(),
-        steps: params.steps.clone(),
-        success_selector: params.success_selector.clone(),
-        failure_selector: params.failure_selector.clone(),
-        secret: ExecutorSecret {
-            username: credential.username.as_str().to_owned(),
-            password: credential.password.as_str().to_owned(),
-            totp: current_totp(credential),
+    cookies: Option<&[cookie_store::Cookie]>,
+) -> Result<ExecutorLoginStarted, ExecutorFailure> {
+    let build_request = || ExecutorLoginWithCookies {
+        login: ExecutorLoginRequest {
+            op: "login",
+            id: 1,
+            target_url: params.target_url.clone(),
+            steps: params.steps.clone(),
+            success_selector: params.success_selector.clone(),
+            failure_selector: params.failure_selector.clone(),
+            secret: ExecutorSecret {
+                username: credential.username.as_str().to_owned(),
+                password: credential.password.as_str().to_owned(),
+                totp: current_totp(credential),
+            },
         },
+        cookies,
     };
-    let ((endpoint, target_id), executor) = open_executor_with(
+    let (parsed, executor) = open_executor_with(
         entry,
         executor_socket,
         node_path,
@@ -4020,11 +4272,18 @@ async fn start_executor(
         parse_login_response,
     )
     .await?;
-    Ok((endpoint, target_id, executor))
+    Ok(ExecutorLoginStarted {
+        endpoint: parsed.endpoint,
+        target_id: parsed.target_id,
+        executor,
+        cookies: parsed.cookies,
+        steps_skipped: parsed.steps_skipped,
+    })
 }
 
-/// `login` への応答から CDP の endpoint と target_id を取り出す。
-fn parse_login_response(line: &str) -> Result<(String, String), ExecutorFailure> {
+/// `login` への応答から CDP の endpoint と target_id、および cookie 永続化の値を取り出す。
+/// `cookies` と `steps_skipped` は古い executor では欠けるため、欠けていても成功として扱う。
+fn parse_login_response(line: &str) -> Result<ParsedLoginResponse, ExecutorFailure> {
     let response: ExecutorResponse = serde_json::from_str(line).map_err(|_| ErrorCode::Internal)?;
     if response.id != Some(1) {
         return Err(ErrorCode::Internal.into());
@@ -4032,7 +4291,21 @@ fn parse_login_response(line: &str) -> Result<(String, String), ExecutorFailure>
     if response.ok {
         let endpoint = response.endpoint.ok_or(ErrorCode::Internal)?;
         let target_id = response.target_id.ok_or(ErrorCode::Internal)?;
-        Ok((endpoint, target_id))
+        let mut extras = serde_json::from_str::<Value>(line).unwrap_or(Value::Null);
+        let cookies = extras
+            .get_mut("cookies")
+            .map(Value::take)
+            .filter(|cookies| !cookies.is_null());
+        let steps_skipped = extras
+            .get("steps_skipped")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Ok(ParsedLoginResponse {
+            endpoint,
+            target_id,
+            cookies,
+            steps_skipped,
+        })
     } else {
         let code = response
             .error
@@ -4413,6 +4686,54 @@ async fn release_lease(
     }
 }
 
+/// executor から受け取った cookie を保管する。保管できたかを返し、失敗は値を含めずに stderr へ記録する。
+fn save_cookies(
+    store: &cookie_store::CookieStore,
+    key: &sessions::BrowserKey,
+    cookies: &Value,
+) -> bool {
+    match store.save(key, cookies, cookie_store::unix_now()) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("tegatad: cookie store: cookies of a session were {error}");
+            false
+        }
+    }
+}
+
+/// executor に `export_cookies` を送り、応答の cookie 配列を返す。
+/// 応答は `EXECUTOR_SHUTDOWN_TIMEOUT` で打ち切り、失敗・異常応答では `None` を返す。
+async fn executor_export_cookies(connection: &Arc<ExecutorConnection>) -> Option<Value> {
+    let mut response = executor_request(
+        connection,
+        |id| json!({ "op": "export_cookies", "id": id }),
+        EXECUTOR_SHUTDOWN_TIMEOUT,
+    )
+    .await
+    .ok()?;
+    if response.get("ok").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    response
+        .get_mut("cookies")
+        .map(Value::take)
+        .filter(Value::is_array)
+}
+
+/// 永続化対象のブラウザについて、終了前に cookie を書き出して保管する。保管できたかを返す。
+/// 保管できなかった場合も既存のファイルには触れない。
+async fn export_browser_cookies(
+    state: &SharedState,
+    key: &sessions::BrowserKey,
+    executor: &Arc<ExecutorConnection>,
+) -> bool {
+    let store = state.lock().await.cookie_store.clone();
+    match executor_export_cookies(executor).await {
+        Some(cookies) => save_cookies(&store, key, &cookies),
+        None => false,
+    }
+}
+
 async fn shutdown_executor(connection: Arc<ExecutorConnection>) {
     let Ok(operation) = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, connection.operation.lock()).await
     else {
@@ -4763,12 +5084,15 @@ fn spawn_executor_reaper(
         let Some(browser) = browser else {
             return;
         };
+        // executor が切断された後は cookie を書き出せないため、保管しなかったことを記録する。
+        let cookies_saved = browser.persist_cookies.then_some(false);
         for (session_id, _) in browser.leases {
             audit_system_session(
                 &state,
                 "session_terminated",
                 session_id,
                 browser.key.namespace.clone(),
+                cookies_saved,
             )
             .await;
         }
@@ -4877,6 +5201,7 @@ fn success(id: Value, result: Value) -> HandledRequest {
         audit_approval: None,
         audit_approval_grant: None,
         audit_fields: None,
+        audit_cookies: None,
     }
 }
 
@@ -4892,6 +5217,7 @@ fn classified_with_step(id: Value, error: ErrorCode, step: Option<usize>) -> Han
         audit_approval: None,
         audit_approval_grant: None,
         audit_fields: None,
+        audit_cookies: None,
     }
 }
 
@@ -5309,5 +5635,32 @@ allowed_sids = []
         )
         .expect("parse renderer config without providers");
         assert!(config.providers.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod persist_cookies_config_tests {
+    use super::ProviderConfig;
+
+    fn persist_cookies(provider: &str) -> Vec<String> {
+        toml::from_str::<ProviderConfig>(provider)
+            .expect("provider config")
+            .persist_cookies
+    }
+
+    #[test]
+    fn every_provider_type_accepts_persist_cookies() {
+        let providers = [
+            "type = \"bitwarden-cli\"\nserver_url = \"https://vault.test\"\nemail = \"a@example.test\"\naskpass_cmd = \"true\"\n",
+            "type = \"age-file\"\nentries_path = \"/e\"\nidentity_path = \"/i\"\n",
+            "type = \"pass\"\nstore_dir = \"/s\"\n",
+        ];
+        for provider in providers {
+            let listed =
+                format!("namespace = \"ns\"\npersist_cookies = [\"*\", \"x\"]\n{provider}");
+            assert_eq!(persist_cookies(&listed), ["*", "x"], "{provider}");
+            let omitted = format!("namespace = \"ns\"\n{provider}");
+            assert!(persist_cookies(&omitted).is_empty(), "{provider}");
+        }
     }
 }

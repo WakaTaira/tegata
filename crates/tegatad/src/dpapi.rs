@@ -8,6 +8,7 @@ use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
+use zeroize::Zeroizing;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Error {
@@ -58,13 +59,33 @@ impl Drop for LocalBuffer {
 }
 
 pub(crate) fn seal(master_password: &mut String, path: &Path) -> Result<(), Error> {
-    let mut plaintext = master_password.as_bytes().to_vec();
+    let mut sealed = protect(master_password.as_bytes())?;
+    let result = fs::write(path, &sealed).map_err(|_| Error::Write);
+    sealed.fill(0);
+    result
+}
+
+pub(crate) fn unseal(path: &Path) -> Result<Secret, Error> {
+    let mut sealed = fs::read(path).map_err(|_| Error::Read)?;
+    let result = unprotect(&sealed);
+    sealed.fill(0);
+    let mut plaintext = result?;
+    match String::from_utf8(std::mem::take(&mut *plaintext)) {
+        Ok(value) => Ok(Secret::new(value)),
+        Err(error) => {
+            let mut bytes = error.into_bytes();
+            bytes.fill(0);
+            Err(Error::InvalidPlaintext)
+        }
+    }
+}
+
+/// バイト列をサービスアカウントの DPAPI で封印する。入力の複製は封印後に消去する。
+pub(crate) fn protect(plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut plaintext = Zeroizing::new(plaintext.to_vec());
     let length = match u32::try_from(plaintext.len()) {
         Ok(length) if length != 0 => length,
-        _ => {
-            plaintext.fill(0);
-            return Err(Error::InvalidPlaintext);
-        }
+        _ => return Err(Error::InvalidPlaintext),
     };
     let input = CRYPT_INTEGER_BLOB {
         cbData: length,
@@ -83,26 +104,20 @@ pub(crate) fn seal(master_password: &mut String, path: &Path) -> Result<(), Erro
             &mut output,
         )
     };
-    plaintext.fill(0);
+    drop(plaintext);
     let output = LocalBuffer::new(output);
     if protected == 0 {
         return Err(Error::Protect);
     }
-
-    let mut sealed = output.copy()?;
-    let result = fs::write(path, &sealed).map_err(|_| Error::Write);
-    sealed.fill(0);
-    result
+    output.copy()
 }
 
-pub(crate) fn unseal(path: &Path) -> Result<Secret, Error> {
-    let mut sealed = fs::read(path).map_err(|_| Error::Read)?;
+/// `protect` で封印したバイト列を開封する。平文は破棄時に消去される。
+pub(crate) fn unprotect(sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
+    let mut sealed = Zeroizing::new(sealed.to_vec());
     let length = match u32::try_from(sealed.len()) {
         Ok(length) if length != 0 => length,
-        _ => {
-            sealed.fill(0);
-            return Err(Error::InvalidBlob);
-        }
+        _ => return Err(Error::InvalidBlob),
     };
     let input = CRYPT_INTEGER_BLOB {
         cbData: length,
@@ -121,21 +136,12 @@ pub(crate) fn unseal(path: &Path) -> Result<Secret, Error> {
             &mut output,
         )
     };
-    sealed.fill(0);
+    drop(sealed);
     let output = LocalBuffer::new(output);
     if unprotected == 0 {
         return Err(Error::Unprotect);
     }
-
-    let plaintext = output.copy()?;
-    match String::from_utf8(plaintext) {
-        Ok(value) => Ok(Secret::new(value)),
-        Err(error) => {
-            let mut bytes = error.into_bytes();
-            bytes.fill(0);
-            Err(Error::InvalidPlaintext)
-        }
-    }
+    output.copy().map(Zeroizing::new)
 }
 
 #[cfg(all(test, windows))]

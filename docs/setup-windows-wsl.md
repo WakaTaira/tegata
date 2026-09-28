@@ -97,6 +97,7 @@ server_url     = "https://vault.example.com"
 email          = "vault-account@example.com"
 askpass_cmd    = ""
 totp_exposable = ["Example Service"]
+persist_cookies = ["Example Service"]  # or ["*"] for every credential
 ```
 
 Then, from an **elevated** PowerShell or command prompt:
@@ -141,6 +142,19 @@ On upgrade, an existing `state\token_hash` is imported at startup into
 `peer issue` add a peer without invalidating existing tokens; revoke a token with
 `peer revoke <peer_id>`.
 
+### Forget saved cookies
+
+```
+tegatad.exe cookies forget <cred_id> [--pipe <name>]
+tegatad.exe cookies forget --all [--pipe <name>]
+```
+
+Elevated only, over the same administrative RPC gate as `peer issue`. Removes
+the saved [persistent-cookie](security.md#persistent-cookies) file for one
+credential, or every saved credential with `--all`. It does not end a live
+browser session — that session re-saves its cookies when it closes, so forget a
+credential's cookies for good by running `logout` first.
+
 ### Seal the master password
 
 ```
@@ -167,6 +181,8 @@ an opt-in for a deployment that provides its own helper.
 | `tegatad.exe peer list` | yes | List named client tokens |
 | `tegatad.exe token issue` | yes | Deprecated alias for `peer issue --label default`; removed in the next release |
 | `tegatad.exe seal` | yes | Seal the master password |
+| `tegatad.exe cookies forget <cred_id>` | yes | Remove a credential's saved cookies |
+| `tegatad.exe cookies forget --all` | yes | Remove every saved credential's cookies |
 | `tegatad.exe approval list` | yes | List pending `login`, `authorize_device`, `open_api_proxy`, and `open_mcp_server` approvals |
 | `tegatad.exe approval allow <id>` | yes | Let a pending request proceed |
 | `tegatad.exe approval deny <id>` | yes | Refuse a pending request |
@@ -261,7 +277,10 @@ becomes the only way in, and no firewall rule is added.
 
 Provider tables use the same keys as on Linux; see
 [setup-linux.md](setup-linux.md#providers). `totp_exposable` matches the entry's
-**name**.
+**name**. `persist_cookies` matches the same name (or `["*"]` for every
+credential); its default is an empty list, and on Windows the saved file is
+sealed with the same DPAPI mechanism used for the master password rather than
+kept as plaintext — see [security.md](security.md#persistent-cookies).
 
 Only `bitwarden-cli` is supported on Windows. `pass` is UNIX-only, and `age-file`
 is refused because the browser shares the daemon's service account and could read

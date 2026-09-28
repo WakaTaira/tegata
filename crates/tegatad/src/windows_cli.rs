@@ -27,6 +27,10 @@ pub(crate) enum WindowsCommand {
         #[command(subcommand)]
         command: ApprovalCommand,
     },
+    Cookies {
+        #[command(subcommand)]
+        command: CookiesCommand,
+    },
     Service {
         #[command(subcommand)]
         command: super::windows_service::ServiceCommand,
@@ -78,6 +82,19 @@ pub(crate) enum ApprovalCommand {
     },
 }
 
+#[derive(clap::Subcommand)]
+pub(crate) enum CookiesCommand {
+    /// Delete the stored cookies of one credential (every principal) or of all credentials.
+    Forget {
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        cred_id: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value = "tegatad")]
+        pipe: String,
+    },
+}
+
 pub(crate) fn run_windows_cli(
     pipe_name: &str,
     method: &str,
@@ -119,7 +136,7 @@ pub(crate) fn run_windows_cli(
             println!("{token}");
             eprintln!("{peer_id}");
         }
-        "admin_peer_list" | "admin_approval_list" => {
+        "admin_peer_list" | "admin_approval_list" | "admin_cookies_forget" => {
             let result = response
                 .get("result")
                 .ok_or_else(|| format!("{method} returned no result"))?;

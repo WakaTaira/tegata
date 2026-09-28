@@ -13,9 +13,11 @@ import {
 import {
   type Cookie,
   cleanupResources,
+  formatExecutorErrorLine,
   handleExportCookies,
   handleLogin,
   parseRequest,
+  toExportedCookie,
 } from "../src/index.js";
 
 const DEVICE_VALUE = "device-canary-7f3a";
@@ -349,5 +351,44 @@ describe("login cookie parsing", () => {
       op: "export_cookies",
       id: 3,
     });
+  });
+});
+
+describe("login cookie redaction", () => {
+  test("redacts restored cookie values from diagnostic error lines", () => {
+    const restored = deviceCookie({ value: DEVICE_VALUE });
+    const request = {
+      op: "login" as const,
+      target_url: "https://example.test/login",
+      steps: null,
+      success_selector: null,
+      failure_selector: null,
+      cookies: [restored],
+      secret,
+    };
+
+    const line = formatExecutorErrorLine(
+      request,
+      "login",
+      "INTERNAL",
+      new Error(`page threw for cookie ${DEVICE_VALUE}`),
+    );
+
+    expect(line).not.toContain(DEVICE_VALUE);
+    expect(line).toContain("[REDACTED]");
+  });
+});
+
+describe("toExportedCookie", () => {
+  test("copies a well-formed cookie", () => {
+    const cookie = deviceCookie();
+    expect(toExportedCookie(cookie)).toEqual(cookie);
+  });
+
+  test("drops a cookie that does not match the expected shape", () => {
+    // context.cookies() が形の不正な値を返した場合でも、export_cookies や
+    // ログイン応答全体を失敗させず、その要素だけを捨てる。
+    const malformed = { ...deviceCookie(), domain: "" };
+    expect(toExportedCookie(malformed)).toBeUndefined();
   });
 });

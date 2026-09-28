@@ -135,17 +135,16 @@ pub(crate) struct CookiePolicy {
 }
 
 impl CookiePolicy {
-    /// namespace の `persist_cookies` を登録する。空のリストは登録しない。
-    /// 同じ namespace が重複する場合は、資格の解決と同じく先に現れた provider を用いる。
+    /// namespace の `persist_cookies` を登録する。
+    /// 資格の解決（同じ namespace の provider が複数あるとき先頭を採用する）と優先順位を
+    /// 一致させるため、リストが空であっても最初に現れた provider のものを採用し、
+    /// 同じ namespace への以降の登録は無視する。
     pub(crate) fn insert(&mut self, namespace: String, backend_ids: Vec<String>) {
-        if backend_ids.is_empty() {
-            return;
-        }
         self.by_namespace.entry(namespace).or_insert(backend_ids);
     }
 
     fn is_empty(&self) -> bool {
-        self.by_namespace.is_empty()
+        self.by_namespace.values().all(Vec::is_empty)
     }
 
     /// `cred_id`（`<namespace>:<backend id>`）が永続化対象であるかを判定する。
@@ -230,7 +229,9 @@ impl CookieStore {
     }
 
     /// 保管済みの cookie を読み出す。期限切れは捨て、残りが無ければ `None` を返す。
-    /// 読めないファイルは削除し、stderr に 1 行記録したうえで `None` を返す。
+    /// ファイルの読み込み自体に失敗した場合は、stderr に 1 行記録したうえで `None` を返す
+    /// （ファイルは削除しない）。復号・パースに失敗した場合、または保管単位が `key` と
+    /// 一致しない場合は、ファイルを削除したうえで stderr に 1 行記録し `None` を返す。
     pub(crate) fn load(&self, key: &BrowserKey, now: f64) -> Option<Vec<Cookie>> {
         let path = self.path_for(key);
         let bytes = match std::fs::read(&path) {
@@ -287,7 +288,12 @@ impl CookieStore {
     }
 
     /// 保管済みのファイルを削除し、削除した件数を返す。保管ディレクトリが無ければ 0 件とする。
-    /// cred_id 指定では、読めないファイルは帰属を判定できないため残す。
+    /// cred_id 指定では、読めない（壊れた）ファイルは cred_id への帰属を判定できないため残す。
+    /// 誤って別の資格のファイルや、一時的な I/O 失敗・権限不足で読めない正常ファイルまで
+    /// 削除してしまわないようにするための判断であり、`forget` の目的（その資格の cookie が
+    /// 以後復元されないこと）は、読めないファイルから cookie を復元できない以上、変わらず
+    /// 満たされる。これらの読めないファイルは `--all` 指定時、次回の読み出し時、または
+    /// 起動時の掃除（`sweep`）で改めて削除の対象になる。
     pub(crate) fn forget(&self, target: ForgetTarget<'_>) -> io::Result<usize> {
         let mut removed = 0;
         for path in self.store_files()? {
@@ -540,6 +546,23 @@ mod tests {
     }
 
     #[test]
+    fn insert_keeps_the_first_providers_list_for_a_namespace() {
+        // 資格の解決は同じ namespace の先頭 provider を採用するため、ポリシーも
+        // 先頭 provider のリスト（空を含む）を採用しなければならない。
+        let mut leading_empty = CookiePolicy::default();
+        leading_empty.insert("mock".to_owned(), Vec::new());
+        leading_empty.insert("mock".to_owned(), vec!["site".to_owned()]);
+        assert!(leading_empty.is_empty());
+        assert!(!leading_empty.persists("mock:site"));
+
+        let mut leading_wins = CookiePolicy::default();
+        leading_wins.insert("mock".to_owned(), vec!["site".to_owned()]);
+        leading_wins.insert("mock".to_owned(), Vec::new());
+        assert!(!leading_wins.is_empty());
+        assert!(leading_wins.persists("mock:site"));
+    }
+
+    #[test]
     fn filtering_keeps_only_well_formed_unexpired_persistent_cookies() {
         let mut no_expires = cookie("no-expires", NOW + 60.0);
         no_expires
@@ -774,6 +797,33 @@ mod tests {
         assert!(store.load(&key("uid:1000", "mock:site-b"), NOW).is_some());
         assert_eq!(store.forget(ForgetTarget::All).expect("forget all"), 1);
         assert_eq!(store.forget(ForgetTarget::All).expect("forget none"), 0);
+    }
+
+    #[test]
+    fn forget_by_credential_leaves_unreadable_and_other_credential_files() {
+        let dir = TempDir::new("forget-unreadable");
+        let store = store(&dir, &["*"]);
+        let target = key("uid:1000", "mock:site");
+        let other = key("uid:1000", "mock:site-b");
+        store
+            .save(&target, &json!([cookie("device", NOW + 60.0)]), NOW)
+            .expect("save target");
+        store
+            .save(&other, &json!([cookie("device", NOW + 60.0)]), NOW)
+            .expect("save other");
+        let corrupt = store.dir.join(store_file_name(&key("uid:1000", "mock:x")));
+        std::fs::write(&corrupt, b"garbage").expect("write corrupt file");
+        // cred_id への帰属が確定できるファイルだけが消え、別資格の正常ファイルと、
+        // 読めない（帰属不明の）ファイルは forget では残ることを確認する。
+        assert_eq!(
+            store
+                .forget(ForgetTarget::Credential("mock:site"))
+                .expect("forget"),
+            1
+        );
+        assert!(corrupt.exists());
+        assert!(store.load(&other, NOW).is_some());
+        assert_eq!(store.forget(ForgetTarget::All).expect("forget all"), 2);
     }
 
     #[test]

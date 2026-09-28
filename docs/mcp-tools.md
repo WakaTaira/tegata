@@ -261,12 +261,12 @@ possibly-unauthenticated browser.
 When the operator has enabled `persist_cookies` for this credential (see
 [security.md](security.md#persistent-cookies)) and a saved cookie is restored
 into a new, non-shared browser, `login` races `success_selector` against the
-first step's selector: if `success_selector` attaches first, the call succeeds
-without running any step at all — no secret is ever placed into the page for
-that call. If the step's selector attaches first, or the site still wants to
-authenticate, `login` runs the steps exactly as it would have otherwise. A
-credential with no `success_selector` set never takes this shortcut and always
-runs its steps.
+first step's selector: if `success_selector` becomes visible first, the call
+succeeds without running any step at all — no secret is ever placed into the
+page for that call. If the step's selector becomes visible first, or the site
+still wants to authenticate, `login` runs the steps exactly as it would have
+otherwise. A credential with no `success_selector` set never takes this
+shortcut and always runs its steps.
 
 ### Approval
 

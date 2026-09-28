@@ -4702,14 +4702,21 @@ fn save_cookies(
 }
 
 /// executor に `export_cookies` を送り、応答の cookie 配列を返す。
-/// 応答は `EXECUTOR_SHUTDOWN_TIMEOUT` で打ち切り、失敗・異常応答では `None` を返す。
+/// `executor_request` は書き込み・応答受信などの各段階をそれぞれ独立に
+/// `EXECUTOR_SHUTDOWN_TIMEOUT` で待つため、呼び出し全体を単一の
+/// `timeout(EXECUTOR_SHUTDOWN_TIMEOUT, ..)` で包み、全体としても
+/// `EXECUTOR_SHUTDOWN_TIMEOUT` を超えないように打ち切る。失敗・異常応答では `None` を返す。
 async fn executor_export_cookies(connection: &Arc<ExecutorConnection>) -> Option<Value> {
-    let mut response = executor_request(
-        connection,
-        |id| json!({ "op": "export_cookies", "id": id }),
+    let mut response = timeout(
         EXECUTOR_SHUTDOWN_TIMEOUT,
+        executor_request(
+            connection,
+            |id| json!({ "op": "export_cookies", "id": id }),
+            EXECUTOR_SHUTDOWN_TIMEOUT,
+        ),
     )
     .await
+    .ok()?
     .ok()?;
     if response.get("ok").and_then(Value::as_bool) != Some(true) {
         return None;

@@ -299,10 +299,16 @@ profile itself is thrown away with the rest of the browser process at the end of
 every session. The reason is not disk space: `localStorage` and the rest are
 places an agent driving the page over CDP could plant its own state, and letting
 that state ride along into the next `login` would hand a future fill whatever
-script the agent (or an injected instruction) left behind. A device-trust cookie
-crosses that line too, but it is bounded to what the site itself decided to
-grant, expires on its own, and is worth nothing without the credential it is
-paired with.
+script the agent (or an injected instruction) left behind. A saved cookie is a
+bearer token in its own right: on its own, without the credential it is paired
+with, it can grant a logged-in session (see [mcp-tools.md](mcp-tools.md) for how
+`login` short-circuits when one is restored). That is exactly why persistence
+defaults to off, is an explicit per-credential opt-in, is isolated per
+`(principal, namespace, credential)`, is kept in the daemon's state directory
+rather than the browser worker's, and the locally saved copy can be deleted
+with `tegatad cookies forget`. Deleting the local copy does not revoke the
+session on the site itself; an operator who needs that must log out of the
+site (or otherwise invalidate the session there).
 
 **Storage and isolation.** Saved cookies live under the daemon's state directory,
 in `cookies/`, one file per `(principal, namespace, credential)` — the same

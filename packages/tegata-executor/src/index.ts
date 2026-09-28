@@ -272,9 +272,12 @@ function requestSecrets(request: DiagnosticRequest): SecretCandidates {
     request.secret.password,
     request.secret.totp,
   ];
-  return request.op === "login"
-    ? loginSecrets
-    : [...loginSecrets, request.user_code];
+  if (request.op !== "login") {
+    return [...loginSecrets, request.user_code];
+  }
+  // 復元用 cookie の値も、失敗時のページ内例外文言に紛れ込みうるため秘匿対象に含める。
+  const cookieValues = (request.cookies ?? []).map((cookie) => cookie.value);
+  return [...loginSecrets, ...cookieValues];
 }
 
 /**
@@ -2032,18 +2035,13 @@ async function openBrowserPage() {
   }
 }
 
-/** Playwright の cookie から、デーモンと受け渡す項目のみを写す。 */
-function toExportedCookie(cookie: Cookie): Cookie {
-  return {
-    name: cookie.name,
-    value: cookie.value,
-    domain: cookie.domain,
-    path: cookie.path,
-    expires: cookie.expires,
-    httpOnly: cookie.httpOnly,
-    secure: cookie.secure,
-    sameSite: cookie.sameSite,
-  };
+/**
+ * Playwright の cookie から、デーモンと受け渡す項目のみを写す。
+ * toCookie と同じ検証・コピーを再利用する。検証を通らない要素は捨てる
+ * （デーモン側でも再検証するため、ここで例外にしてログイン全体を失敗させない）。
+ */
+export function toExportedCookie(cookie: Cookie): Cookie | undefined {
+  return toCookie(cookie);
 }
 
 async function readContextCookies(
@@ -2051,7 +2049,10 @@ async function readContextCookies(
   context: BrowserContext,
 ): Promise<Cookie[]> {
   const cookies = await withGuard(guard, () => context.cookies());
-  return cookies.map(toExportedCookie);
+  return cookies.flatMap((cookie) => {
+    const exported = toExportedCookie(cookie);
+    return exported === undefined ? [] : [exported];
+  });
 }
 
 /**

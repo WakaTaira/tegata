@@ -22,11 +22,10 @@ const PATH_SECRET: &str = "fake-path-secret_A1";
 /// 受けた要求を `executor.js.log` に 1 行ずつ記録する偽 executor。
 /// 開始応答の直後と、停止・終了の応答の直前に id を持たないイベント行を書き、
 /// デーモンがイベント行を応答と取り違えないことを確かめられるようにする。
-/// stdin が閉じても待機を続けるが、親のデーモンが消えたら終了する（テストの後始末で孤児を残さないため、#47）。
+/// stdin が閉じても待機を続けるが、テストのディレクトリが消えたら終了する。ディレクトリはデーモンの停止後に後始末で消されるため、デーモン自身の回収は検証対象に残したまま、孤児を残さない（#47）。
 const PROXY_EXECUTOR: &str = r#"
 const fs = require("node:fs");
 const readline = require("node:readline");
-const parent = process.ppid;
 const log = (value) => fs.appendFileSync(__filename + ".log", JSON.stringify(value) + "\n");
 const event = (path, status) =>
   process.stdout.write(JSON.stringify({ event: "api_proxy_request", http_method: "GET", path, status }) + "\n");
@@ -46,7 +45,7 @@ rl.on("line", (line) => {
     process.exit(0);
   }
 });
-rl.on("close", () => { setInterval(() => { if (process.ppid !== parent) process.exit(0); }, 200); });
+rl.on("close", () => { setInterval(() => { if (!fs.existsSync(__dirname)) process.exit(0); }, 200); });
 "#;
 
 /// 開始応答の直後に、監査で整形されるべき path のイベント行を書く偽 executor。
@@ -84,7 +83,6 @@ rl.on("line", (line) => {
 const OAUTH_PROXY_EXECUTOR: &str = r#"
 const fs = require("node:fs");
 const readline = require("node:readline");
-const parent = process.ppid;
 const log = (value) => fs.appendFileSync(__filename + ".log", JSON.stringify(value) + "\n");
 const event = (action) =>
   process.stdout.write(JSON.stringify({ event: "oauth_token", action }) + "\n");
@@ -104,7 +102,7 @@ rl.on("line", (line) => {
     process.exit(0);
   }
 });
-rl.on("close", () => { setInterval(() => { if (process.ppid !== parent) process.exit(0); }, 200); });
+rl.on("close", () => { setInterval(() => { if (!fs.existsSync(__dirname)) process.exit(0); }, 200); });
 "#;
 
 const OAUTH_FAILING_PROXY_EXECUTOR: &str = r#"
@@ -123,7 +121,6 @@ rl.on("line", (line) => {
 const SLOW_REVOKING_OAUTH_PROXY_EXECUTOR: &str = r#"
 const fs = require("node:fs");
 const readline = require("node:readline");
-const parent = process.ppid;
 const log = (value) => fs.appendFileSync(__filename + ".log", JSON.stringify(value) + "\n");
 const event = (action) =>
   process.stdout.write(JSON.stringify({ event: "oauth_token", action }) + "\n");
@@ -144,7 +141,7 @@ rl.on("line", (line) => {
     process.exit(0);
   }
 });
-rl.on("close", () => { setInterval(() => { if (process.ppid !== parent) process.exit(0); }, 200); });
+rl.on("close", () => { setInterval(() => { if (!fs.existsSync(__dirname)) process.exit(0); }, 200); });
 "#;
 
 struct Options<'a> {

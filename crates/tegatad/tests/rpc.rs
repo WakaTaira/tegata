@@ -19,7 +19,10 @@ const TOTP_SEED: &str = "invalid-base32-canary-$";
 
 /// A fake executor that completes a login and then idles even after stdin
 /// closes, imitating an executor whose browser keeps the event loop alive.
-/// Only an explicit shutdown request or a signal can end it.
+/// Only an explicit shutdown request, a signal, or the removal of the test
+/// directory can end it. The fixture removes the directory only after the daemon
+/// is gone, so the daemon's own reaping stays under test, yet a daemon killed by
+/// the fixture no longer leaves this process orphaned (#47).
 const IDLING_EXECUTOR: &str = r#"
 const fs = require("node:fs");
 const readline = require("node:readline");
@@ -40,7 +43,7 @@ rl.on("line", (line) => {
     process.exit(0);
   }
 });
-rl.on("close", () => { setInterval(() => {}, 1000); });
+rl.on("close", () => { setInterval(() => { if (!fs.existsSync(__dirname)) process.exit(0); }, 200); });
 "#;
 
 /// A fake executor that fails the login and then idles the same way.
@@ -58,7 +61,7 @@ rl.on("line", (line) => {
     process.exit(0);
   }
 });
-rl.on("close", () => { setInterval(() => {}, 1000); });
+rl.on("close", () => { setInterval(() => { if (!fs.existsSync(__dirname)) process.exit(0); }, 200); });
 "#;
 
 const SELECTOR_STEP_EXECUTOR: &str = r#"

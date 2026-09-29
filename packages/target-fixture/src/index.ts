@@ -1252,6 +1252,165 @@ function handleApiMe(request: IncomingMessage, response: ServerResponse): void {
   }
 }
 
+// State of the /device-cookies/ device approval pages (Issue #49). They accept
+// the `device` cookie and the `sid` session issued by the /persistent-cookies/
+// login site and send every other request to the login page, even a GET.
+const deviceCookieRequests: RecordedRequest[] = [];
+const voidedSidCookies = new Set<string>();
+let deviceCookieApprovals = 0;
+
+function recordDeviceCookieRequest(request: IncomingMessage): void {
+  deviceCookieRequests.push({
+    method: request.method ?? "",
+    path: request.url ?? "",
+    cookies: [...cookiesFrom(request).keys()],
+  });
+}
+
+function hasDeviceCookieSession(request: IncomingMessage): boolean {
+  if (hasValidDeviceCookie(request)) return true;
+  const sid = cookiesFrom(request).get("sid");
+  return (
+    sid !== undefined &&
+    issuedSidCookies.includes(sid) &&
+    !voidedSidCookies.has(sid)
+  );
+}
+
+function redirectToDeviceCookieLogin(response: ServerResponse): void {
+  response.writeHead(302, { Location: "/device-cookies/login" });
+  response.end();
+}
+
+function deviceCookieEntryPage(): string {
+  return devicePage().replace(
+    'action="/device"',
+    'action="/device-cookies/device"',
+  );
+}
+
+function deviceCookieAuthorizationPage(userCode: string): string {
+  return deviceAuthorizationPage(userCode).replace(
+    'action="/device/approve"',
+    'action="/device-cookies/approve"',
+  );
+}
+
+function handleDeviceCookieEntry(
+  request: IncomingMessage,
+  response: ServerResponse,
+): void {
+  readRequestBody(request, (body) => {
+    const userCode = new URLSearchParams(body).get("user_code");
+    writePage(
+      response,
+      userCode !== null && deviceCodes.has(userCode)
+        ? deviceCookieAuthorizationPage(userCode)
+        : deviceErrorPage(),
+    );
+  });
+}
+
+function handleDeviceCookieApprove(
+  request: IncomingMessage,
+  response: ServerResponse,
+): void {
+  readRequestBody(request, (body) => {
+    const userCode = new URLSearchParams(body).get("user_code");
+    if (userCode !== null && deviceCodes.has(userCode)) {
+      deviceCodes.set(userCode, true);
+      deviceCookieApprovals += 1;
+      writePage(response, deviceApprovedPage());
+    } else {
+      writePage(response, deviceErrorPage());
+    }
+  });
+}
+
+/** Device authorization whose `verification_uri` is the gated approval page. */
+function handleDeviceCookieOAuthAuthorization(
+  request: IncomingMessage,
+  response: ServerResponse,
+): void {
+  readRequestBody(request, (body) => {
+    const form = new URLSearchParams(body);
+    if (form.get("client_id") === null || form.get("client_id") === "") {
+      writeJson(response, 400, { error: "invalid_request" });
+      return;
+    }
+    const userCode = newDeviceCode();
+    const deviceCode = newOAuthToken();
+    deviceCodes.set(userCode, false);
+    oauthDeviceCodes.set(deviceCode, {
+      userCode,
+      expiresAt: Date.now() + 300_000,
+      consumed: false,
+    });
+    writeJson(response, 200, {
+      device_code: deviceCode,
+      user_code: userCode,
+      verification_uri: `${requestOrigin(request)}/device-cookies/device`,
+      expires_in: 300,
+      interval: 1,
+    });
+  });
+}
+
+/**
+ * Device approval pages behind the persistent-cookie login: `GET /device` and
+ * the `POST` steps require a valid `device` cookie or `sid` session, while
+ * `GET /open` shows the empty form to anyone (its submission still requires
+ * the session). `GET /state` reports `{login_posts, approvals, requests}`,
+ * `POST /invalidate` voids every `device` cookie and `sid` session. Returns
+ * false for requests it does not handle.
+ */
+function handleDeviceCookieRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+): boolean {
+  const route = `${request.method} ${request.url}`;
+  if (route === "GET /device-cookies/state") {
+    writeJson(response, 200, {
+      login_posts: persistentCookieLoginPosts,
+      approvals: deviceCookieApprovals,
+      requests: deviceCookieRequests,
+    });
+    return true;
+  }
+  if (route === "POST /device-cookies/invalidate") {
+    validDeviceCookies.clear();
+    for (const sid of issuedSidCookies) voidedSidCookies.add(sid);
+    writeJson(response, 200, { ok: true });
+    return true;
+  }
+  if (request.url?.startsWith("/device-cookies/") !== true) return false;
+  recordDeviceCookieRequest(request);
+  const authenticated = hasDeviceCookieSession(request);
+  if (route === "GET /device-cookies/login") {
+    writePage(response, persistentCookieLoginForm(false));
+  } else if (route === "GET /device-cookies/open") {
+    writePage(response, deviceCookieEntryPage());
+  } else if (route === "POST /device-cookies/oauth/device_authorization") {
+    handleDeviceCookieOAuthAuthorization(request, response);
+  } else if (
+    route !== "GET /device-cookies/device" &&
+    route !== "POST /device-cookies/device" &&
+    route !== "POST /device-cookies/approve"
+  ) {
+    response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("not found");
+  } else if (!authenticated) {
+    redirectToDeviceCookieLogin(response);
+  } else if (route === "GET /device-cookies/device") {
+    writePage(response, deviceCookieEntryPage());
+  } else if (route === "POST /device-cookies/device") {
+    handleDeviceCookieEntry(request, response);
+  } else {
+    handleDeviceCookieApprove(request, response);
+  }
+  return true;
+}
+
 /** OAuth 認可サーバーと保護 API の経路を処理する。該当しない要求には false を返す。 */
 function handleOAuthRequest(
   request: IncomingMessage,
@@ -1456,6 +1615,8 @@ function handleRequest(
   if (handleOAuthRequest(request, response)) return;
 
   if (handlePersistentCookieRequest(request, response, credentials)) return;
+
+  if (handleDeviceCookieRequest(request, response)) return;
 
   if (handleStepwiseRequest(request, response, credentials)) return;
 

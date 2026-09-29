@@ -2664,10 +2664,12 @@ async function stepStepwise(
   return concludeStepwise(session, settled, false);
 }
 
+/** `pageSecrets` には、失敗の時点で context が持っていた cookie の値を渡す。 */
 type ExecutionErrorWriter = (
   stage: ExecutionStage,
   classified: ClassifiedExecutionError,
   cause: unknown,
+  pageSecrets: SecretCandidates,
 ) => void;
 
 function throwIfDeviceAuthorizationAborted(signal?: AbortSignal): void {
@@ -2686,6 +2688,10 @@ export function firstDeviceStepSelector(
   return steps[0]?.selector;
 }
 
+// デバイス段の競争でログインフォームとみなす要素。先頭の password 欄が非表示でも後続の可視の欄を検出できるよう、
+// 可視の候補に限って待つ。
+const DEVICE_RACE_LOGIN_SELECTOR = 'input[type="password"]:visible';
+
 /**
  * デバイス段の最初の要素とログインフォーム（可視の password 欄）のどちらが先に可視になるかを返す。
  * どちらも上限までに現れない場合は undefined を返す。
@@ -2697,7 +2703,7 @@ export async function raceDeviceStageAgainstLogin(
   const device = waitUntilVisible(page, deviceSelector).then((visible) =>
     visible ? ("device" as const) : undefined,
   );
-  const login = waitUntilVisible(page, DEFAULT_FIRST_STEP_SELECTOR).then(
+  const login = waitUntilVisible(page, DEVICE_RACE_LOGIN_SELECTOR).then(
     (visible) => (visible ? ("login" as const) : undefined),
   );
   return raceDecisive(
@@ -2812,17 +2818,49 @@ export function formatDeviceAuthorizationFields(
   return { cookies: outcome.cookies, steps_skipped: outcome.stepsSkipped };
 }
 
+// 診断行の秘匿のために、失敗の時点の context の cookie を読む上限。
+const DIAGNOSTIC_COOKIE_READ_TIMEOUT_MS = 1_000;
+
+/**
+ * 診断行の置換対象とするため、context が現に持つ cookie の値を読む。実行中にページが発行・更新した cookie は
+ * 要求に含まれず、要求由来の置換では秘匿できないためである。context が無い場合、読めない場合、
+ * 上限を超えた場合は空とし、元の失敗の報告を妨げない。
+ */
+async function readCookieValuesForRedaction(
+  context: BrowserContext | undefined,
+): Promise<string[]> {
+  if (context === undefined) return [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const cookies = await Promise.race([
+      context.cookies(),
+      new Promise<[]>((resolve) => {
+        timer = setTimeout(
+          () => resolve([]),
+          DIAGNOSTIC_COOKIE_READ_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    return cookies.map((cookie) => cookie.value);
+  } catch {
+    return [];
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
 /**
  * device 承認をブラウザで行う。`signal` が中断された場合は、ブラウザ起動の後および各段の前で打ち切る。
  * 成功した場合は、ブラウザを閉じる前の context の cookie を返す。ブラウザの後始末は呼び出し側が行う。
  */
 async function executeAuthorizeDevice(
   request: AuthorizeDeviceRequest,
-  writeError: ExecutionErrorWriter = (stage, classified, cause) =>
-    writeExecutorErrorLine(request, stage, classified, cause),
+  writeError: ExecutionErrorWriter = (stage, classified, cause, pageSecrets) =>
+    writeExecutorErrorLine(request, stage, classified, cause, pageSecrets),
   signal?: AbortSignal,
 ): Promise<DeviceAuthorizationResult> {
   let stage: ExecutionStage = "login";
+  let diagnosticContext: BrowserContext | undefined;
   try {
     throwIfDeviceAuthorizationAborted(signal);
     const { page, pageSession } = await openBrowserPage();
@@ -2838,6 +2876,7 @@ async function executeAuthorizeDevice(
     };
     try {
       const context = page.context();
+      diagnosticContext = context;
       const restored = await runner.run("login", () =>
         restoreCookies(guard, context, request.cookies ?? []),
       );
@@ -2851,7 +2890,12 @@ async function executeAuthorizeDevice(
     }
   } catch (error) {
     const classified = classifyExecutionError(error, stage);
-    writeError(stage, classified, error);
+    writeError(
+      stage,
+      classified,
+      error,
+      await readCookieValuesForRedaction(diagnosticContext),
+    );
     return { ok: false, error: classified };
   }
 }
@@ -3261,16 +3305,13 @@ async function authorizeDeviceInBrowser(
   });
   const authorization = executeAuthorizeDevice(
     toAuthorizeDeviceRequest(request, device),
-    (stage, classified, cause) => {
+    (stage, classified, cause, pageSecrets) => {
       // 打ち切った後の失敗は、打ち切りの理由として別に報告するため出力しない。
       if (!cancel.signal.aborted) {
-        writeExecutorErrorLine(
-          request,
-          stage,
-          classified,
-          cause,
-          runtimeSecrets,
-        );
+        writeExecutorErrorLine(request, stage, classified, cause, [
+          ...runtimeSecrets,
+          ...pageSecrets,
+        ]);
       }
     },
     cancel.signal,

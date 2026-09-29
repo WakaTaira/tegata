@@ -29,6 +29,7 @@ const DEVICE_VALUE = "device-canary-5d21";
 const SID_VALUE = "sid-canary-a8e0";
 const USER_CODE = "WDJB-MJHT";
 const DEVICE_CODE = "device-code-canary-3b7c";
+const ISSUED_VALUE = "issued-canary-71f4";
 
 const secret = {
   username: "alice@example.test",
@@ -67,6 +68,32 @@ const authorizationForm = `
   <form method="post" action="/approve">
     <button type="submit">Authorize</button>
   </form>
+`;
+
+// 実行中に cookie を発行し、既定のログイン段がユーザー名欄を探す評価の中で、その値を含む例外を投げるページ。
+const leakingLoginForm = `
+  ${loginForm}
+  <script>
+    const querySelectorAll = document.querySelectorAll.bind(document);
+    document.querySelectorAll = (selector) => {
+      if (selector === "input") throw new Error("page-thrown:" + document.cookie);
+      return querySelectorAll(selector);
+    };
+  </script>
+`;
+
+// 非表示の password 欄の後に可視のログインフォームがあり、承認の入力欄が遅れて現れる未認証のページ。
+const hiddenPasswordFirstPage = `
+  <input name="decoy" type="password" hidden>
+  ${loginForm}
+  <script>
+    setTimeout(() => {
+      const code = document.createElement("input");
+      code.name = "user_code";
+      code.type = "text";
+      document.body.append(code);
+    }, 1000);
+  </script>
 `;
 
 function html(body: string): string {
@@ -156,11 +183,21 @@ beforeAll(async () => {
       page(entryForm);
       return;
     }
+    if (route === "GET /login-leaks") {
+      page(leakingLoginForm, {
+        "set-cookie": [`issued=${ISSUED_VALUE}; Path=/`],
+      });
+      return;
+    }
+    if (route === "GET /mixed" && !isAuthenticated(request)) {
+      page(hiddenPasswordFirstPage);
+      return;
+    }
     if (!isAuthenticated(request)) {
       response.writeHead(302, { location: "/login" }).end();
       return;
     }
-    if (route === "GET /device") {
+    if (route === "GET /device" || route === "GET /mixed") {
       page(entryForm);
     } else if (route === "POST /device") {
       page(
@@ -224,6 +261,23 @@ async function captureResponse(
     .filter((line) => !("event" in line));
   expect(responses).toHaveLength(1);
   return responses[0];
+}
+
+/** 1 回の処理が標準エラー出力へ書く内容を読み取る。標準出力の応答は captureResponse で読む。 */
+async function captureStderr(action: () => Promise<unknown>): Promise<string> {
+  const chunks: string[] = [];
+  const spy = vi.spyOn(process.stderr, "write").mockImplementation(((
+    chunk: string | Uint8Array,
+  ) => {
+    chunks.push(String(chunk));
+    return true;
+  }) as typeof process.stderr.write);
+  try {
+    await action();
+  } finally {
+    spy.mockRestore();
+  }
+  return chunks.join("");
 }
 
 function deviceCookie(overrides: Partial<Cookie> = {}): Cookie {
@@ -387,6 +441,24 @@ describe("authorize_device with persistent cookies", {
     expect(site.approvals).toBe(0);
   });
 
+  test("runs the login stage when a hidden password field precedes the visible login form", async () => {
+    site.deviceValid = false;
+
+    const response = await authorizeDevice({
+      cookies: [deviceCookie()],
+      verification_url: `${origin}/mixed`,
+    });
+
+    expect(response).toMatchObject({ ok: true, steps_skipped: false });
+    expect(site.posts).toBe(1);
+    expect(site.approvals).toBe(1);
+    // 可視の password 欄が承認の入力欄より先に見つかり、省略を試みずにログイン段へ進む。
+    expect(site.requests.slice(0, 2)).toMatchObject([
+      { method: "GET", path: "/mixed" },
+      { method: "GET", path: "/login" },
+    ]);
+  });
+
   test("keeps the previous behavior when the cookies field is absent", async () => {
     const response = await authorizeDevice({});
 
@@ -506,6 +578,31 @@ describe("device cookie parsing", () => {
     ["api_proxy_start oauth", parsedOAuthCookies],
   ])("rejects a cookies field in %s that is not a list", (_name, parse) => {
     expect(() => parse({ name: "device" })).toThrow();
+  });
+});
+
+describe("cookies issued during the browser login", {
+  timeout: 60_000,
+}, () => {
+  test.each([
+    [
+      "authorize_device",
+      () => authorizeDevice({ login_url: `${origin}/login-leaks` }),
+    ],
+    [
+      "api_proxy_start oauth",
+      () => startOAuthProxy({ login_url: `${origin}/login-leaks` }),
+    ],
+  ])("are redacted from the diagnostic line of %s", async (_name, run) => {
+    let response: Record<string, unknown> = {};
+    const stderr = await captureStderr(async () => {
+      response = await run();
+    });
+
+    expect(response).toMatchObject({ ok: false, error: "INTERNAL" });
+    expect(stderr).toContain("page-thrown:");
+    expect(stderr).toContain("[REDACTED]");
+    expect(stderr).not.toContain(ISSUED_VALUE);
   });
 });
 

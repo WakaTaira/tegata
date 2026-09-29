@@ -4482,15 +4482,10 @@ fn parse_login_response(line: &str) -> Result<ParsedLoginResponse, ExecutorFailu
     if response.ok {
         let endpoint = response.endpoint.ok_or(ErrorCode::Internal)?;
         let target_id = response.target_id.ok_or(ErrorCode::Internal)?;
-        let mut extras = serde_json::from_str::<Value>(line).unwrap_or(Value::Null);
-        let cookies = extras
-            .get_mut("cookies")
-            .map(Value::take)
-            .filter(|cookies| !cookies.is_null());
-        let steps_skipped = extras
-            .get("steps_skipped")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let ReturnedCookies {
+            cookies,
+            steps_skipped,
+        } = parse_returned_cookies(line);
         Ok(ParsedLoginResponse {
             endpoint,
             target_id,

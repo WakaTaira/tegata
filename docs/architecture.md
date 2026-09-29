@@ -189,9 +189,13 @@ Agent                    Broker         tegatad          Executor
   │◀───────────────────────│◀─────────────│                │
 ```
 
-Every snapshot the executor builds is checked against the daemon's registry
-of resolved secrets before it is handed back — the same exact-match search
-described in [security.md](security.md#stepwise-login) — and no answer
+Every snapshot the executor builds is searched on the isolated side for the
+credential's password and every TOTP code entered so far before it is handed
+back — the same exact-match search described in
+[security.md](security.md#stepwise-login) — with usernames excluded from that
+check since they are not secret. The daemon's own leak-scan pass over the
+whole RPC response is a second, independent line of defense against the same
+class of leak, not the mechanism that catches it here. No answer
 carries a CDP endpoint until `success_selector` attaches and the browser is
 handed off. The daemon keeps a per-`login_id` ledger (principal, browser,
 last-activity time, start time, TOTP codes entered) to enforce

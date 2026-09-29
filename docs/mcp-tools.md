@@ -71,7 +71,7 @@ the public code format; arbitrary daemon text is normalised to `INTERNAL`.
 | `APPROVAL_TIMEOUT` | The approval hook did not answer within its timeout |
 | `PROVIDER_UNAVAILABLE` | A transient failure of the credential provider (for example the Bitwarden CLI failing or timing out right after a daemon restart); the call may be retried. Returned by `list_credentials`, `login`, `get_totp`, and `lock_vault` when they call a provider |
 | `NOT_FOUND` | The session does not exist or belongs to another principal; its existence is not disclosed. Also returned by `login_step` for an unknown, expired, or foreign `login_id` |
-| `SNAPSHOT_REJECTED` | A `login_step` snapshot would have echoed a secret it just filled; the stepwise login ended and its browser was discarded |
+| `SNAPSHOT_REJECTED` | A `login_begin` or `login_step` snapshot would have echoed a secret it just filled; the stepwise login ended and its browser was discarded |
 | `INTERNAL` | Anything else, including a refused response that failed the leak scan |
 
 For an explicit `steps` array, `structuredContent.step` is the zero-based index
@@ -357,8 +357,8 @@ and no snapshot involved.
 | `snapshot` | — | Take a fresh snapshot without acting on the page |
 | `abort` | — | Discard the browser and end the stepwise login |
 
-**Output** is the same three shapes as `login_begin`'s output, plus
-`{ "state": "aborted" }` for `abort`.
+**Output** is one of the two `login_begin` shapes (`pending` or `done`), plus
+`{ "state": "aborted" }` for `abort` — three shapes in all.
 
 `fill_submit` fills its elements with the same native-setter, no-keystroke
 mechanism as `login`, then submits, then waits to settle (below). Whatever it
@@ -384,9 +384,7 @@ open shadow roots:
   "text": "...",
   "elements": [
     {
-      "tag": "button", "type": null, "id": null, "name": null,
-      "role": "button", "placeholder": null, "aria-label": null,
-      "autocomplete": null, "href": null, "disabled": false,
+      "tag": "button", "role": "button", "disabled": false,
       "text": "More options", "selector": "#more-options"
     }
   ],
@@ -396,12 +394,15 @@ open shadow roots:
 
 `text` is `document.body.innerText`, truncated to 2000 characters. `elements`
 lists visible `button`, `a[href]`, `input`, `select`, `textarea`, and
-`[role=button]` / `[role=link]` elements, up to 200, each with only the
-attributes above plus a `selector` tegata generates (an `#id` if unique, else
-a `[name=...]` match, else a positional path) — the same selector the agent
-passes back in the next step. **No `value` property, `value` attribute, or
-`data-*` attribute of any element is ever included**, regardless of the
-element's type or visibility. The whole snapshot is capped at 64 KiB
+`[role=button]` / `[role=link]` elements, up to 200. Each entry carries `tag`,
+`disabled` (always a boolean), `text`, and a `selector` tegata generates (an
+`#id` if unique, else a `[name=...]` match, else a positional path) — the same
+selector the agent passes back in the next step — plus whichever of `type`,
+`id`, `name`, `role`, `placeholder`, `aria-label`, `autocomplete`, and `href`
+the element actually has; an attribute the element lacks is omitted from the
+entry rather than serialized as `null`. **No `value` property, `value`
+attribute, or `data-*` attribute of any element is ever included**, regardless
+of the element's type or visibility. The whole snapshot is capped at 64 KiB
 serialized; over that, `elements` is trimmed from the end and `truncated:
 true` is added.
 

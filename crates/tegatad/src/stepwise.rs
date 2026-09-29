@@ -17,16 +17,16 @@ use tokio::time::{Instant, interval, timeout};
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+use crate::peers;
 use crate::sessions::{BrowserKey, StartControl, StartKey};
 use crate::transport::PeerIdentity;
 use crate::{
     AuditFields, AuditPeer, BrowserRegistration, CookieAudit, EXECUTOR_OPERATION_TIMEOUT,
-    EXECUTOR_SHUTDOWN_TIMEOUT, EXECUTOR_TIMEOUT, ErrorCode, ExecutorFailure, ExecutorHandle,
-    HandledRequest, SharedState, append_audit, classified, classified_with_step, cookie_store,
-    current_totp, gate_on_approval, join_browser, kill_executor_handle, open_executor_with,
-    parse_error_code, parse_params, register_login_browser, resolve_unlocked_credential,
-    save_cookies, selector_step, service_launch_settings, start_control, stop_child, success,
-    wait_or_kill_executor,
+    EXECUTOR_TIMEOUT, ErrorCode, ExecutorFailure, ExecutorHandle, HandledRequest, SharedState,
+    append_audit, classified, classified_with_step, cookie_store, current_totp, gate_on_approval,
+    join_browser, namespace_locked, open_executor_with, parse_error_code, parse_params,
+    register_login_browser, resolve_unlocked_credential, save_cookies, selector_step,
+    service_launch_settings, shutdown_executor_handle, start_control, stop_child, success,
 };
 
 /// `stepwise_idle_secs` の既定値。
@@ -564,7 +564,7 @@ pub(crate) async fn login_begin(
         Ok(grant) => grant,
         Err(error) => return classified(request.id.clone(), error),
     };
-    begin_after_approval(request.id.clone(), &state, key, &params)
+    begin_after_approval(request.id.clone(), &state, key, &params, peer)
         .await
         .with_audit_approval_grant(grant)
 }
@@ -576,6 +576,7 @@ async fn begin_after_approval(
     state: &SharedState,
     key: BrowserKey,
     params: &BeginParams,
+    peer: &PeerIdentity,
 ) -> HandledRequest {
     let gate = start_control(state, StartKey::Browser(key.clone())).await;
     let mut control = gate.lock().await;
@@ -643,9 +644,13 @@ async fn begin_after_approval(
     match reply {
         ExecutorState::Pending(snapshot) => {
             drop(control);
-            let login_id = register_pending(state, launched).await;
-            success(id, pending_result(&login_id, snapshot))
-                .with_audit_cookies(persist_cookies.then(|| CookieAudit::login(restored, false)))
+            match register_pending(state, peer, launched).await {
+                Ok(login_id) => success(id, pending_result(&login_id, snapshot))
+                    .with_audit_cookies(
+                        persist_cookies.then(|| CookieAudit::login(restored, false)),
+                    ),
+                Err(error) => classified(id, error),
+            }
         }
         ExecutorState::Done(done) => {
             let steps_skipped = done.steps_skipped;
@@ -675,8 +680,14 @@ struct Launched {
     pending: PendingExecutor,
 }
 
-/// `pending` の段階ログインを台帳へ登録し、login_id を返す。
-async fn register_pending(state: &SharedState, launched: Launched) -> String {
+/// `pending` の段階ログインを台帳へ登録する。executor の起動中（`open_executor_with` の待機中）は
+/// 台帳に無いため、その間に生じた vault のロック・peer の失効・デーモンの停止処理の終了対象から漏れる。
+/// 登録した直後にその時点の状態を確認し、既に終了対象であれば `pending` を返さずに自ら終了する。
+async fn register_pending(
+    state: &SharedState,
+    peer: &PeerIdentity,
+    launched: Launched,
+) -> Result<String, ErrorCode> {
     let login_id = Uuid::new_v4().to_string();
     let Launched {
         key,
@@ -687,7 +698,7 @@ async fn register_pending(state: &SharedState, launched: Launched) -> String {
     } = launched;
     let slot = Arc::new(Mutex::new(Some(pending)));
     let entry = Entry::new(
-        key,
+        key.clone(),
         exclusive,
         persist_cookies,
         browser_started_at,
@@ -695,7 +706,50 @@ async fn register_pending(state: &SharedState, launched: Launched) -> String {
         slot,
     );
     state.lock().await.stepwise.insert(login_id.clone(), entry);
-    login_id
+    if let Some(reason) = immediate_end_reason(state, &key, peer).await {
+        let entry = state
+            .lock()
+            .await
+            .stepwise
+            .take_owned(&login_id, &key.principal);
+        if let Some(entry) = entry {
+            end_entry(state, &login_id, entry, reason, AuditPeer::System).await;
+        }
+        return Err(immediate_error(reason));
+    }
+    Ok(login_id)
+}
+
+/// 段階ログインの登録直後に、既に終了対象になっていないかを判定する。
+/// 判定は既存の状態（プロバイダのロック状態、peer 台帳、デーモンの停止フラグ）からのみ行う。
+async fn immediate_end_reason(
+    state: &SharedState,
+    key: &BrowserKey,
+    peer: &PeerIdentity,
+) -> Option<EndReason> {
+    if namespace_locked(state, &key.namespace).await {
+        return Some(EndReason::LockVault);
+    }
+    let daemon = state.lock().await;
+    if let PeerIdentity::Peer { peer_id, .. } = peer
+        && !peers::is_active(&daemon.peers, peer_id)
+    {
+        return Some(EndReason::PeerRevoked);
+    }
+    if daemon.shutting_down {
+        return Some(EndReason::Shutdown);
+    }
+    None
+}
+
+/// `immediate_end_reason` の終了理由に対応する応答。lock_vault は `VAULT_LOCKED`、peer 失効は
+/// 通常の失効 peer への応答と同じ `UNAUTHORIZED`。デーモン停止はどのみち接続が畳まれるため `INTERNAL` とする。
+fn immediate_error(reason: EndReason) -> ErrorCode {
+    match reason {
+        EndReason::LockVault => ErrorCode::VaultLocked,
+        EndReason::PeerRevoked => ErrorCode::Unauthorized,
+        _ => ErrorCode::Internal,
+    }
 }
 
 fn pending_result(login_id: &str, snapshot: Value) -> Value {
@@ -718,7 +772,6 @@ async fn hand_off(
     launched: Launched,
     done: DoneState,
 ) -> Result<Value, ErrorCode> {
-    control.record_success();
     let (shared_exists, cookie_store) = {
         let daemon = state.lock().await;
         (
@@ -738,6 +791,8 @@ async fn hand_off(
         browser_started_at: launched.browser_started_at,
     };
     let result = register_login_browser(state, registration).await?;
+    // 登録が成功した後にのみバックオフをリセットする。登録失敗（INTERNAL）時に成功と数えないため。
+    control.record_success();
     if launched.persist_cookies
         && let Some(cookies) = done.cookies.as_ref()
     {
@@ -1012,6 +1067,7 @@ async fn exchange_step(
 }
 
 /// ハンドオフ前の executor を停止する。`abort` では先に executor へ破棄を依頼する。
+/// 停止手順そのものは `shutdown_executor_handle` に集約し、`authorize_device` の使い捨て接続と共有する。
 async fn stop_pending(mut pending: PendingExecutor, abort: bool) {
     if abort {
         let _ = exchange_step(
@@ -1023,19 +1079,7 @@ async fn stop_pending(mut pending: PendingExecutor, abort: bool) {
         .await;
     }
     let id = pending.take_id();
-    let executor = &mut pending.handle;
-    let request = format!("{}\n", json!({ "op": "shutdown", "id": id }));
-    let written = timeout(
-        EXECUTOR_SHUTDOWN_TIMEOUT,
-        executor.write_line(request.as_bytes()),
-    )
-    .await;
-    if matches!(written, Ok(Ok(()))) {
-        let _ = timeout(EXECUTOR_SHUTDOWN_TIMEOUT, executor.read_line()).await;
-    }
-    if !wait_or_kill_executor(executor).await {
-        kill_executor_handle(executor).await;
-    }
+    shutdown_executor_handle(&mut pending.handle, id).await;
 }
 
 /// 台帳から除いた段階ログインを終了する。処理中の step があれば、その完了を待ってから executor を回収する。

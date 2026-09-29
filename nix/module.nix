@@ -359,13 +359,13 @@ in
     };
 
     stepwiseIdleSecs = lib.mkOption {
-      type = lib.types.nullOr lib.types.ints.unsigned;
+      type = lib.types.nullOr lib.types.ints.positive;
       default = null;
       description = "Idle timeout for a stepwise login (login_begin / login_step) in seconds; null uses the daemon default.";
     };
 
     stepwiseMaxSecs = lib.mkOption {
-      type = lib.types.nullOr lib.types.ints.unsigned;
+      type = lib.types.nullOr lib.types.ints.positive;
       default = null;
       description = "Absolute lifetime of a stepwise login (login_begin / login_step) in seconds; null uses the daemon default.";
     };

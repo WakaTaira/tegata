@@ -19,6 +19,8 @@ use common::{create_private_dir, rpc, try_rpc};
 /// `#verify` はハンドオフ、`#missing` は SELECTOR_NOT_FOUND、`#reject` は SNAPSHOT_REJECTED、
 /// `#mismatch` は FILL_MISMATCH、`#vanish` は応答せずに切断する。`#echo-user` は username を
 /// マスクせずに含むスナップショットを返す（executor の検査をすり抜けた場合の模擬）。
+/// `target_url` が `http://127.0.0.1/delay` の `login_begin` は、応答を少し遅らせる
+/// （executor 起動中に daemon 側の状態が変わる競合をテストで作るため）。
 /// 受け取った要求の op・action・totp・secret のキー・cookies の数を `executor.js.requests` に記録する。
 /// stdin が閉じられたら必ず終了する。
 const STEPWISE_EXECUTOR: &str = r##"
@@ -55,10 +57,17 @@ rl.on("line", (line) => {
   }) + "\n");
   if (request.op === "login_begin") {
     username = request.secret.username;
-    if (Array.isArray(request.cookies)) {
-      reply(request.id, { ok: true, state: "done", endpoint, target_id: "begin-target", cookies: jar, steps_skipped: true });
+    const respond = () => {
+      if (Array.isArray(request.cookies)) {
+        reply(request.id, { ok: true, state: "done", endpoint, target_id: "begin-target", cookies: jar, steps_skipped: true });
+      } else {
+        reply(request.id, { ok: true, state: "pending", snapshot: snapshot("start") });
+      }
+    };
+    if (request.target_url === "http://127.0.0.1/delay") {
+      setTimeout(respond, 300);
     } else {
-      reply(request.id, { ok: true, state: "pending", snapshot: snapshot("start") });
+      respond();
     }
   } else if (request.op === "login_step") {
     step(request);
@@ -201,21 +210,20 @@ impl Daemon {
             .collect()
     }
 
-    /// 条件を満たす監査行が現れるまで待つ。
+    /// 指定した login_id の監査行が現れるまで待つ。
     fn wait_for_record(&self, method: &str, login_id: &str) -> Value {
+        self.wait_for_record_matching(method, |record| record["login_id"] == login_id)
+    }
+
+    /// 条件を満たす監査行が現れるまで待つ。login_id が応答に現れない場合など、
+    /// login_id 以外の条件で 1 行を探したいときに用いる。
+    fn wait_for_record_matching(&self, method: &str, matches: impl Fn(&Value) -> bool) -> Value {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Some(record) = self
-                .records(method)
-                .into_iter()
-                .find(|record| record["login_id"] == login_id)
-            {
+            if let Some(record) = self.records(method).into_iter().find(&matches) {
                 return record;
             }
-            assert!(
-                Instant::now() < deadline,
-                "no {method} record for {login_id}"
-            );
+            assert!(Instant::now() < deadline, "no matching {method} record");
             sleep(Duration::from_millis(50));
         }
     }
@@ -637,6 +645,38 @@ fn lock_vault_ends_the_stepwise_logins_of_the_namespace() {
     let record = daemon.wait_for_record("stepwise_terminated", &login_id);
     assert_eq!(record["outcome"], "lock_vault");
     daemon.wait_for_shutdowns(1);
+}
+
+#[test]
+fn lock_vault_during_login_begin_ends_the_pending_login_before_it_is_returned() {
+    // executor の起動中（`login_begin` への応答待ち）は段階ログインがまだ台帳に無い。
+    // この間に lock_vault が走っても、登録直後の自己終了判定が pending を返させない。
+    let daemon = Daemon::start();
+    let begun = std::thread::scope(|scope| {
+        let begin_thread = scope.spawn(|| {
+            daemon.call(
+                "login_begin",
+                json!({
+                    "cred_id": "mock:site",
+                    "target_url": "http://127.0.0.1/delay",
+                    "success_selector": "#signed-in",
+                }),
+            )
+        });
+        sleep(Duration::from_millis(100));
+        let locked = daemon.call("lock_vault", json!({ "namespace": "mock" }));
+        assert_eq!(locked["result"], json!({ "ok": true }), "{locked}");
+        begin_thread.join().expect("begin thread")
+    });
+
+    assert_eq!(error_message(&begun), "VAULT_LOCKED", "{begun}");
+    assert!(begun.get("result").is_none(), "{begun}");
+    let terminated = daemon.wait_for_record_matching("stepwise_terminated", |record| {
+        record["cred_id"] == "mock:site" && record["outcome"] == "lock_vault"
+    });
+    assert_eq!(terminated["cred_id"], "mock:site");
+    daemon.wait_for_shutdowns(1);
+    assert_eq!(daemon.status()["browsers"], 0);
 }
 
 #[test]

@@ -639,6 +639,9 @@ struct DaemonState {
     cookie_store: Arc<cookie_store::CookieStore>,
     /// ハンドオフ前の段階ログインの台帳。
     stepwise: stepwise::Ledger,
+    /// デーモンが停止処理に入った（`accept_connections` を抜けた）ことを示す。
+    /// 停止処理の開始後に登録された段階ログインの `pending` を、登録直後に自ら終了させるために用いる。
+    shutting_down: bool,
     #[cfg(windows)]
     sealed_blob_path: PathBuf,
 }
@@ -1291,6 +1294,9 @@ async fn serve_transport(
     // The daemon is exiting — on a stop request, a termination signal, or a
     // transport failure. Reap every live executor before returning so
     // interrupted sessions do not leave orphaned browser processes behind.
+    // フラグは、この掃討より前に登録された段階ログインの `pending` を確実に拾うため、掃討の直前に立てる。
+    // 掃討より後に登録された `pending` は、登録直後の自己終了判定（`stepwise::register_pending`）が拾う。
+    state.lock().await.shutting_down = true;
     terminate_browsers(&state, drain_browsers(&state, None).await).await;
     stepwise::terminate(&state, None, stepwise::EndReason::Shutdown).await;
     result
@@ -1586,6 +1592,7 @@ async fn build_state(
         mcp_servers,
         cookie_store: Arc::new(cookie_store),
         stepwise,
+        shutting_down: false,
         #[cfg(windows)]
         sealed_blob_path,
     })
@@ -2854,6 +2861,23 @@ async fn resolve_unlocked_credential(
         return Err(ErrorCode::VaultLocked);
     }
     Ok(credential)
+}
+
+/// namespace の資格プロバイダが施錠中かを判定する。プロバイダが見つからなければ施錠中とはしない。
+/// 資格 1 件を解決しない分、`resolve_unlocked_credential` より安価に呼べる。
+async fn namespace_locked(state: &SharedState, namespace: &str) -> bool {
+    let provider = {
+        let daemon = state.lock().await;
+        daemon
+            .providers
+            .iter()
+            .find(|provider| provider.namespace == namespace)
+            .map(|provider| provider.provider.clone())
+    };
+    let Some(provider) = provider else {
+        return false;
+    };
+    provider.lock().await.locked()
 }
 
 async fn authorize_device(
@@ -4471,7 +4495,12 @@ async fn authorize_device_with_executor(
 }
 
 async fn shutdown_authorize_executor(executor: &mut ExecutorHandle) {
-    let id = 2;
+    shutdown_executor_handle(executor, 2).await;
+}
+
+/// `ExecutorHandle` へ `shutdown` を送り、応答を待ったうえで停止する。応答が無ければ強制終了する。
+/// `authorize_device` の使い捨て接続と、段階ログインの `stop_pending` とで共有する手順である。
+async fn shutdown_executor_handle(executor: &mut ExecutorHandle, id: u64) {
     let Ok(mut request) = serde_json::to_vec(&json!({ "op": "shutdown", "id": id })) else {
         return;
     };

@@ -355,8 +355,11 @@ non-value attributes only — no `value` property, `value` attribute, or
 `data-*` attribute of any element is ever serialized, regardless of the
 element's type or visibility. `fill_submit`, the only action that may place
 `{{password}}` or `{{totp}}`, fills and submits as one uninterruptible
-operation and clears what it filled from the DOM before any snapshot is
-built, so a secret is never present in a page the snapshot describes.
+operation and then makes a best-effort attempt to clear what it filled from
+the DOM before any snapshot is built; that clearing can fail silently, and a
+page that copies the filled value into another element before submission is
+outside what it clears. The actual backstop is the snapshot check below, not
+this clearing.
 
 **Every snapshot is checked for a known secret before it leaves the
 boundary.** The full serialization is searched, in raw, HTML-escaped,
@@ -400,8 +403,10 @@ legitimate `login` from one an injected instruction talked the agent into making
 both are the same call for a credential the agent is entitled to use. The answer to
 that is not a better boundary; it is a human.
 
-Setting `approve_cmd` gates every `login`, `authorize_device`,
-`open_api_proxy`, and `open_mcp_server` on an external command. The daemon runs
+Setting `approve_cmd` gates every `login`, `login_begin`, `authorize_device`,
+`open_api_proxy`, and `open_mcp_server` on an external command. `login_step`,
+which continues a login `login_begin` already approved, does not gate again.
+The daemon runs
 it through `sh -c` on the isolated side and reads the exit status as the verdict:
 zero approves, anything else denies with `APPROVAL_DENIED`. A command that has not
 answered within `approve_timeout_secs` — 60 by default — has its whole process
@@ -434,7 +439,7 @@ environment variables:
 | --- | --- |
 | `TEGATA_CRED_ID` | The namespaced credential reference being requested |
 | `TEGATA_TARGET_URL` | The login destination, for `authorize_device` the verification URL with its query, fragment, and userinfo removed, for `open_api_proxy` the API proxy's upstream, or for `open_mcp_server` `mcp:<name>` |
-| `TEGATA_METHOD` | `login`, `authorize_device`, `open_api_proxy`, or `open_mcp_server` |
+| `TEGATA_METHOD` | `login`, `login_begin`, `authorize_device`, `open_api_proxy`, or `open_mcp_server` |
 | `TEGATA_PEER` | The calling peer's uid, in decimal |
 
 That is enough for a human to make a decision — *which* account, at *which* site,

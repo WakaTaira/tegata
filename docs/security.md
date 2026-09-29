@@ -462,7 +462,7 @@ What an agent cannot forge, on this host, is passage through the administrative
 RPC gate: elevated, a member of the local Administrators group, and not a WSL
 interop caller. That gate already exists to protect `peer issue`, `peer revoke`,
 and `seal`. `approve_operator = true` puts the approval decision behind the same
-gate instead of behind a command. Every `login`, `authorize_device`,
+gate instead of behind a command. Every `login`, `login_begin`, `authorize_device`,
 `open_api_proxy`, and `open_mcp_server` registers a pending approval — at the same point in the call, after the credential is
 confirmed to exist and before any value is resolved — and a human decides it
 from an elevated PowerShell with `tegatad.exe approval list` / `approval allow

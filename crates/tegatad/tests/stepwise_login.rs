@@ -65,7 +65,7 @@ rl.on("line", (line) => {
       }
     };
     if (request.target_url === "http://127.0.0.1/delay") {
-      setTimeout(respond, 300);
+      setTimeout(respond, 2000);
     } else {
       respond();
     }

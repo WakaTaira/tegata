@@ -361,8 +361,10 @@ and no snapshot involved.
 `{ "state": "aborted" }` for `abort` — three shapes in all.
 
 `fill_submit` fills its elements with the same native-setter, no-keystroke
-mechanism as `login`, then submits, then waits to settle (below). Whatever it
-filled is cleared from the DOM afterward regardless of outcome. A
+mechanism as `login`, then submits, then waits to settle (below). It then tries to
+clear whatever it filled from the DOM, regardless of outcome. Clearing is
+best-effort; the guarantee is the snapshot check below, which refuses any
+snapshot that still carries a secret. A
 `SELECTOR_NOT_FOUND` during `fill_submit` leaves the stepwise login open for
 another step; a `FILL_MISMATCH` ends it, the same way a suspected
 secret-misroute ends a `login`. While one `fill_submit` runs, other

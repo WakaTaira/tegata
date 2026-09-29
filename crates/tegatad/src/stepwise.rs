@@ -722,6 +722,7 @@ async fn register_pending(
 
 /// 段階ログインの登録直後に、既に終了対象になっていないかを判定する。
 /// 判定は既存の状態（プロバイダのロック状態、peer 台帳、デーモンの停止フラグ）からのみ行う。
+/// ロック状態は原因を区別しないため、起動中に TTL による自動ロックが起きた場合も `lock_vault` と同じく終了する。
 async fn immediate_end_reason(
     state: &SharedState,
     key: &BrowserKey,

@@ -556,7 +556,7 @@ nothing else is passed — no credential value ever reaches the hook:
 | --- | --- |
 | `TEGATA_CRED_ID` | The namespaced credential reference |
 | `TEGATA_TARGET_URL` | The login destination; the upstream for `open_api_proxy`; `mcp:<name>` for `open_mcp_server` |
-| `TEGATA_METHOD` | The gated method: `login`, `authorize_device`, `open_api_proxy`, or `open_mcp_server` |
+| `TEGATA_METHOD` | The gated method: `login`, `login_begin`, `authorize_device`, `open_api_proxy`, or `open_mcp_server` |
 | `TEGATA_APPROVAL_CODE` | A two-digit number, 10–99, generated per request by the daemon |
 | `TEGATA_APPROVAL_GRANT_TTL_SECS` | The configured approval grant lifetime in seconds |
 | `TEGATA_PEER` | The calling peer: its uid in decimal, or its principal (such as `peer:<id>`) for a token peer |
@@ -579,7 +579,7 @@ user, so an approval prompt is not something the agent can draw, dismiss, or
 answer.
 
 When `approval_grant_ttl_secs` is positive, a successful approval grants the same
-`(principal, credential)` pair access to `login`, `open_api_proxy`,
+`(principal, credential)` pair access to `login`, `login_begin`, `open_api_proxy`,
 `open_mcp_server`, and `authorize_device` for that many seconds from the approval time. The grant expires
 when the TTL elapses, `lock_vault` is called, or the daemon restarts; refusals and
 timeouts never create one. The audit record identifies `approval_grant: "issued"`

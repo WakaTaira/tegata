@@ -2,7 +2,12 @@ import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
-import { loginHandler, openApiProxyHandler } from "./index.js";
+import {
+  loginHandler,
+  loginStepParams,
+  openApiProxyHandler,
+  stepwiseHandler,
+} from "./index.js";
 
 const endpoint = "ws://127.0.0.1:9001/devtools/browser/abc";
 const originalSocket = process.env.TEGATA_SOCKET;
@@ -281,5 +286,380 @@ describe.sequential("open_api_proxy bridge", () => {
     } finally {
       await stopFakeServer(fake.server);
     }
+  });
+});
+
+/** Issue #46: どの method でも同じ結果を返す偽デーモン。呼ばれた method / params を記録する。 */
+async function startFakeStepwiseServer(response: {
+  result?: unknown;
+  error?: { message: string; data?: unknown };
+}) {
+  const socketPath = join(process.cwd(), `.tegata-mcp-${randomUUID()}.sock`);
+  const calls: Array<{ method: string; params: unknown }> = [];
+  const server = createServer((socket) => {
+    let data = "";
+    socket.on("data", (chunk) => {
+      data += chunk.toString();
+      const lineEnd = data.indexOf("\n");
+      if (lineEnd === -1) return;
+      const request = JSON.parse(data.slice(0, lineEnd)) as {
+        method: string;
+        params?: unknown;
+      };
+      calls.push({ method: request.method, params: request.params });
+      const wire =
+        response.error === undefined
+          ? { jsonrpc: "2.0", id: 1, result: response.result }
+          : {
+              jsonrpc: "2.0",
+              id: 1,
+              error: { code: -32000, ...response.error },
+            };
+      socket.write(`${JSON.stringify(wire)}\n`);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  process.env.TEGATA_SOCKET = socketPath;
+  return { server, calls };
+}
+
+/**
+ * Issue #46: 段階ログインの bridge 経路を検証する偽デーモン。1 回目は
+ * `firstMethod`（`login_begin` / `login_step`）に `doneResult` を返し、bridge
+ * 有効時にのみ来る 2 回目の `bridge_open_tunnel` に応答する。
+ */
+async function startFakeStepwiseBridgeServer(
+  firstMethod: "login_begin" | "login_step",
+  doneResult: unknown,
+  bridgeError = false,
+) {
+  const socketPath = join(process.cwd(), `.tegata-mcp-${randomUUID()}.sock`);
+  const calls: Array<{ method: string; params: unknown }> = [];
+  let first = true;
+  const server = createServer((socket) => {
+    let data = "";
+    socket.on("data", (chunk) => {
+      data += chunk.toString();
+      const lineEnd = data.indexOf("\n");
+      if (lineEnd === -1) return;
+      const request = JSON.parse(data.slice(0, lineEnd)) as {
+        method: string;
+        params?: unknown;
+      };
+      calls.push({ method: request.method, params: request.params });
+      const response = first
+        ? { jsonrpc: "2.0", id: 1, result: doneResult }
+        : bridgeError
+          ? {
+              jsonrpc: "2.0",
+              id: 1,
+              error: { code: -32000, message: "FORBIDDEN" },
+            }
+          : { jsonrpc: "2.0", id: 1, result: { local_port: 4242 } };
+      if (first) expect(request.method).toBe(firstMethod);
+      else expect(request.method).toBe("bridge_open_tunnel");
+      first = false;
+      socket.write(`${JSON.stringify(response)}\n`);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+  process.env.TEGATA_SOCKET = socketPath;
+  return { server, calls };
+}
+
+describe.sequential("login_begin / login_step forwarding", () => {
+  test("forwards login_begin params and the pending result unchanged", async () => {
+    const pending = {
+      state: "pending",
+      login_id: "l1",
+      snapshot: { url: "https://example.test", elements: [] },
+    };
+    const fake = await startFakeStepwiseServer({ result: pending });
+    try {
+      const params = {
+        cred_id: "mock:site",
+        target_url: "https://example.test/login",
+        success_selector: "#signed-in",
+      };
+      const result = await stepwiseHandler("login_begin", params);
+      expect(fake.calls).toEqual([{ method: "login_begin", params }]);
+      expect(result).toEqual({
+        content: [{ type: "text", text: JSON.stringify(pending) }],
+      });
+    } finally {
+      await stopFakeServer(fake.server);
+    }
+  });
+
+  test("forwards login_step's done result unchanged when bridge mode is disabled", async () => {
+    const done = {
+      state: "done",
+      session_id: "s1",
+      channel: { kind: "cdp", endpoint },
+    };
+    const fake = await startFakeStepwiseServer({ result: done });
+    delete process.env.TEGATA_BRIDGE;
+    try {
+      const params = {
+        login_id: "l1",
+        action: "fill_submit",
+        fills: [{ selector: "#password", value: "{{password}}" }],
+        submit: { click: "#submit" },
+      };
+      const result = await stepwiseHandler("login_step", params);
+      expect(fake.calls).toEqual([{ method: "login_step", params }]);
+      expect(result).toEqual({
+        content: [{ type: "text", text: JSON.stringify(done) }],
+      });
+    } finally {
+      await stopFakeServer(fake.server);
+    }
+  });
+
+  test("rewrites the endpoint of a login_step done result through the bridge", async () => {
+    const done = {
+      state: "done",
+      session_id: "s1",
+      target_id: "t1",
+      channel: { kind: "cdp", endpoint },
+    };
+    const fake = await startFakeStepwiseBridgeServer("login_step", done);
+    process.env.TEGATA_BRIDGE = "1";
+    try {
+      const result = await stepwiseHandler("login_step", {
+        login_id: "l1",
+        action: "fill_submit",
+        fills: [{ selector: "#otp", value: "{{totp}}" }],
+        submit: { click: "#verify" },
+      });
+      expect(fake.calls).toEqual([
+        {
+          method: "login_step",
+          params: {
+            login_id: "l1",
+            action: "fill_submit",
+            fills: [{ selector: "#otp", value: "{{totp}}" }],
+            submit: { click: "#verify" },
+          },
+        },
+        {
+          method: "bridge_open_tunnel",
+          params: { session_id: "s1", port: 9001 },
+        },
+      ]);
+      expect(result).toEqual({
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              state: "done",
+              session_id: "s1",
+              target_id: "t1",
+              channel: {
+                kind: "cdp",
+                endpoint: "ws://127.0.0.1:4242/devtools/browser/abc",
+              },
+            }),
+          },
+        ],
+      });
+    } finally {
+      await stopFakeServer(fake.server);
+    }
+  });
+
+  test("rewrites the endpoint of a login_begin done result through the bridge", async () => {
+    const done = {
+      state: "done",
+      session_id: "s2",
+      channel: { kind: "cdp", endpoint },
+    };
+    const fake = await startFakeStepwiseBridgeServer("login_begin", done);
+    process.env.TEGATA_BRIDGE = "1";
+    try {
+      const result = await stepwiseHandler("login_begin", {
+        cred_id: "mock:site",
+        target_url: "https://example.test/login",
+        success_selector: "#signed-in",
+      });
+      expect(result).toEqual({
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              state: "done",
+              session_id: "s2",
+              channel: {
+                kind: "cdp",
+                endpoint: "ws://127.0.0.1:4242/devtools/browser/abc",
+              },
+            }),
+          },
+        ],
+      });
+    } finally {
+      await stopFakeServer(fake.server);
+    }
+  });
+
+  test("returns the bridge error code for a login_step done result", async () => {
+    const done = {
+      state: "done",
+      session_id: "s1",
+      channel: { kind: "cdp", endpoint },
+    };
+    const fake = await startFakeStepwiseBridgeServer("login_step", done, true);
+    process.env.TEGATA_BRIDGE = "1";
+    try {
+      const result = await stepwiseHandler("login_step", {
+        login_id: "l1",
+        action: "snapshot",
+      });
+      expect(result).toEqual({
+        isError: true,
+        content: [{ type: "text", text: "FORBIDDEN" }],
+      });
+    } finally {
+      await stopFakeServer(fake.server);
+    }
+  });
+
+  test("does not open a bridge tunnel for a pending or aborted result", async () => {
+    const pending = {
+      state: "pending",
+      login_id: "l1",
+      snapshot: { url: "https://example.test", elements: [] },
+    };
+    const fake = await startFakeStepwiseServer({ result: pending });
+    process.env.TEGATA_BRIDGE = "1";
+    try {
+      const result = await stepwiseHandler("login_step", {
+        login_id: "l1",
+        action: "snapshot",
+      });
+      expect(fake.calls).toHaveLength(1);
+      expect(result).toEqual({
+        content: [{ type: "text", text: JSON.stringify(pending) }],
+      });
+
+      const aborted = { state: "aborted" };
+      const fake2 = await startFakeStepwiseServer({ result: aborted });
+      try {
+        const abortedResult = await stepwiseHandler("login_step", {
+          login_id: "l1",
+          action: "abort",
+        });
+        expect(fake2.calls).toHaveLength(1);
+        expect(abortedResult).toEqual({
+          content: [{ type: "text", text: JSON.stringify(aborted) }],
+        });
+      } finally {
+        await stopFakeServer(fake2.server);
+      }
+    } finally {
+      delete process.env.TEGATA_BRIDGE;
+      await stopFakeServer(fake.server);
+    }
+  });
+
+  test("relays SNAPSHOT_REJECTED from the daemon", async () => {
+    const fake = await startFakeStepwiseServer({
+      error: { message: "SNAPSHOT_REJECTED" },
+    });
+    delete process.env.TEGATA_BRIDGE;
+    try {
+      const result = await stepwiseHandler("login_step", {
+        login_id: "l1",
+        action: "snapshot",
+      });
+      expect(result).toEqual({
+        isError: true,
+        content: [{ type: "text", text: "SNAPSHOT_REJECTED" }],
+      });
+    } finally {
+      await stopFakeServer(fake.server);
+    }
+  });
+});
+
+describe("login_step input schema", () => {
+  test("accepts one instance of each action shape", () => {
+    const valid = [
+      { login_id: "l1", action: "click", selector: "#a" },
+      { login_id: "l1", action: "wait_for", selector: "#a" },
+      { login_id: "l1", action: "fill", selector: "#a", value: "{{username}}" },
+      {
+        login_id: "l1",
+        action: "fill_submit",
+        fills: [{ selector: "#p", value: "{{password}}" }],
+        submit: { click: "#submit" },
+      },
+      {
+        login_id: "l1",
+        action: "fill_submit",
+        fills: [{ selector: "#o", value: "{{totp}}" }],
+        submit: { press_enter: "#o" },
+      },
+      { login_id: "l1", action: "snapshot" },
+      { login_id: "l1", action: "abort" },
+    ];
+    for (const candidate of valid) {
+      expect(
+        loginStepParams.safeParse(candidate).success,
+        JSON.stringify(candidate),
+      ).toBe(true);
+    }
+  });
+
+  test("rejects a lone fill of {{password}} or {{totp}}", () => {
+    expect(
+      loginStepParams.safeParse({
+        login_id: "l1",
+        action: "fill",
+        selector: "#p",
+        value: "{{password}}",
+      }).success,
+    ).toBe(false);
+    expect(
+      loginStepParams.safeParse({
+        login_id: "l1",
+        action: "fill",
+        selector: "#o",
+        value: "{{totp}}",
+      }).success,
+    ).toBe(false);
+  });
+
+  test("rejects a fill_submit fill with a non-placeholder value", () => {
+    expect(
+      loginStepParams.safeParse({
+        login_id: "l1",
+        action: "fill_submit",
+        fills: [{ selector: "#p", value: "hunter2" }],
+        submit: { click: "#submit" },
+      }).success,
+    ).toBe(false);
+  });
+
+  test("rejects fill_submit with more than three fills", () => {
+    expect(
+      loginStepParams.safeParse({
+        login_id: "l1",
+        action: "fill_submit",
+        fills: [
+          { selector: "#a", value: "{{username}}" },
+          { selector: "#b", value: "{{password}}" },
+          { selector: "#c", value: "{{totp}}" },
+          { selector: "#d", value: "{{username}}" },
+        ],
+        submit: { click: "#submit" },
+      }).success,
+    ).toBe(false);
+  });
+
+  test("rejects an unknown action", () => {
+    expect(
+      loginStepParams.safeParse({ login_id: "l1", action: "type" }).success,
+    ).toBe(false);
   });
 });

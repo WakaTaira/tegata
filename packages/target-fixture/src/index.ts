@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { createHmac, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
   createServer,
@@ -53,6 +53,34 @@ const issuedDeviceCookies: string[] = [];
 const issuedSidCookies: string[] = [];
 const persistentCookieRequests: RecordedRequest[] = [];
 let persistentCookieLoginPosts = 0;
+
+// State of the /stepwise/ login sites (Issue #46). Every recorded field value
+// is masked by `maskStepwiseValue`, so the state never carries a credential.
+interface StepwiseFlow {
+  passwordOk: boolean;
+}
+interface StepwisePost {
+  path: string;
+  kind: string | null;
+  fields: Record<string, string>;
+}
+interface StepwiseInput {
+  path: string;
+  field: string;
+  value: string;
+}
+interface StepwiseStickyReport {
+  when: string;
+  target: string;
+  password_length: number;
+}
+const stepwiseFlows = new Map<string, StepwiseFlow>();
+const stepwiseSessions = new Set<string>();
+const stepwiseRequests: Array<{ method: string; path: string }> = [];
+const stepwisePosts: StepwisePost[] = [];
+const stepwiseInputs: StepwiseInput[] = [];
+const stepwiseTotp: Array<{ code: string; valid: boolean }> = [];
+const stepwiseStickyReports: StepwiseStickyReport[] = [];
 
 function usageError(message: string): never {
   throw new Error(message);
@@ -525,6 +553,479 @@ function handlePersistentCookieRequest(
   return true;
 }
 
+/** Value attribute of a visible checkbox on the stepwise username page. */
+const STEPWISE_VALUE_MARKER = "stepwise-value-attribute-marker";
+const STEPWISE_ECHO_KINDS = ["text", "attr", "query"] as const;
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+/**
+ * Mask a submitted value for the recorded state: credential values become
+ * markers and anything else becomes its sha256, so `/stepwise/state` never
+ * carries a secret.
+ */
+function maskStepwiseValue(value: string, credentials: Credentials): string {
+  if (value === "") return "<empty>";
+  if (value === credentials.username) return "<username>";
+  if (value === credentials.password) return "<password>";
+  if (
+    credentials.totp_seed !== undefined &&
+    validTotp(credentials.totp_seed, value)
+  )
+    return "<totp>";
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+// input イベントを同期要求で報告する。executor の fill が戻る前に、欄へ入った値を fixture に
+// 届けるためである。値は fixture 側で伏せて記録する。
+const STEPWISE_INPUT_REPORTER = `<script>
+document.addEventListener("input", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement)) return;
+  const request = new XMLHttpRequest();
+  request.open("POST", "/stepwise/input", false);
+  request.setRequestHeader("Content-Type", "application/json");
+  request.send(JSON.stringify({
+    path: location.pathname,
+    field: target.name || target.id,
+    value: target.value
+  }));
+}, true);
+</script>`;
+
+function stepwisePage(title: string, body: string): string {
+  return `<!doctype html>
+<html lang="en">
+<head><title>${title}</title></head>
+<body>
+${body}
+${STEPWISE_INPUT_REPORTER}
+</body>
+</html>`;
+}
+
+function stepwiseError(message: string | undefined): string {
+  return message === undefined ? "" : `<div id="login-error">${message}</div>`;
+}
+
+function stepwiseUsernamePage(error?: string): string {
+  return stepwisePage(
+    "Sign in",
+    `<h1>Sign in</h1>
+${stepwiseError(error)}
+<form method="POST" action="/stepwise/username">
+<label for="username">Username or email address</label>
+<input id="username" name="username" type="text" autocomplete="username">
+<label><input id="remember" name="remember" type="checkbox" value="${STEPWISE_VALUE_MARKER}"> Remember me</label>
+<button id="next" type="submit">Next</button>
+</form>`,
+  );
+}
+
+function stepwisePasswordPage(error?: string): string {
+  return stepwisePage(
+    "Enter your password",
+    `<h1>Enter your password</h1>
+${stepwiseError(error)}
+<form method="POST" action="/stepwise/password">
+<label for="password">Password</label>
+<input id="password" name="password" type="password" autocomplete="current-password">
+<button id="sign-in" type="submit">Sign in</button>
+</form>`,
+  );
+}
+
+function stepwisePushPage(): string {
+  return stepwisePage(
+    "Two-factor authentication",
+    `<h1>Two-factor authentication</h1>
+<p>Waiting for approval on your mobile device.</p>
+<button type="button">More options</button>
+<div id="other-methods" hidden>
+<a href="/stepwise/2fa/app">Use your authenticator app</a>
+</div>
+<script>
+document.querySelector("button")?.addEventListener("click", () => {
+  const methods = document.getElementById("other-methods");
+  if (methods !== null) methods.hidden = false;
+});
+</script>`,
+  );
+}
+
+function stepwiseAppPage(error?: string): string {
+  return stepwisePage(
+    "Authenticator app",
+    `<h1>Authenticator app</h1>
+${stepwiseError(error)}
+<form method="POST" action="/stepwise/2fa/app">
+<label for="otp">Authentication code</label>
+<input id="otp" name="otp" type="text" inputmode="numeric" autocomplete="one-time-code">
+<button id="verify" type="submit">Verify</button>
+</form>`,
+  );
+}
+
+function stepwiseHomePage(username: string): string {
+  return stepwisePage(
+    "Home",
+    `<h1>Home</h1>
+<div id="signed-in">Signed in as ${escapeHtml(username)}</div>
+<a href="/stepwise/home">Dashboard</a>`,
+  );
+}
+
+function stepwiseEchoForm(kind: string): string {
+  return stepwisePage(
+    "Sign in",
+    `<h1>Sign in</h1>
+<form method="POST" action="/stepwise/echo/login?kind=${kind}">
+<input id="username" name="username" type="text" autocomplete="username">
+<input id="password" name="password" type="password" autocomplete="current-password">
+<button id="submit" type="submit">Sign in</button>
+</form>`,
+  );
+}
+
+function stepwiseStickyPage(): string {
+  return stepwisePage(
+    "Sign in",
+    `<h1>Sign in</h1>
+<form id="sticky-form">
+<input id="username" name="username" type="text" autocomplete="username">
+<input id="password" name="password" type="password" autocomplete="current-password">
+<button id="submit" type="submit">Sign in</button>
+</form>
+<button id="help" type="button">Help</button>
+<div id="status"></div>
+<script>
+const stickyPassword = document.getElementById("password");
+// 同期要求で報告する。クリックの処理が進む前に、その時点の password 欄の値の長さを
+// fixture に届けるためである。
+const reportSticky = (when, target) => {
+  const request = new XMLHttpRequest();
+  request.open("POST", "/stepwise/sticky/report", false);
+  request.setRequestHeader("Content-Type", "application/json");
+  request.send(JSON.stringify({
+    when,
+    target,
+    password_length: stickyPassword?.value.length ?? 0
+  }));
+};
+document.addEventListener("click", (event) => {
+  const target = event.target;
+  reportSticky("click", target instanceof Element ? target.id || target.tagName : "");
+}, true);
+document.getElementById("sticky-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const body = new URLSearchParams(new FormData(event.currentTarget));
+  const response = await fetch("/stepwise/sticky/login", { method: "POST", body });
+  const result = await response.json();
+  const status = document.getElementById("status");
+  if (status === null) return;
+  if (result.ok === true) {
+    status.innerHTML = '<div id="welcome">Signed in</div>';
+    return;
+  }
+  // 誤った password の欄の値はそのまま残し、エラー表示だけを描き直す。
+  status.innerHTML = '<div id="login-error">Incorrect password</div>';
+  reportSticky("rerender", "status");
+});
+</script>`,
+  );
+}
+
+function recordStepwisePost(
+  path: string,
+  kind: string | null,
+  form: URLSearchParams,
+  credentials: Credentials,
+): void {
+  const fields: Record<string, string> = {};
+  for (const [name, value] of form) {
+    fields[name] = maskStepwiseValue(value, credentials);
+  }
+  stepwisePosts.push({ path, kind, fields });
+}
+
+function stepwiseFlowFrom(request: IncomingMessage): StepwiseFlow | undefined {
+  const id = cookiesFrom(request).get("stepwise_flow");
+  return id === undefined ? undefined : stepwiseFlows.get(id);
+}
+
+function hasStepwiseSession(request: IncomingMessage): boolean {
+  const session = cookiesFrom(request).get("stepwise_session");
+  return session !== undefined && stepwiseSessions.has(session);
+}
+
+function redirect(response: ServerResponse, location: string): void {
+  response.writeHead(303, { Location: location });
+  response.end();
+}
+
+function handleStepwiseUsername(
+  request: IncomingMessage,
+  response: ServerResponse,
+  credentials: Credentials,
+): void {
+  readRequestBody(request, (body) => {
+    const form = new URLSearchParams(body);
+    recordStepwisePost("/stepwise/username", null, form, credentials);
+    if (form.get("username") !== credentials.username) {
+      writePage(response, stepwiseUsernamePage("Unknown user"));
+      return;
+    }
+    const flow = randomBytes(16).toString("hex");
+    stepwiseFlows.set(flow, { passwordOk: false });
+    writePage(response, stepwisePasswordPage(), {
+      "Set-Cookie": `stepwise_flow=${flow}; HttpOnly; Path=/stepwise; SameSite=Lax`,
+    });
+  });
+}
+
+function handleStepwisePassword(
+  request: IncomingMessage,
+  response: ServerResponse,
+  credentials: Credentials,
+): void {
+  const flow = stepwiseFlowFrom(request);
+  readRequestBody(request, (body) => {
+    const form = new URLSearchParams(body);
+    recordStepwisePost("/stepwise/password", null, form, credentials);
+    if (flow === undefined) {
+      redirect(response, "/stepwise/");
+      return;
+    }
+    if (form.get("password") !== credentials.password) {
+      writePage(response, stepwisePasswordPage("Incorrect password"));
+      return;
+    }
+    flow.passwordOk = true;
+    writePage(response, stepwisePushPage());
+  });
+}
+
+function handleStepwiseTotp(
+  request: IncomingMessage,
+  response: ServerResponse,
+  credentials: Credentials,
+): void {
+  const flow = stepwiseFlowFrom(request);
+  readRequestBody(request, (body) => {
+    const form = new URLSearchParams(body);
+    recordStepwisePost("/stepwise/2fa/app", null, form, credentials);
+    if (flow?.passwordOk !== true) {
+      redirect(response, "/stepwise/");
+      return;
+    }
+    const code = form.get("otp") ?? "";
+    const valid =
+      credentials.totp_seed !== undefined &&
+      validTotp(credentials.totp_seed, code);
+    stepwiseTotp.push({ code, valid });
+    if (!valid) {
+      writePage(response, stepwiseAppPage("Invalid code"));
+      return;
+    }
+    const session = randomBytes(32).toString("hex");
+    stepwiseSessions.add(session);
+    response.writeHead(303, {
+      Location: "/stepwise/home",
+      "Set-Cookie": `stepwise_session=${session}; Max-Age=86400; HttpOnly; Path=/stepwise; SameSite=Lax`,
+    });
+    response.end();
+  });
+}
+
+function handleStepwiseEcho(
+  request: IncomingMessage,
+  response: ServerResponse,
+  credentials: Credentials,
+  kind: string,
+): void {
+  readRequestBody(request, (body) => {
+    const form = new URLSearchParams(body);
+    recordStepwisePost("/stepwise/echo/login", kind, form, credentials);
+    const password = form.get("password") ?? "";
+    if (kind === "text") {
+      writePage(
+        response,
+        stepwisePage(
+          "Welcome",
+          `<p id="echo">You entered: ${escapeHtml(password)}</p>`,
+        ),
+      );
+    } else if (kind === "attr") {
+      writePage(
+        response,
+        stepwisePage(
+          "Welcome",
+          `<button id="echo" type="button" aria-label="${escapeHtml(password)}">Continue</button>`,
+        ),
+      );
+    } else {
+      redirect(
+        response,
+        `/stepwise/echo/result?kind=query&password=${encodeURIComponent(password)}`,
+      );
+    }
+  });
+}
+
+function handleStepwiseSticky(
+  request: IncomingMessage,
+  response: ServerResponse,
+  credentials: Credentials,
+): void {
+  readRequestBody(request, (body) => {
+    const form = new URLSearchParams(body);
+    recordStepwisePost("/stepwise/sticky/login", null, form, credentials);
+    writeJson(response, 200, {
+      ok:
+        form.get("username") === credentials.username &&
+        form.get("password") === credentials.password,
+    });
+  });
+}
+
+function recordStepwiseJson(
+  request: IncomingMessage,
+  response: ServerResponse,
+  record: (value: Record<string, unknown>) => boolean,
+): void {
+  readRequestBody(request, (body) => {
+    try {
+      const value = JSON.parse(body) as Record<string, unknown>;
+      if (typeof value !== "object" || value === null || !record(value)) {
+        writeJson(response, 400, { error: "invalid_report" });
+        return;
+      }
+      writeJson(response, 200, { ok: true });
+    } catch {
+      writeJson(response, 400, { error: "invalid_report" });
+    }
+  });
+}
+
+function stepwiseStateBody(): Record<string, unknown> {
+  return {
+    requests: stepwiseRequests,
+    posts: stepwisePosts,
+    inputs: stepwiseInputs,
+    totp: stepwiseTotp,
+    sticky_reports: stepwiseStickyReports,
+  };
+}
+
+/** Test-only endpoints of the stepwise sites (state and in-page reports). */
+function handleStepwiseControl(
+  route: string,
+  request: IncomingMessage,
+  response: ServerResponse,
+  credentials: Credentials,
+): boolean {
+  if (route === "GET /stepwise/state") {
+    writeJson(response, 200, stepwiseStateBody());
+  } else if (route === "POST /stepwise/input") {
+    recordStepwiseJson(request, response, (value) => {
+      if (
+        typeof value.path !== "string" ||
+        typeof value.field !== "string" ||
+        typeof value.value !== "string"
+      )
+        return false;
+      stepwiseInputs.push({
+        path: value.path,
+        field: value.field,
+        value: maskStepwiseValue(value.value, credentials),
+      });
+      return true;
+    });
+  } else if (route === "POST /stepwise/sticky/report") {
+    recordStepwiseJson(request, response, (value) => {
+      if (
+        typeof value.when !== "string" ||
+        typeof value.target !== "string" ||
+        typeof value.password_length !== "number"
+      )
+        return false;
+      stepwiseStickyReports.push({
+        when: value.when,
+        target: value.target,
+        password_length: value.password_length,
+      });
+      return true;
+    });
+  } else {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Stepwise login sites (Issue #46): (1) username -> password -> 2FA push
+ * page with "More options" -> authenticator app -> signed-in page, (2) echo
+ * pages that reflect the submitted password into text, an attribute, or the
+ * URL query (`?kind=`), (3) a page that keeps a wrong password in its field
+ * and reports the field on every click. Returns false for other requests.
+ */
+function handleStepwiseRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  credentials: Credentials,
+): boolean {
+  const url = new URL(request.url ?? "/", "http://127.0.0.1");
+  if (!url.pathname.startsWith("/stepwise/")) return false;
+  const route = `${request.method} ${url.pathname}`;
+  if (handleStepwiseControl(route, request, response, credentials)) return true;
+  stepwiseRequests.push({ method: request.method ?? "", path: url.pathname });
+  const kind = url.searchParams.get("kind") ?? "";
+  const echoKind = (STEPWISE_ECHO_KINDS as readonly string[]).includes(kind);
+  if (route === "GET /stepwise/") {
+    writePage(
+      response,
+      hasStepwiseSession(request)
+        ? stepwiseHomePage(credentials.username)
+        : stepwiseUsernamePage(),
+    );
+  } else if (route === "POST /stepwise/username") {
+    handleStepwiseUsername(request, response, credentials);
+  } else if (route === "POST /stepwise/password") {
+    handleStepwisePassword(request, response, credentials);
+  } else if (route === "GET /stepwise/2fa/app") {
+    if (stepwiseFlowFrom(request)?.passwordOk === true)
+      writePage(response, stepwiseAppPage());
+    else redirect(response, "/stepwise/");
+  } else if (route === "POST /stepwise/2fa/app") {
+    handleStepwiseTotp(request, response, credentials);
+  } else if (route === "GET /stepwise/home") {
+    if (hasStepwiseSession(request))
+      writePage(response, stepwiseHomePage(credentials.username));
+    else redirect(response, "/stepwise/");
+  } else if (route === "GET /stepwise/echo/" && echoKind) {
+    writePage(response, stepwiseEchoForm(kind));
+  } else if (route === "POST /stepwise/echo/login" && echoKind) {
+    handleStepwiseEcho(request, response, credentials, kind);
+  } else if (route === "GET /stepwise/echo/result") {
+    writePage(response, stepwisePage("Done", '<p id="echo">Thanks</p>'));
+  } else if (route === "GET /stepwise/sticky/") {
+    writePage(response, stepwiseStickyPage());
+  } else if (route === "POST /stepwise/sticky/login") {
+    handleStepwiseSticky(request, response, credentials);
+  } else {
+    response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+    response.end("not found");
+  }
+  return true;
+}
+
 function devicePage(): string {
   return `<!doctype html>
 <html lang="en">
@@ -955,6 +1456,8 @@ function handleRequest(
   if (handleOAuthRequest(request, response)) return;
 
   if (handlePersistentCookieRequest(request, response, credentials)) return;
+
+  if (handleStepwiseRequest(request, response, credentials)) return;
 
   if (request.method === "POST" && request.url === "/device/issue") {
     const userCode = newDeviceCode();

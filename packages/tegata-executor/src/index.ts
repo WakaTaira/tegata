@@ -9,7 +9,9 @@ import { fileURLToPath } from "node:url";
 import {
   type Browser,
   type BrowserContext,
+  type CDPSession,
   chromium,
+  type ElementHandle,
   type Locator,
   type Page,
 } from "playwright-core";
@@ -40,6 +42,20 @@ import {
   type TokenSet,
   tokenPollDeadline,
 } from "./oauth.js";
+import {
+  buildSnapshotInPage,
+  finalizeSnapshot,
+  PAGE_SNAPSHOT_LIMITS,
+  type Snapshot,
+  SnapshotRejectedError,
+} from "./snapshot.js";
+import {
+  clearFilledFields,
+  disposeHandles,
+  sanitizeRawSnapshot,
+  settlePage,
+  trackNavigation,
+} from "./stepwise.js";
 
 type FillStep = {
   action: "fill";
@@ -161,6 +177,36 @@ type McpServerStartRequest = {
 
 type McpServerStopRequest = { op: "mcp_server_stop"; id?: RequestId };
 
+type LoginBeginRequest = {
+  op: "login_begin";
+  id?: RequestId;
+  target_url: string;
+  success_selector: string;
+  failure_selector: string | null;
+  cookies: Cookie[] | null;
+  secret: { username: string; password: string };
+};
+
+type StepwiseFill = { selector: string; value: FillStep["value"] };
+
+type StepwiseSubmit = { click: string } | { press_enter: string };
+
+type StepwiseAction =
+  | ClickStep
+  | WaitForStep
+  | { action: "fill"; selector: string; value: "{{username}}" }
+  | { action: "fill_submit"; fills: StepwiseFill[]; submit: StepwiseSubmit }
+  | { action: "snapshot" }
+  | { action: "abort" };
+
+type LoginStepRequest = {
+  op: "login_step";
+  id?: RequestId;
+  action: StepwiseAction;
+  // デーモンは fill_submit に {{totp}} が含まれる場合にのみ現在のコードを渡す。
+  totp: string | null;
+};
+
 type Request =
   | LoginRequest
   | AuthorizeDeviceRequest
@@ -171,6 +217,8 @@ type Request =
   | ApiProxyStopRequest
   | McpServerStartRequest
   | McpServerStopRequest
+  | LoginBeginRequest
+  | LoginStepRequest
   | { op: "hello"; id?: RequestId }
   | { op: "shutdown"; id?: RequestId };
 
@@ -185,6 +233,7 @@ type ErrorCode =
   | "DEVICE_CODE_REJECTED"
   | "LOGIN_RESULT_TIMEOUT"
   | "OAUTH_GRANT_FAILED"
+  | "SNAPSHOT_REJECTED"
   | "INTERNAL";
 
 export class SelectorNotFoundError extends Error {
@@ -213,7 +262,9 @@ type DiagnosticRequest =
   | LoginRequest
   | AuthorizeDeviceRequest
   | ApiProxyStartRequest
-  | McpServerStartRequest;
+  | McpServerStartRequest
+  | LoginBeginRequest
+  | LoginStepRequest;
 
 /** 診断行から置換する秘密の候補。未設定の値（null・undefined・空文字）は無視される。 */
 type SecretCandidates = Array<string | null | undefined>;
@@ -266,6 +317,15 @@ function requestSecrets(request: DiagnosticRequest): SecretCandidates {
           request.oauth.secret.totp,
         ]
       : [request.header_value];
+  }
+  // login_step の要求が持つ秘密は TOTP のコードのみであり、段階ログインの資格は呼び出し側が実行時の秘密として渡す。
+  if (request.op === "login_step") return [request.totp];
+  if (request.op === "login_begin") {
+    return [
+      request.secret.username,
+      request.secret.password,
+      ...(request.cookies ?? []).map((cookie) => cookie.value),
+    ];
   }
   const loginSecrets = [
     request.secret.username,
@@ -338,7 +398,9 @@ export function classifyError(
           ? "MFA_REQUIRED"
           : error instanceof LoginResultTimeoutError
             ? "LOGIN_RESULT_TIMEOUT"
-            : "INTERNAL";
+            : error instanceof SnapshotRejectedError
+              ? "SNAPSHOT_REJECTED"
+              : "INTERNAL";
 }
 
 type ClassifiedExecutionError = {
@@ -399,6 +461,8 @@ let activeMcpStart: Promise<void> | undefined;
 let activeOAuthStart:
   | { controller: AbortController; done: Promise<void> }
   | undefined;
+// ハンドオフ前の段階ログイン。ハンドオフ・終了・後始末で undefined に戻す。
+let activeStepwise: StepwiseSession | undefined;
 let shuttingDown = false;
 
 type CdpMessage = {
@@ -896,6 +960,109 @@ function parseCookies(value: unknown, id?: RequestId): Cookie[] | null {
   });
 }
 
+// fill_submit の 1 回に入れられる欄の上限。
+const MAX_STEPWISE_FILLS = 3;
+
+function parseLoginBegin(
+  value: Record<string, unknown>,
+  id?: RequestId,
+): LoginBeginRequest {
+  const secret = value.secret;
+  if (
+    typeof value.target_url !== "string" ||
+    typeof value.success_selector !== "string" ||
+    !isOptionalNullableString(value.failure_selector) ||
+    !isRecord(secret) ||
+    typeof secret.username !== "string" ||
+    typeof secret.password !== "string"
+  ) {
+    throw new InvalidRequestError(id);
+  }
+  return {
+    op: "login_begin",
+    id,
+    target_url: value.target_url,
+    success_selector: value.success_selector,
+    failure_selector: value.failure_selector ?? null,
+    cookies: parseCookies(value.cookies, id),
+    secret: { username: secret.username, password: secret.password },
+  };
+}
+
+function parseStepwiseFills(value: unknown, id?: RequestId): StepwiseFill[] {
+  if (
+    !Array.isArray(value) ||
+    value.length < 1 ||
+    value.length > MAX_STEPWISE_FILLS
+  ) {
+    throw new InvalidRequestError(id);
+  }
+  return value.map((fill): StepwiseFill => {
+    if (
+      !isRecord(fill) ||
+      typeof fill.selector !== "string" ||
+      !isSecretPlaceholder(fill.value)
+    ) {
+      throw new InvalidRequestError(id);
+    }
+    return { selector: fill.selector, value: fill.value };
+  });
+}
+
+/** click と press_enter のどちらか一方のみを受け付ける。 */
+function parseStepwiseSubmit(value: unknown, id?: RequestId): StepwiseSubmit {
+  if (!isRecord(value)) throw new InvalidRequestError(id);
+  const hasClick = value.click !== undefined;
+  const hasPressEnter = value.press_enter !== undefined;
+  if (hasClick && !hasPressEnter && typeof value.click === "string") {
+    return { click: value.click };
+  }
+  if (hasPressEnter && !hasClick && typeof value.press_enter === "string") {
+    return { press_enter: value.press_enter };
+  }
+  throw new InvalidRequestError(id);
+}
+
+/**
+ * 段階ログインの action を検証する。単独の fill は {{username}} のみとし、{{password}} と {{totp}} は
+ * fill_submit の中でのみ受け付ける（MCP のスキーマ・デーモンの検証と同じ二重防御）。
+ */
+function parseStepwiseAction(
+  value: Record<string, unknown>,
+  id?: RequestId,
+): StepwiseAction {
+  const action = value.action;
+  if (action === "snapshot" || action === "abort") return { action };
+  if (action === "fill_submit") {
+    return {
+      action,
+      fills: parseStepwiseFills(value.fills, id),
+      submit: parseStepwiseSubmit(value.submit, id),
+    };
+  }
+  if (typeof value.selector !== "string") throw new InvalidRequestError(id);
+  if (action === "click" || action === "wait_for") {
+    return { action, selector: value.selector };
+  }
+  if (action === "fill" && value.value === "{{username}}") {
+    return { action, selector: value.selector, value: value.value };
+  }
+  throw new InvalidRequestError(id);
+}
+
+function parseLoginStep(
+  value: Record<string, unknown>,
+  id?: RequestId,
+): LoginStepRequest {
+  if (!isOptionalNullableString(value.totp)) throw new InvalidRequestError(id);
+  return {
+    op: "login_step",
+    id,
+    action: parseStepwiseAction(value, id),
+    totp: value.totp ?? null,
+  };
+}
+
 export function parseRequest(line: string): Request {
   let value: unknown;
   try {
@@ -916,6 +1083,8 @@ export function parseRequest(line: string): Request {
   if (value.op === "api_proxy_start") return parseApiProxyStart(value, id);
   if (value.op === "mcp_server_stop") return { op: "mcp_server_stop", id };
   if (value.op === "mcp_server_start") return parseMcpServerStart(value, id);
+  if (value.op === "login_begin") return parseLoginBegin(value, id);
+  if (value.op === "login_step") return parseLoginStep(value, id);
   if (value.op === "release") {
     if (typeof value.target_id !== "string") {
       throw new InvalidRequestError(id);
@@ -2186,6 +2355,301 @@ async function executeLogin(request: LoginRequest): Promise<LoginOutcome> {
   return { endpoint, targetId, cookies, stepsSkipped };
 }
 
+/**
+ * ハンドオフ前の段階ログイン。CDP endpoint はハンドオフまでどの応答にも載せない。
+ * filled は入力した欄であり、失敗時の消去に用いる。
+ */
+type StepwiseSession = {
+  endpoint: string;
+  page: Page;
+  pageSession: CDPSession;
+  targetId: string;
+  browserContextId: string;
+  guard: CdpGuard;
+  successSelector: string;
+  failureSelector: string | null;
+  secret: LoginBeginRequest["secret"];
+  cookieValues: string[];
+  totpCodes: string[];
+  filled: ElementHandle[];
+  guardMonitored: boolean;
+};
+
+type StepwiseOutcome =
+  | { state: "pending"; snapshot: Snapshot }
+  | {
+      state: "done";
+      endpoint: string;
+      target_id: string;
+      cookies: Cookie[];
+      steps_skipped: boolean;
+    }
+  | { state: "aborted" };
+
+// 段階ログインを終了させずに応答するエラー。これ以外のエラーではブラウザを破棄してから応答する。
+const CONTINUABLE_STEPWISE_ERRORS: ReadonlySet<ErrorCode> = new Set([
+  "SELECTOR_NOT_FOUND",
+]);
+
+/** 診断行から置換する段階ログインの秘密（資格・入力した TOTP コード・復元した cookie の値）。 */
+function stepwiseSecrets(session: StepwiseSession): string[] {
+  return [
+    session.secret.username,
+    session.secret.password,
+    ...session.totpCodes,
+    ...session.cookieValues,
+  ];
+}
+
+/** 待機中のブラウザでガードが失われた場合に executor ごと終了させる監視を、1 度だけ張る。 */
+function monitorStepwiseGuard(session: StepwiseSession): void {
+  if (session.guardMonitored) return;
+  session.guardMonitored = true;
+  monitorGuardFailure(session.guard);
+}
+
+/** action を実行し、その後ページが落ち着くのを待つ。落ち着いたかを返す。 */
+async function runWithSettle(
+  session: StepwiseSession,
+  action: () => Promise<unknown>,
+): Promise<boolean> {
+  const { guard, page } = session;
+  const tracker = trackNavigation(page);
+  try {
+    await withGuard(guard, action);
+    return await withGuard(guard, () => settlePage(page, tracker));
+  } finally {
+    tracker.dispose();
+  }
+}
+
+/** success_selector と failure_selector の attach を即時に確認する（待たない）。 */
+async function readStepwiseResult(
+  session: StepwiseSession,
+): Promise<"success" | "failure" | undefined> {
+  const { guard, page, successSelector, failureSelector } = session;
+  if (await withGuard(guard, () => selectorExists(page, successSelector))) {
+    return "success";
+  }
+  if (
+    failureSelector !== null &&
+    (await withGuard(guard, () => selectorExists(page, failureSelector)))
+  ) {
+    return "failure";
+  }
+  return undefined;
+}
+
+async function takeStepwiseSnapshot(
+  session: StepwiseSession,
+  settled: boolean,
+): Promise<Snapshot> {
+  const { guard, page } = session;
+  const raw = await withGuard(guard, () =>
+    page.evaluate(buildSnapshotInPage, PAGE_SNAPSHOT_LIMITS),
+  );
+  return finalizeSnapshot(sanitizeRawSnapshot(raw), page.url(), settled, {
+    username: session.secret.username,
+    password: session.secret.password,
+    totpCodes: session.totpCodes,
+  });
+}
+
+/** 段階ログインを通常のブラウザセッションへ昇格させ、login の成功と同じ形の結果を返す。 */
+async function completeStepwise(
+  session: StepwiseSession,
+  stepsSkipped: boolean,
+): Promise<StepwiseOutcome> {
+  const { guard, page } = session;
+  const context = page.context();
+  await disposeHandles(session.filled);
+  session.filled = [];
+  const cookies = await readContextCookies(guard, context);
+  await session.pageSession.detach().catch(() => undefined);
+  activeStepwise = undefined;
+  activeBrowserContextId = session.browserContextId;
+  activeLoginContext = context;
+  monitorStepwiseGuard(session);
+  guard.assertOpen();
+  return {
+    state: "done",
+    endpoint: session.endpoint,
+    target_id: session.targetId,
+    cookies,
+    steps_skipped: stepsSkipped,
+  };
+}
+
+/**
+ * settle の後の判定。success なら昇格し、failure なら入力した欄を空にして INVALID_CREDENTIAL とし、
+ * どちらでもなければ検査済みのスナップショットを返す。
+ */
+async function concludeStepwise(
+  session: StepwiseSession,
+  settled: boolean,
+  cookiesRestored: boolean,
+): Promise<StepwiseOutcome> {
+  const result = await readStepwiseResult(session);
+  if (result === "success") return completeStepwise(session, cookiesRestored);
+  if (result === "failure") {
+    await clearFilledFields(session.filled);
+    throw new InvalidCredentialError();
+  }
+  const snapshot = await takeStepwiseSnapshot(session, settled);
+  monitorStepwiseGuard(session);
+  return { state: "pending", snapshot };
+}
+
+async function beginStepwise(
+  request: LoginBeginRequest,
+): Promise<StepwiseOutcome> {
+  const { endpoint, page, pageSession, targetId, browserContextId } =
+    await openBrowserPage();
+  const guard = activeGuard;
+  if (guard === undefined) throw new Error("CDP guard is not available");
+  const session: StepwiseSession = {
+    endpoint,
+    page,
+    pageSession,
+    targetId,
+    browserContextId,
+    guard,
+    successSelector: request.success_selector,
+    failureSelector: request.failure_selector,
+    secret: request.secret,
+    cookieValues: (request.cookies ?? []).map((cookie) => cookie.value),
+    totpCodes: [],
+    filled: [],
+    guardMonitored: false,
+  };
+  activeStepwise = session;
+  const restored = await restoreCookies(
+    guard,
+    page.context(),
+    request.cookies ?? [],
+  );
+  const settled = await runWithSettle(session, () =>
+    page.goto(request.target_url, { waitUntil: "commit" }),
+  );
+  return concludeStepwise(session, settled, restored > 0);
+}
+
+/** 可視になった欄を記録してから #43 の fillLocator で値を入れる。 */
+async function fillStepwiseField(
+  session: StepwiseSession,
+  selector: string,
+  value: string,
+  passwordOnly: boolean,
+  filled: ElementHandle[],
+  stepIndex?: number,
+): Promise<void> {
+  const locator = session.page.locator(selector).first();
+  await waitForVisible(locator, stepIndex);
+  let handle: ElementHandle | null;
+  try {
+    handle = await locator.elementHandle({ timeout: STEP_SELECTOR_TIMEOUT_MS });
+  } catch (error) {
+    if (isTimeoutError(error)) throw new SelectorNotFoundError(stepIndex);
+    throw error;
+  }
+  if (handle !== null) {
+    filled.push(handle);
+    session.filled.push(handle);
+  }
+  await fillLocator(locator, value, passwordOnly, stepIndex);
+}
+
+async function submitStepwise(
+  page: Page,
+  submit: StepwiseSubmit,
+  stepIndex: number,
+): Promise<void> {
+  if ("click" in submit) return click(page, submit.click, stepIndex);
+  try {
+    await page.press(submit.press_enter, "Enter", {
+      timeout: STEP_SELECTOR_TIMEOUT_MS,
+    });
+  } catch (error) {
+    if (isTimeoutError(error)) throw new SelectorNotFoundError(stepIndex);
+    throw error;
+  }
+}
+
+/**
+ * fills を順に入れて submit し、settle までを 1 つの操作として行う。成否にかかわらず、入れた欄のうち
+ * 文書に残って値が空でないものを空にしてから戻る。エラーの step は fills の添字（submit は fills の個数）とする。
+ */
+async function fillAndSubmit(
+  session: StepwiseSession,
+  action: Extract<StepwiseAction, { action: "fill_submit" }>,
+  totp: string | null,
+): Promise<boolean> {
+  // 入力の途中で MFA_REQUIRED とならないよう、欄に触れる前に確認する。
+  const usesTotp = action.fills.some((fill) => fill.value === "{{totp}}");
+  if (usesTotp && totp === null) throw new MfaRequiredError();
+  if (usesTotp && totp !== null && !session.totpCodes.includes(totp)) {
+    session.totpCodes.push(totp);
+  }
+  const secret = { ...session.secret, totp };
+  const filled: ElementHandle[] = [];
+  try {
+    return await runWithSettle(session, async () => {
+      for (const [index, fill] of action.fills.entries()) {
+        await fillStepwiseField(
+          session,
+          fill.selector,
+          substituteSecrets(fill.value, secret),
+          fill.value === "{{password}}",
+          filled,
+          index,
+        );
+      }
+      await submitStepwise(session.page, action.submit, action.fills.length);
+    });
+  } finally {
+    await clearFilledFields(filled);
+  }
+}
+
+/** abort 以外の action を実行し、settle まで待って落ち着いたかを返す。 */
+async function performStepwiseAction(
+  session: StepwiseSession,
+  request: LoginStepRequest,
+): Promise<boolean> {
+  const { action } = request;
+  const { page } = session;
+  if (action.action === "fill_submit") {
+    return fillAndSubmit(session, action, request.totp);
+  }
+  return runWithSettle(session, async () => {
+    if (action.action === "click") return click(page, action.selector);
+    if (action.action === "wait_for") {
+      return waitForVisible(page.locator(action.selector).first());
+    }
+    if (action.action === "fill") {
+      return fillStepwiseField(
+        session,
+        action.selector,
+        session.secret.username,
+        false,
+        [],
+      );
+    }
+  });
+}
+
+async function stepStepwise(
+  session: StepwiseSession,
+  request: LoginStepRequest,
+): Promise<StepwiseOutcome> {
+  if (request.action.action === "abort") {
+    await cleanupResources();
+    return { state: "aborted" };
+  }
+  const settled = await performStepwiseAction(session, request);
+  return concludeStepwise(session, settled, false);
+}
+
 type ExecutionErrorWriter = (
   stage: ExecutionStage,
   classified: ClassifiedExecutionError,
@@ -2326,6 +2790,7 @@ export async function cleanupResources(): Promise<void> {
   }
   const dir = activeTempDir;
   activeTempDir = undefined;
+  activeStepwise = undefined;
   activeBrowserContextId = undefined;
   activeLoginContext = undefined;
   if (dir !== undefined) {
@@ -2458,6 +2923,58 @@ export async function handleLogin(request: LoginRequest): Promise<void> {
     writeExecutorErrorLine(request, "login", classified, error);
     await cleanupResources();
     writeResponse(formatErrorResponse(classified), request.id);
+  }
+}
+
+/** 段階ログインのエラーを応答する。継続できないエラーでは、ブラウザを破棄してから応答する。 */
+async function writeStepwiseError(
+  request: LoginBeginRequest | LoginStepRequest,
+  error: unknown,
+  runtimeSecrets: SecretCandidates,
+): Promise<void> {
+  const classified = classifyExecutionError(error, "login");
+  writeExecutorErrorLine(request, "login", classified, error, runtimeSecrets);
+  if (!CONTINUABLE_STEPWISE_ERRORS.has(classified.code)) {
+    await cleanupResources();
+  }
+  writeResponse(formatErrorResponse(classified), request.id);
+}
+
+export async function handleLoginBegin(
+  request: LoginBeginRequest,
+): Promise<void> {
+  if (activeBrowser !== undefined) {
+    const error = new Error("browser is already active");
+    const classified = classifyExecutionError(error, "login");
+    writeExecutorErrorLine(request, "login", classified, error);
+    writeResponse(formatErrorResponse(classified), request.id);
+    return;
+  }
+  try {
+    writeResponse({ ok: true, ...(await beginStepwise(request)) }, request.id);
+  } catch (error) {
+    // login_begin の時点では selector の操作が無く、エラーはすべて段階ログインを終了させる。
+    await cleanupResources();
+    await writeStepwiseError(request, error, []);
+  }
+}
+
+export async function handleLoginStep(
+  request: LoginStepRequest,
+): Promise<void> {
+  const session = activeStepwise;
+  if (session === undefined) {
+    // ハンドオフ後または終了後のブラウザは、段階ログインの操作の対象にしない。
+    writeResponse(formatErrorResponse({ code: "INTERNAL" }), request.id);
+    return;
+  }
+  try {
+    writeResponse(
+      { ok: true, ...(await stepStepwise(session, request)) },
+      request.id,
+    );
+  } catch (error) {
+    await writeStepwiseError(request, error, stepwiseSecrets(session));
   }
 }
 
@@ -2904,8 +3421,18 @@ async function main(): Promise<void> {
         await handleMcpServerStop(request);
         continue;
       }
+      if (request.op === "login_begin") {
+        await handleLoginBegin(request);
+        continue;
+      }
+      if (request.op === "login_step") {
+        await handleLoginStep(request);
+        continue;
+      }
       await handleLogin(request);
     } catch (error) {
+      // 段階ログイン中の不正な要求は INTERNAL として終了させるため、応答の前にブラウザを破棄する。
+      if (activeStepwise !== undefined) await cleanupResources();
       writeResponse(
         { ok: false, error: "INTERNAL" satisfies ErrorCode },
         error instanceof InvalidRequestError ? error.id : undefined,

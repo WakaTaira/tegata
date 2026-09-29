@@ -28,7 +28,8 @@ export const REPO_ROOT = path.resolve(
 
 /** Error classification codes. The full closed set; nothing else may appear.
  * APPROVAL_DENIED / APPROVAL_TIMEOUT were added by the Phase 3 contract
- * (docs/secret/briefs/tegata-phase3.md, change 4).
+ * (docs/secret/briefs/tegata-phase3.md, change 4); SNAPSHOT_REJECTED by the
+ * Issue #46 contract (stepwise login).
  * Keep in sync with ErrorCode in crates/tegatad/src/main.rs and
  * ERROR_CODES in packages/tegata-mcp/src/index.ts. */
 export const ERROR_CODES = [
@@ -45,6 +46,7 @@ export const ERROR_CODES = [
   "OAUTH_GRANT_FAILED",
   "PROVIDER_UNAVAILABLE",
   "LOGIN_RESULT_TIMEOUT",
+  "SNAPSHOT_REJECTED",
   "INTERNAL",
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];

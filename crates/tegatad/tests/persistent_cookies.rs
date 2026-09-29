@@ -64,6 +64,73 @@ rl.on("line", (line) => {
 });
 "#;
 
+/// login に加えて `authorize_device` と `api_proxy_start` にも cookie を返す偽の executor（Issue #49）。
+/// 受け取った要求の op と、復元用に渡された cookie（`api_proxy_start` では `oauth.cookies`、
+/// 静的トークンのプロキシでは `"static"`）を `executor.js.requests` に 1 行ずつ記録する。
+/// user_code が `rejected-code` の `authorize_device` は `DEVICE_CODE_REJECTED` で失敗させる。
+/// 静的トークンのプロキシにも cookie を返し、デーモンがそれを捨てることを確かめられるようにする。
+const DEVICE_EXECUTOR: &str = r#"
+const fs = require("node:fs");
+const readline = require("node:readline");
+const log = __filename + ".requests";
+const day = Date.now() / 1000 + 86400.5;
+const jar = (tag) => [
+  { name: "device", value: "device-canary-" + tag, domain: "127.0.0.1", path: "/", expires: day, httpOnly: true, secure: false, sameSite: "Lax" },
+  { name: "sid", value: "sid-canary-" + tag, domain: "127.0.0.1", path: "/", expires: -1, httpOnly: true, secure: false, sameSite: "Lax" },
+];
+const reply = (id, body) => process.stdout.write(JSON.stringify({ id, ...body }) + "\n");
+const restoredOf = (request) => {
+  if (request.op !== "api_proxy_start") return request.cookies;
+  return request.oauth ? request.oauth.cookies : "static";
+};
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  const request = JSON.parse(line);
+  const restored = restoredOf(request);
+  fs.appendFileSync(log, JSON.stringify({ op: request.op, cookies: restored === undefined ? "absent" : restored }) + "\n");
+  const skipped = Array.isArray(restored);
+  if (request.op === "login") {
+    reply(request.id, { ok: true, endpoint: "ws://127.0.0.1:38999/devtools/browser/test", target_id: "test-target", cookies: jar("login"), steps_skipped: skipped });
+  } else if (request.op === "authorize_device") {
+    if (request.user_code === "rejected-code") {
+      reply(request.id, { ok: false, error: "DEVICE_CODE_REJECTED" });
+    } else {
+      reply(request.id, { ok: true, cookies: jar("device"), steps_skipped: skipped });
+    }
+  } else if (request.op === "api_proxy_start") {
+    const tag = request.oauth ? "oauth" : "static";
+    reply(request.id, { ok: true, port: 38998, secret: "path-secret", cookies: jar(tag), steps_skipped: true });
+  } else if (request.op === "export_cookies") {
+    reply(request.id, { ok: true, cookies: jar("export") });
+  } else if (request.op === "release" || request.op === "api_proxy_stop") {
+    reply(request.id, { ok: true });
+  } else if (request.op === "shutdown") {
+    reply(request.id, { ok: true });
+    process.exit(0);
+  }
+});
+rl.on("close", () => process.exit(0));
+"#;
+
+/// OAuth の注入プロキシ `fx`（`mock:site` でログイン）と静的トークンのプロキシ `st`（`mock:site-b`）。
+const API_PROXY_CONFIG: &str = r##"
+[[api_proxy]]
+name = "fx"
+upstream = "https://api.example.test"
+value = "Bearer {{secret}}"
+[api_proxy.oauth]
+client_id = "oauth-client"
+device_authorization_url = "https://oauth.example/device"
+token_url = "https://oauth.example/token"
+login_cred_id = "mock:site"
+success_selector = "#success"
+
+[[api_proxy]]
+name = "st"
+cred_id = "mock:site-b"
+upstream = "https://api.example.test"
+"##;
+
 const USERNAME: &str = "cookie-test-username-secret";
 const PASSWORD: &str = "cookie-test-password-secret";
 
@@ -186,6 +253,59 @@ impl Daemon {
             .into_iter()
             .find(|record| record["method"] == method && record["session_id"] == session_id)
             .unwrap_or_else(|| panic!("no {method} record for {session_id}"))
+    }
+
+    /// セッションを持たない行（`authorize_device` など）を、記録された順に返す。
+    fn records_of(&self, method: &str) -> Vec<Value> {
+        self.audit_records()
+            .into_iter()
+            .filter(|record| record["method"] == method)
+            .collect()
+    }
+
+    /// 偽の executor が受け取った `op` の要求の、復元用 cookie を順に返す。
+    fn restored_cookies_of(&self, op: &str) -> Vec<Value> {
+        self.executor_requests()
+            .into_iter()
+            .filter(|request| request["op"] == op)
+            .map(|request| request["cookies"].clone())
+            .collect()
+    }
+
+    fn authorize_device(&self, cred_id: &str, user_code: &str) -> Value {
+        rpc(
+            &self.socket_path,
+            "authorize_device",
+            json!({
+                "cred_id": cred_id,
+                "verification_url": "http://127.0.0.1/device",
+                "user_code": user_code,
+                "success_selector": "#device-ok"
+            }),
+        )
+    }
+
+    fn open_api_proxy(&self, name: &str) -> (Value, String) {
+        let response = rpc(&self.socket_path, "open_api_proxy", json!({ "name": name }));
+        let session_id = response["result"]["session_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("open_api_proxy failed: {response}"))
+            .to_owned();
+        (response, session_id)
+    }
+
+    /// RPC 応答・監査・stderr のいずれにも cookie のカナリア値が現れないことを確かめる。
+    fn assert_no_cookie_values(&self, responses: &[&Value]) {
+        let audit = std::fs::read_to_string(self.audit_path()).expect("read audit log");
+        let stderr = std::fs::read_to_string(self.directory.join("stderr.log")).unwrap_or_default();
+        let surfaces = responses
+            .iter()
+            .map(|response| response.to_string())
+            .chain([audit, stderr]);
+        for surface in surfaces {
+            assert!(!surface.contains("device-canary"), "{surface}");
+            assert!(!surface.contains("sid-canary"), "{surface}");
+        }
     }
 
     /// 偽の executor が受け取った要求（op と cookies）。
@@ -525,4 +645,197 @@ fn an_expired_session_saves_its_cookies() {
     };
     assert_eq!(record["cookies_saved"], true);
     assert_eq!(daemon.store_files().len(), 1);
+}
+
+/// 復元用に渡された cookie が、永続 cookie `device` の 1 件だけで、その値が `value` であることを確かめる。
+fn assert_restored_device(cookies: &Value, value: &str) {
+    let cookies = cookies
+        .as_array()
+        .unwrap_or_else(|| panic!("no restored cookies: {cookies}"));
+    assert_eq!(cookies.len(), 1, "session cookies are not carried over");
+    assert_eq!(cookies[0]["name"], "device");
+    assert_eq!(cookies[0]["value"], value);
+}
+
+#[test]
+fn authorize_device_restores_and_saves_the_cookies_of_a_persisted_credential() {
+    let daemon = Daemon::start(&["site"], DEVICE_EXECUTOR);
+
+    let first = daemon.authorize_device("mock:site", "device-code");
+    assert_eq!(first["result"], json!({ "ok": true }), "{first}");
+    assert_eq!(daemon.store_files().len(), 1, "the cookies are stored");
+    let second = daemon.authorize_device("mock:site", "device-code");
+    assert_eq!(second["result"], json!({ "ok": true }), "{second}");
+
+    let records = daemon.records_of("authorize_device");
+    assert_eq!(records[0]["cookies"], "none");
+    assert_eq!(records[0]["steps_skipped"], false);
+    assert_eq!(records[1]["cookies"], "restored");
+    assert_eq!(records[1]["steps_skipped"], true);
+    let sent = daemon.restored_cookies_of("authorize_device");
+    assert_eq!(sent[0], Value::Null);
+    assert_restored_device(&sent[1], "device-canary-device");
+    daemon.assert_no_cookie_values(&[&first, &second]);
+}
+
+#[test]
+fn authorize_device_outside_persist_cookies_behaves_as_before() {
+    let daemon = Daemon::start(&["site-b"], DEVICE_EXECUTOR);
+
+    for _ in 0..2 {
+        let response = daemon.authorize_device("mock:site", "device-code");
+        assert_eq!(response["result"], json!({ "ok": true }), "{response}");
+    }
+
+    for record in daemon.records_of("authorize_device") {
+        assert!(record.get("cookies").is_none(), "{record}");
+        assert!(record.get("steps_skipped").is_none(), "{record}");
+    }
+    assert!(
+        daemon
+            .restored_cookies_of("authorize_device")
+            .iter()
+            .all(Value::is_null)
+    );
+    assert!(daemon.store_files().is_empty());
+}
+
+#[test]
+fn a_failed_authorize_device_leaves_the_stored_cookies_untouched() {
+    let daemon = Daemon::start(&["site"], DEVICE_EXECUTOR);
+    daemon.authorize_device("mock:site", "device-code");
+    let files = daemon.store_files();
+    assert_eq!(files.len(), 1);
+    let before = std::fs::read(&files[0]).expect("read store file");
+
+    let rejected = daemon.authorize_device("mock:site", "rejected-code");
+    assert_eq!(
+        rejected["error"]["message"], "DEVICE_CODE_REJECTED",
+        "{rejected}"
+    );
+    assert_restored_device(
+        &daemon.restored_cookies_of("authorize_device")[1],
+        "device-canary-device",
+    );
+    assert_eq!(
+        std::fs::read(&files[0]).expect("read store file"),
+        before,
+        "a failure does not rewrite the store"
+    );
+}
+
+#[test]
+fn login_and_authorize_device_share_one_store() {
+    let daemon = Daemon::start(&["*"], DEVICE_EXECUTOR);
+
+    let (_, session) = daemon.login("mock:site");
+    daemon.logout(&session);
+    daemon.authorize_device("mock:site", "device-code");
+    let after_login = &daemon.records_of("authorize_device")[0];
+    assert_eq!(after_login["cookies"], "restored");
+    assert_eq!(after_login["steps_skipped"], true);
+    assert_restored_device(
+        &daemon.restored_cookies_of("authorize_device")[0],
+        "device-canary-export",
+    );
+
+    daemon.authorize_device("mock:site-b", "device-code");
+    let (_, session) = daemon.login("mock:site-b");
+    assert_eq!(daemon.record("login", &session)["cookies"], "restored");
+    assert_restored_device(
+        &daemon.restored_cookies_of("login")[1],
+        "device-canary-device",
+    );
+}
+
+#[test]
+fn authorize_device_cookies_are_separated_by_principal() {
+    let daemon = Daemon::start(&["*"], DEVICE_EXECUTOR);
+    daemon.authorize_device("mock:site", "device-code");
+
+    let issued = rpc(
+        &daemon.socket_path,
+        "admin_peer_issue",
+        json!({ "label": "other-principal" }),
+    );
+    let token = issued["result"]["token"].as_str().expect("peer token");
+    let response = tcp_rpc(
+        &daemon,
+        token,
+        "authorize_device",
+        json!({
+            "cred_id": "mock:site",
+            "verification_url": "http://127.0.0.1/device",
+            "user_code": "device-code",
+            "success_selector": "#device-ok"
+        }),
+    );
+    assert_eq!(response["result"], json!({ "ok": true }), "{response}");
+    assert_eq!(
+        daemon.restored_cookies_of("authorize_device")[1],
+        Value::Null
+    );
+    assert_eq!(daemon.records_of("authorize_device")[1]["cookies"], "none");
+    assert_eq!(daemon.store_files().len(), 2);
+}
+
+#[test]
+fn an_oauth_api_proxy_restores_and_saves_cookies_but_a_static_proxy_does_not() {
+    let daemon = Daemon::start_with(&["*"], DEVICE_EXECUTOR, API_PROXY_CONFIG);
+
+    let (first_response, first) = daemon.open_api_proxy("fx");
+    let first_record = daemon.record("open_api_proxy", &first);
+    assert_eq!(first_record["cookies"], "none");
+    assert_eq!(first_record["steps_skipped"], true);
+    assert_eq!(
+        daemon.store_files().len(),
+        1,
+        "the OAuth login cookies are stored"
+    );
+    let logout_response = daemon.logout(&first);
+
+    let (second_response, second) = daemon.open_api_proxy("fx");
+    let second_record = daemon.record("open_api_proxy", &second);
+    assert_eq!(second_record["cookies"], "restored");
+    assert_eq!(second_record["steps_skipped"], true);
+    for response in [&first_response, &second_response] {
+        let keys = response["result"]
+            .as_object()
+            .expect("open_api_proxy result")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(keys, ["base_url", "session_id"], "{response}");
+    }
+
+    let (static_response, static_session) = daemon.open_api_proxy("st");
+    let static_record = daemon.record("open_api_proxy", &static_session);
+    assert!(static_record.get("cookies").is_none(), "{static_record}");
+    assert!(
+        static_record.get("steps_skipped").is_none(),
+        "{static_record}"
+    );
+    assert_eq!(
+        daemon.store_files().len(),
+        1,
+        "static proxies store nothing"
+    );
+
+    let sent = daemon.restored_cookies_of("api_proxy_start");
+    assert_eq!(sent[0], Value::Null);
+    assert_restored_device(&sent[1], "device-canary-oauth");
+    assert_eq!(sent[2], "static");
+    assert!(
+        daemon
+            .executor_requests()
+            .iter()
+            .all(|request| request["op"] != "export_cookies"),
+        "proxy leases never export cookies"
+    );
+    daemon.assert_no_cookie_values(&[
+        &first_response,
+        &logout_response,
+        &second_response,
+        &static_response,
+    ]);
 }

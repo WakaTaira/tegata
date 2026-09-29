@@ -275,7 +275,9 @@ opt-in persistent cookies per credential
 ([#45](https://github.com/WakaTaira/tegata/issues/45)) — the daemon keeps a
 credential's unexpired persistent cookies for each caller, so a site sees the
 same device on the next login instead of a new one, and a login whose restored
-cookies already sign in skips the form; stepwise login
+cookies already sign in skips the form, with the same saved cookies also
+carried into `authorize_device` and the OAuth proxy's device-code login
+([#49](https://github.com/WakaTaira/tegata/issues/49)); stepwise login
 ([#46](https://github.com/WakaTaira/tegata/issues/46)) — `login_begin` and
 `login_step` let the agent work through a multi-screen login one action at a
 time, seeing only page snapshots tegata builds without field values and checks

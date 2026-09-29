@@ -519,6 +519,16 @@ returns `DEVICE_CODE_REJECTED`, including when it renders while a step is still
 waiting for its selector. Approval hooks can also return `APPROVAL_DENIED`
 or `APPROVAL_TIMEOUT`.
 
+### Persistent cookies
+
+When the operator has enabled `persist_cookies` for this credential (see
+[security.md](security.md#persistent-cookies)) and a saved cookie is restored,
+`authorize_device` opens `verification_url` first; if the device approval page
+renders, the login stage is skipped and no secret is placed into any page.
+Otherwise it runs the login stage as usual. The approval hook still runs first,
+and the response is still `{"ok": true}`; the audit record carries `cookies` and
+`steps_skipped`.
+
 ## `open_api_proxy`
 
 Opens a loopback HTTP relay that injects a credential's value into a fixed
@@ -559,6 +569,12 @@ after a failed start, or after 3 starts in 10 minutes, the call returns
 
 The lease this opens behaves like any other session: it has a TTL, `logout`
 ends it early, and `lock_vault` closes every proxy in the locked namespace.
+
+For an OAuth proxy whose credential is enabled in `persist_cookies`, the grant's
+login stage can be skipped the same way as in `authorize_device` when a saved
+cookie is restored and the approval page renders. The audit record of
+`open_api_proxy` carries `cookies` and `steps_skipped`. See
+[security.md](security.md#persistent-cookies).
 
 ## `get_totp`
 

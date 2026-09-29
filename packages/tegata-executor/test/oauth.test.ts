@@ -115,7 +115,7 @@ describe("api_proxy_start parsing", () => {
       upstream: "https://api.example.test",
       header: "Authorization",
       value_template: "Bearer {{secret}}",
-      oauth: OAUTH_REQUEST,
+      oauth: { ...OAUTH_REQUEST, cookies: null },
     });
   });
 
@@ -144,6 +144,7 @@ describe("api_proxy_start parsing", () => {
         scope: null,
         steps: null,
         failure_selector: null,
+        cookies: null,
         secret: { username: "alice", password: "login-password", totp: null },
       },
     });

@@ -278,7 +278,8 @@ becomes the only way in, and no firewall rule is added.
 Provider tables use the same keys as on Linux; see
 [setup-linux.md](setup-linux.md#providers). `totp_exposable` matches the entry's
 **name**. `persist_cookies` matches the same name (or `["*"]` for every
-credential); its default is an empty list, and on Windows the saved file is
+credential) and applies to `login`, `authorize_device`, and the login behind an
+OAuth `open_api_proxy`; its default is an empty list, and on Windows the saved file is
 sealed with the same DPAPI mechanism used for the master password rather than
 kept as plaintext — see [security.md](security.md#persistent-cookies).
 

@@ -256,6 +256,7 @@ describe("authorize_device protocol", () => {
       steps: null,
       success_selector: "#success",
       failure_selector: null,
+      cookies: null,
       secret: { username: "alice", password: "password", totp: null },
     });
     expect(formatResponse({ ok: true }, request.id)).toEqual({

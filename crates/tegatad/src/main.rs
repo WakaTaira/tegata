@@ -2896,9 +2896,14 @@ async fn authorize_device(
     if !valid_authorize_steps(params.steps.as_deref()) {
         return classified(request.id.clone(), ErrorCode::Internal);
     }
-    if params.cred_id.split_once(':').is_none() {
+    let Some((namespace, _)) = params.cred_id.split_once(':') else {
         return classified(request.id.clone(), ErrorCode::InvalidCredential);
-    }
+    };
+    let key = sessions::BrowserKey::new(
+        peer.principal(),
+        namespace.to_owned(),
+        params.cred_id.clone(),
+    );
     let metadata = match credential_metadata(&state, &params.cred_id).await {
         Ok(Some(metadata)) => metadata,
         Ok(None) => return classified(request.id.clone(), ErrorCode::InvalidCredential),
@@ -2922,6 +2927,9 @@ async fn authorize_device(
             return classified(request.id.clone(), error).with_audit_approval_grant(grant);
         }
     };
+    // 承認ゲートとアンロック確認を通過した後にのみ、保管済み cookie を読み出す。
+    let login_cookies = LoginCookies::load(&state, key).await;
+    let restored_cookies = login_cookies.as_ref().and_then(LoginCookies::wire_cookies);
     let (executor_entry, executor_socket, node_path, browsers_path) = {
         let daemon = state.lock().await;
         (
@@ -2936,13 +2944,12 @@ async fn authorize_device(
         executor_socket.as_deref(),
         &node_path,
         browsers_path.as_deref(),
-        &params,
-        login_url,
-        &credential,
+        || authorize_device_request(&params, login_url, &credential, restored_cookies),
     )
     .await
     {
-        Ok(()) => success(request.id.clone(), json!({ "ok": true })),
+        Ok(returned) => success(request.id.clone(), json!({ "ok": true }))
+            .with_audit_cookies(login_cookies.map(|cookies| cookies.finish(returned))),
         Err(error) => classified_with_step(request.id.clone(), error.code, error.step),
     }
     .with_audit_approval_grant(grant)
@@ -2986,13 +2993,14 @@ async fn open_service<S: HostedService>(
             Err(error) => return classified(request.id.clone(), error).with_audit_fields(fields),
         };
     match start_service_session(&state, peer, service, cred_id, namespace).await {
-        Ok((session_id, port, secret)) => {
+        Ok((session_id, port, secret, cookie_audit)) => {
             fields.session_id = Some(session_id.clone());
             success(
                 request.id.clone(),
                 S::open_result(&session_id, port, &secret),
             )
             .with_audit_fields(fields)
+            .with_audit_cookies(cookie_audit)
         }
         Err(error) => classified(request.id.clone(), error).with_audit_fields(fields),
     }
@@ -3000,14 +3008,15 @@ async fn open_service<S: HostedService>(
 }
 
 /// 承認ゲートを通過したサービスを起動制御を経て起動し、リースを登録して
-/// `(session_id, port, secret)` を返す。`cred_id` と `namespace` は承認対象から分割済みの値である。
+/// `(session_id, port, secret, cookie 永続化の監査項目)` を返す。
+/// `cred_id` と `namespace` は承認対象から分割済みの値である。
 async fn start_service_session<S: HostedService>(
     state: &SharedState,
     peer: &PeerIdentity,
     service: S,
     cred_id: String,
     namespace: String,
-) -> Result<(String, u16, String), ErrorCode> {
+) -> Result<(String, u16, String, Option<CookieAudit>), ErrorCode> {
     let start_gate = start_control(
         state,
         S::KIND.start_key(peer.principal(), service.name().to_owned()),
@@ -3018,12 +3027,22 @@ async fn start_service_session<S: HostedService>(
         return Err(ErrorCode::RateLimited);
     }
     let credential = resolve_unlocked_credential(state, &cred_id).await?;
+    // 承認ゲートとアンロック確認を通過した後にのみ、保管済み cookie を読み出す。
+    let login_cookies = if service.logs_in_browser() {
+        let key = sessions::BrowserKey::new(peer.principal(), namespace.clone(), cred_id.clone());
+        LoginCookies::load(state, key).await
+    } else {
+        None
+    };
     let settings = service_launch_settings(state).await;
-    let launch = service.build_launch(&credential)?;
+    let launch = service.build_launch(
+        &credential,
+        login_cookies.as_ref().and_then(LoginCookies::wire_cookies),
+    )?;
     drop(credential);
     start_guard.record_attempt(Instant::now());
     let started_at = Instant::now();
-    let (port, secret, executor) = match service.start_executor(&settings, launch).await {
+    let started = match service.start_executor(&settings, launch).await {
         Ok(result) => {
             start_guard.record_success();
             result
@@ -3035,6 +3054,12 @@ async fn start_service_session<S: HostedService>(
     };
     let deadline = started_at + settings.browser_max_lifetime;
     drop(start_guard);
+    let ServiceStarted {
+        port,
+        secret,
+        executor,
+        returned_cookies,
+    } = started;
     let session_id = register_service_lease(
         state,
         peer,
@@ -3050,7 +3075,17 @@ async fn start_service_session<S: HostedService>(
         },
     )
     .await?;
-    Ok((session_id, port, secret))
+    let cookie_audit = login_cookies.map(|cookies| cookies.finish(returned_cookies));
+    Ok((session_id, port, secret, cookie_audit))
+}
+
+/// 起動したサービスの executor と、その成功応答から取り出した値。
+struct ServiceStarted {
+    port: u16,
+    secret: String,
+    executor: ExecutorHandle,
+    /// ブラウザログインを伴う起動での cookie 永続化の値。それ以外の起動では既定値とする。
+    returned_cookies: ReturnedCookies,
 }
 
 /// executor 接続 1 本を占有するサービスの設定。`open_service` と `start_service_session` のうち、
@@ -3069,13 +3104,20 @@ trait HostedService: Clone {
     fn cred_id(&self) -> Option<&str>;
     /// 承認と監査に載せる対象。
     fn target_url(&self) -> String;
-    fn build_launch(&self, credential: &ResolvedCredential) -> Result<Self::Launch, ErrorCode>;
-    /// executor 接続を 1 本開いてサービスを起動し、`(port, secret, executor)` を返す。
+    /// 起動の際に資格でブラウザログインを行うか。真であれば、そのログインに保管済み cookie を用いる。
+    fn logs_in_browser(&self) -> bool;
+    /// `cookies` は、ブラウザログインの前に復元する保管済み cookie である。
+    fn build_launch(
+        &self,
+        credential: &ResolvedCredential,
+        cookies: Option<Vec<Value>>,
+    ) -> Result<Self::Launch, ErrorCode>;
+    /// executor 接続を 1 本開いてサービスを起動する。
     async fn start_executor(
         &self,
         settings: &ServiceLaunchSettings,
         launch: Self::Launch,
-    ) -> Result<(u16, String, ExecutorHandle), ErrorCode>;
+    ) -> Result<ServiceStarted, ErrorCode>;
     /// 起動に成功した場合の RPC の結果。
     fn open_result(session_id: &str, port: u16, secret: &str) -> Value;
 }
@@ -3105,9 +3147,17 @@ impl HostedService for ApiProxyConfig {
         self.upstream.clone()
     }
 
-    fn build_launch(&self, credential: &ResolvedCredential) -> Result<Self::Launch, ErrorCode> {
+    fn logs_in_browser(&self) -> bool {
+        self.oauth.is_some()
+    }
+
+    fn build_launch(
+        &self,
+        credential: &ResolvedCredential,
+        cookies: Option<Vec<Value>>,
+    ) -> Result<Self::Launch, ErrorCode> {
         if let Some(oauth) = &self.oauth {
-            return build_oauth_start(&self.value, oauth, credential);
+            return build_oauth_start(&self.value, oauth, credential, cookies);
         }
         Ok(ApiProxyStartOptions {
             value_template: None,
@@ -3123,7 +3173,7 @@ impl HostedService for ApiProxyConfig {
         &self,
         settings: &ServiceLaunchSettings,
         launch: Self::Launch,
-    ) -> Result<(u16, String, ExecutorHandle), ErrorCode> {
+    ) -> Result<ServiceStarted, ErrorCode> {
         start_api_proxy_executor(settings, self, launch).await
     }
 
@@ -3157,7 +3207,15 @@ impl HostedService for McpServerConfig {
         format!("mcp:{}", self.name)
     }
 
-    fn build_launch(&self, credential: &ResolvedCredential) -> Result<Self::Launch, ErrorCode> {
+    fn logs_in_browser(&self) -> bool {
+        false
+    }
+
+    fn build_launch(
+        &self,
+        credential: &ResolvedCredential,
+        _cookies: Option<Vec<Value>>,
+    ) -> Result<Self::Launch, ErrorCode> {
         build_mcp_server_launch(&self.env, credential)
     }
 
@@ -3165,8 +3223,14 @@ impl HostedService for McpServerConfig {
         &self,
         settings: &ServiceLaunchSettings,
         launch: Self::Launch,
-    ) -> Result<(u16, String, ExecutorHandle), ErrorCode> {
-        start_mcp_server_executor(settings, self, launch).await
+    ) -> Result<ServiceStarted, ErrorCode> {
+        let (port, secret, executor) = start_mcp_server_executor(settings, self, launch).await?;
+        Ok(ServiceStarted {
+            port,
+            secret,
+            executor,
+            returned_cookies: ReturnedCookies::default(),
+        })
     }
 
     fn open_result(session_id: &str, port: u16, secret: &str) -> Value {
@@ -3451,10 +3515,12 @@ fn render_mcp_env_value(
 
 /// OAuth の注入プロキシについて `api_proxy_start` に載せる値を組み立てる。
 /// ログイン URL は資格の URI を優先し、無いか空であれば device authorization endpoint の origin とする。
+/// `cookies` は、ブラウザログインの前に復元する保管済み cookie である。
 fn build_oauth_start(
     value_template: &str,
     oauth: &ApiProxyOAuthConfig,
     credential: &ResolvedCredential,
+    cookies: Option<Vec<Value>>,
 ) -> Result<ApiProxyStartOptions, ErrorCode> {
     let login_url = credential
         .uri
@@ -3477,6 +3543,7 @@ fn build_oauth_start(
             password: Zeroizing::new(credential.password.as_str().to_owned()),
             totp: current_totp(credential).map(Zeroizing::new),
         },
+        cookies,
     };
     Ok(ApiProxyStartOptions {
         value_template: Some(value_template.to_owned()),
@@ -4415,15 +4482,10 @@ fn parse_login_response(line: &str) -> Result<ParsedLoginResponse, ExecutorFailu
     if response.ok {
         let endpoint = response.endpoint.ok_or(ErrorCode::Internal)?;
         let target_id = response.target_id.ok_or(ErrorCode::Internal)?;
-        let mut extras = serde_json::from_str::<Value>(line).unwrap_or(Value::Null);
-        let cookies = extras
-            .get_mut("cookies")
-            .map(Value::take)
-            .filter(|cookies| !cookies.is_null());
-        let steps_skipped = extras
-            .get("steps_skipped")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let ReturnedCookies {
+            cookies,
+            steps_skipped,
+        } = parse_returned_cookies(line);
         Ok(ParsedLoginResponse {
             endpoint,
             target_id,
@@ -4443,40 +4505,50 @@ fn parse_login_response(line: &str) -> Result<ParsedLoginResponse, ExecutorFailu
     }
 }
 
+/// executor への `authorize_device` 要求を組み立てる。`cookies` はログイン段の前に復元する保管済み cookie である。
+fn authorize_device_request(
+    params: &AuthorizeDeviceParams,
+    login_url: String,
+    credential: &ResolvedCredential,
+    cookies: Option<Vec<Value>>,
+) -> ExecutorAuthorizeDeviceRequest {
+    ExecutorAuthorizeDeviceRequest {
+        op: "authorize_device",
+        id: 1,
+        login_url,
+        verification_url: params.verification_url.clone(),
+        user_code: params.user_code.clone(),
+        steps: params.steps.clone(),
+        success_selector: params.success_selector.clone(),
+        failure_selector: params.failure_selector.clone(),
+        secret: ExecutorSecret {
+            username: credential.username.as_str().to_owned(),
+            password: credential.password.as_str().to_owned(),
+            totp: current_totp(credential),
+        },
+        cookies,
+    }
+}
+
+/// executor 接続を 1 本開いて `build_request` の `authorize_device` 要求を送り、応答後に接続を停止する。
+/// 成功時は応答に載る cookie 永続化の値を返す。
 async fn authorize_device_with_executor(
     entry: &Path,
     executor_socket: Option<&Path>,
     node_path: &Path,
     browsers_path: Option<&Path>,
-    params: &AuthorizeDeviceParams,
-    login_url: String,
-    credential: &ResolvedCredential,
-) -> Result<(), ExecutorFailure> {
+    build_request: impl FnOnce() -> ExecutorAuthorizeDeviceRequest,
+) -> Result<ReturnedCookies, ExecutorFailure> {
     let mut executor = connect_executor(entry, executor_socket, node_path, browsers_path).await?;
     let result = async {
-        let request = ExecutorAuthorizeDeviceRequest {
-            op: "authorize_device",
-            id: 1,
-            login_url,
-            verification_url: params.verification_url.clone(),
-            user_code: params.user_code.clone(),
-            steps: params.steps.clone(),
-            success_selector: params.success_selector.clone(),
-            failure_selector: params.failure_selector.clone(),
-            secret: ExecutorSecret {
-                username: credential.username.as_str().to_owned(),
-                password: credential.password.as_str().to_owned(),
-                totp: current_totp(credential),
-            },
-        };
-        let response_line = exchange_first_request(&mut executor, request).await?;
+        let response_line = exchange_first_request(&mut executor, build_request()).await?;
         let response: ExecutorResponse =
             serde_json::from_str(&response_line).map_err(|_| ErrorCode::Internal)?;
         if response.id != Some(1) {
             return Err(ErrorCode::Internal.into());
         }
         if response.ok {
-            Ok(())
+            Ok(parse_returned_cookies(&response_line))
         } else {
             let code = response
                 .error
@@ -4519,7 +4591,7 @@ async fn start_api_proxy_executor(
     settings: &ServiceLaunchSettings,
     proxy: &ApiProxyConfig,
     options: ApiProxyStartOptions,
-) -> Result<(u16, String, ExecutorHandle), ErrorCode> {
+) -> Result<ServiceStarted, ErrorCode> {
     let ApiProxyStartOptions {
         value_template,
         header_value,
@@ -4535,7 +4607,7 @@ async fn start_api_proxy_executor(
         header_value,
         oauth,
     };
-    let ((port, secret), executor) = open_executor_with(
+    let ((port, secret, returned_cookies), executor) = open_executor_with(
         &settings.executor_entry,
         settings.executor_socket.as_deref(),
         &settings.node_path,
@@ -4544,7 +4616,12 @@ async fn start_api_proxy_executor(
         |line| parse_api_proxy_start_response(line, oauth_enabled),
     )
     .await?;
-    Ok((port, secret, executor))
+    Ok(ServiceStarted {
+        port,
+        secret,
+        executor,
+        returned_cookies,
+    })
 }
 
 /// executor 接続を 1 本開き、`mcp_server_start` を送って中継のリスナーのポートと stream secret を受け取る。
@@ -4594,10 +4671,11 @@ fn parse_mcp_server_start_response(line: &str) -> Result<(u16, String), ErrorCod
 }
 
 /// `api_proxy_start` への応答からリスナーのポートと path secret を取り出す。
+/// OAuth の場合は、ブラウザログインの cookie 永続化の値も取り出す（静的トークンでは既定値とする）。
 fn parse_api_proxy_start_response(
     line: &str,
     oauth_enabled: bool,
-) -> Result<(u16, String), ErrorCode> {
+) -> Result<(u16, String, ReturnedCookies), ErrorCode> {
     let response: ExecutorApiProxyStartResponse =
         serde_json::from_str(line).map_err(|_| ErrorCode::Internal)?;
     if response.id != Some(1) {
@@ -4622,7 +4700,12 @@ fn parse_api_proxy_start_response(
         .secret
         .filter(|secret| valid_base64url_secret(secret))
         .ok_or(ErrorCode::Internal)?;
-    Ok((port, secret))
+    let returned_cookies = if oauth_enabled {
+        parse_returned_cookies(line)
+    } else {
+        ReturnedCookies::default()
+    };
+    Ok((port, secret, returned_cookies))
 }
 
 /// executor が返す秘密値が、空でない base64url の文字列であるかを判定する。
@@ -4828,6 +4911,74 @@ fn save_cookies(
             eprintln!("tegatad: cookie store: cookies of a session were {error}");
             false
         }
+    }
+}
+
+/// executor の成功応答に載る cookie 永続化の値。
+#[derive(Default)]
+struct ReturnedCookies {
+    /// 成功時点の context の全 cookie。
+    cookies: Option<Value>,
+    /// 復元した cookie によりログイン段を省略したか。
+    steps_skipped: bool,
+}
+
+/// 成功応答の行から `cookies` と `steps_skipped` を取り出す。
+/// 古い executor では欠けるため、欠けていれば cookie なし・省略なしとして扱う。
+fn parse_returned_cookies(line: &str) -> ReturnedCookies {
+    let mut response = serde_json::from_str::<Value>(line).unwrap_or(Value::Null);
+    ReturnedCookies {
+        cookies: response
+            .get_mut("cookies")
+            .map(Value::take)
+            .filter(|cookies| !cookies.is_null()),
+        steps_skipped: response
+            .get("steps_skipped")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+/// 使い捨てのブラウザでログインする経路（`authorize_device`・OAuth の注入プロキシ）について、
+/// 永続化対象の資格の保管先と、ログインの前に読み出した保管済み cookie。
+struct LoginCookies {
+    store: Arc<cookie_store::CookieStore>,
+    key: sessions::BrowserKey,
+    restored: Option<Vec<cookie_store::Cookie>>,
+}
+
+impl LoginCookies {
+    /// 資格が永続化対象であれば保管済み cookie を読み出し、対象外であれば `None` を返す。
+    /// 承認ゲートとアンロック確認を通過した後にのみ呼ぶ。
+    async fn load(state: &SharedState, key: sessions::BrowserKey) -> Option<Self> {
+        let store = state.lock().await.cookie_store.clone();
+        if !store.persists(&key.cred_id) {
+            return None;
+        }
+        let restored = store.load(&key, cookie_store::unix_now());
+        Some(Self {
+            store,
+            key,
+            restored,
+        })
+    }
+
+    /// executor への要求に載せる形の復元 cookie。復元するものが無ければ `None` を返す。
+    fn wire_cookies(&self) -> Option<Vec<Value>> {
+        self.restored.as_ref().map(|cookies| {
+            cookies
+                .iter()
+                .filter_map(|cookie| serde_json::to_value(cookie).ok())
+                .collect()
+        })
+    }
+
+    /// 成功応答の cookie を保管し、監査項目を返す。ログインが成功した場合にのみ呼ぶ。
+    fn finish(self, returned: ReturnedCookies) -> CookieAudit {
+        if let Some(cookies) = returned.cookies.as_ref() {
+            save_cookies(&self.store, &self.key, cookies);
+        }
+        CookieAudit::login(self.restored.is_some(), returned.steps_skipped)
     }
 }
 
@@ -5809,5 +5960,52 @@ mod persist_cookies_config_tests {
             let omitted = format!("namespace = \"ns\"\n{provider}");
             assert!(persist_cookies(&omitted).is_empty(), "{provider}");
         }
+    }
+}
+
+#[cfg(test)]
+mod returned_cookies_tests {
+    use super::{parse_api_proxy_start_response, parse_returned_cookies};
+    use serde_json::json;
+
+    #[test]
+    fn missing_cookie_fields_mean_no_cookies_and_no_skip() {
+        let returned = parse_returned_cookies(r#"{"id":1,"ok":true}"#);
+        assert!(returned.cookies.is_none());
+        assert!(!returned.steps_skipped);
+        let returned = parse_returned_cookies(r#"{"id":1,"ok":true,"cookies":null}"#);
+        assert!(returned.cookies.is_none());
+    }
+
+    #[test]
+    fn cookie_fields_are_taken_from_a_success_response() {
+        let returned = parse_returned_cookies(
+            r#"{"id":1,"ok":true,"cookies":[{"name":"a"}],"steps_skipped":true}"#,
+        );
+        assert_eq!(returned.cookies, Some(json!([{ "name": "a" }])));
+        assert!(returned.steps_skipped);
+    }
+
+    #[test]
+    fn api_proxy_start_takes_cookies_only_for_oauth() {
+        let line =
+            r#"{"id":1,"ok":true,"port":4000,"secret":"abc","cookies":[],"steps_skipped":true}"#;
+        let Ok((_, _, oauth)) = parse_api_proxy_start_response(line, true) else {
+            panic!("OAuth start response rejected");
+        };
+        assert_eq!(oauth.cookies, Some(json!([])));
+        assert!(oauth.steps_skipped);
+        let Ok((_, _, fixed)) = parse_api_proxy_start_response(line, false) else {
+            panic!("static start response rejected");
+        };
+        assert!(fixed.cookies.is_none());
+        assert!(!fixed.steps_skipped);
+        let legacy = r#"{"id":1,"ok":true,"port":4000,"secret":"abc"}"#;
+        let Ok((port, secret, legacy)) = parse_api_proxy_start_response(legacy, true) else {
+            panic!("OAuth start response without cookies rejected");
+        };
+        assert_eq!((port, secret.as_str()), (4000, "abc"));
+        assert!(legacy.cookies.is_none());
+        assert!(!legacy.steps_skipped);
     }
 }

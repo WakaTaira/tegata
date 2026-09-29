@@ -355,7 +355,7 @@ Vaultwarden.
 | `email` | string | yes | Vault account address |
 | `askpass_cmd` | string | yes | Command that supplies the master password |
 | `totp_exposable` | list of string | no | Item **names** whose current code `get_totp` may return |
-| `persist_cookies` | list of string | no | Backend ids (or `["*"]`) whose device-trust cookies are saved across `login`s |
+| `persist_cookies` | list of string | no | Backend ids (or `["*"]`) whose device-trust cookies are saved across `login`, `authorize_device`, and OAuth proxy logins |
 | `session_ttl_secs` | integer | no | Unlock lifetime; defaults to the global value |
 
 The daemon runs `bw sync` when it establishes a session and, while that session remains within its TTL, at most once every 60 seconds from the previous sync attempt. A failed periodic sync is non-fatal: the daemon continues with the local cache. A timeout or process-start failure during the initial sync discards the session and returns `PROVIDER_UNAVAILABLE` without retrying login, and `bw sync` is limited to 30 seconds; other `bw` commands retain their 60-second limit.
@@ -369,7 +369,7 @@ age crate — no CLI to install, no agent to keep running.
 | --- | --- | --- | --- |
 | `entries_path` | string | yes | The age-encrypted entries file |
 | `identity_path` | string | yes | X25519 identity file. **Must be mode 0600**, or the daemon refuses to start |
-| `persist_cookies` | list of string | no | Backend ids (or `["*"]`) whose device-trust cookies are saved across `login`s |
+| `persist_cookies` | list of string | no | Backend ids (or `["*"]`) whose device-trust cookies are saved across `login`, `authorize_device`, and OAuth proxy logins |
 | `session_ttl_secs` | integer | no | Lifetime of the decrypted entries in memory |
 
 The plaintext inside `entries_path` is a TOML document of `[[entries]]` tables:
@@ -418,7 +418,7 @@ refused at startup with an explicit error.
 | `gnupghome` | string | no | Passed to `pass` as `GNUPGHOME` |
 | `pass_bin` | string | no | The `pass` executable; defaults to `pass` |
 | `totp_exposable` | list of string | no | Entry **names** whose current code `get_totp` may return |
-| `persist_cookies` | list of string | no | Backend ids (or `["*"]`) whose device-trust cookies are saved across `login`s |
+| `persist_cookies` | list of string | no | Backend ids (or `["*"]`) whose device-trust cookies are saved across `login`, `authorize_device`, and OAuth proxy logins |
 | `session_ttl_secs` | integer | no | Lifetime of resolved values in memory |
 
 The catalog comes from scanning `store_dir` for `*.gpg`. An entry's name and its id
@@ -487,7 +487,8 @@ credential exposes a code to the agent unless it is named there. See
 
 `persist_cookies` matches a credential's backend id, `["*"]` matches every
 credential of that provider, and the default is an empty list: no cookie is
-saved to disk unless a provider names it there. See
+saved to disk unless a provider names it there. It applies to `login`,
+`authorize_device`, and the login behind an OAuth `open_api_proxy`. See
 [security.md](security.md#persistent-cookies) before enabling it.
 
 ## The askpass command

@@ -78,6 +78,10 @@ let
     approve_timeout_secs = cfg.approveTimeoutSecs;
   } // lib.optionalAttrs (cfg.auditLogMaxBytes != null) {
     audit_log_max_bytes = cfg.auditLogMaxBytes;
+  } // lib.optionalAttrs (cfg.stepwiseIdleSecs != null) {
+    stepwise_idle_secs = cfg.stepwiseIdleSecs;
+  } // lib.optionalAttrs (cfg.stepwiseMaxSecs != null) {
+    stepwise_max_secs = cfg.stepwiseMaxSecs;
   };
 
   unixListenConfig = ''
@@ -352,6 +356,18 @@ in
       type = lib.types.nullOr lib.types.ints.unsigned;
       default = null;
       description = "Maximum audit log size in bytes.";
+    };
+
+    stepwiseIdleSecs = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.unsigned;
+      default = null;
+      description = "Idle timeout for a stepwise login (login_begin / login_step) in seconds; null uses the daemon default.";
+    };
+
+    stepwiseMaxSecs = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.unsigned;
+      default = null;
+      description = "Absolute lifetime of a stepwise login (login_begin / login_step) in seconds; null uses the daemon default.";
     };
   };
 

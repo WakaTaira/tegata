@@ -32,6 +32,7 @@ const ERROR_CODES = [
   "FORBIDDEN",
   "ADMIN_REQUIRED",
   "ADMIN_SEAL_UNAVAILABLE",
+  "SNAPSHOT_REJECTED",
 ] as const;
 type ErrorCode = (typeof ERROR_CODES)[number];
 const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
@@ -49,6 +50,54 @@ const loginStep = z.union([
   z.object({
     action: z.literal("wait_for"),
     selector: z.string(),
+  }),
+]);
+
+// Issue #46: login_step のフラット形パラメータ。action ごとに許される field を discriminated
+// union で表現し、単独 fill を {{username}} のみに、fill_submit の secret プレースホルダを
+// 3 種のみに制限する（デーモン側の再検査と合わせた二重防御）。テストからスキーマ単体を
+// 検証できるよう export する。
+export const loginStepParams = z.discriminatedUnion("action", [
+  z.object({
+    login_id: z.string(),
+    action: z.literal("click"),
+    selector: z.string(),
+  }),
+  z.object({
+    login_id: z.string(),
+    action: z.literal("wait_for"),
+    selector: z.string(),
+  }),
+  z.object({
+    login_id: z.string(),
+    action: z.literal("fill"),
+    selector: z.string(),
+    value: z.literal("{{username}}"),
+  }),
+  z.object({
+    login_id: z.string(),
+    action: z.literal("fill_submit"),
+    fills: z
+      .array(
+        z.object({
+          selector: z.string(),
+          value: z.enum(["{{username}}", "{{password}}", "{{totp}}"]),
+        }),
+      )
+      .min(1)
+      .max(3),
+    submit: z.union([
+      z.object({ click: z.string() }),
+      z.object({ press_enter: z.string() }),
+    ]),
+  }),
+  z.object({
+    login_id: z.string(),
+    action: z.literal("snapshot"),
+  }),
+  z.object({
+    login_id: z.string(),
+    action: z.literal("abort"),
   }),
 ]);
 
@@ -294,6 +343,43 @@ export async function loginHandler(params: unknown) {
   }
 }
 
+/**
+ * Issue #46: login_begin / login_step の中継。応答が `state: "done"` のハンドオフの
+ * ときだけ、既存の login と同じ bridge トンネル書き換えを適用する。`pending` /
+ * `aborted` にはまだ CDP endpoint が無いため、そのまま中継する。
+ */
+export async function stepwiseHandler(
+  method: "login_begin" | "login_step",
+  params: unknown,
+) {
+  try {
+    const response = await callDaemon(method, params);
+    if (response.error !== undefined) {
+      if (typeof response.error.message !== "string") return internalError();
+      return errorResult(response.error.message, response.error.data);
+    }
+    if (!("result" in response)) return internalError();
+
+    const state =
+      typeof response.result === "object" && response.result !== null
+        ? (response.result as { state?: unknown }).state
+        : undefined;
+    if (state !== "done" || process.env.TEGATA_BRIDGE !== "1")
+      return successResult(response.result);
+
+    const loginResult = parseLoginResult(response.result);
+
+    const tunnel = await openBridgeTunnel(
+      loginResult.sessionId,
+      Number(loginResult.endpoint.port),
+    );
+    if ("failure" in tunnel) return tunnel.failure;
+    return successResult(rewriteEndpoint(loginResult, tunnel.localPort));
+  } catch {
+    return internalError();
+  }
+}
+
 type ParsedApiProxyResult = {
   result: Record<string, unknown>;
   sessionId: string;
@@ -369,6 +455,32 @@ server.registerTool(
     },
   },
   (args) => loginHandler(args),
+);
+
+server.registerTool(
+  "login_begin",
+  {
+    description:
+      "Begin a stepwise login: tegata navigates to target_url and returns a value-free snapshot of the page for the agent to drive one login_step at a time.",
+    inputSchema: {
+      cred_id: z.string(),
+      target_url: z.string(),
+      success_selector: z.string(),
+      failure_selector: z.string().optional(),
+      exclusive: z.boolean().optional(),
+    },
+  },
+  (args) => stepwiseHandler("login_begin", args),
+);
+
+server.registerTool(
+  "login_step",
+  {
+    description:
+      "Drive one step of a stepwise login started with login_begin. fill_submit is the only action that may use the {{password}} / {{totp}} placeholders.",
+    inputSchema: loginStepParams,
+  },
+  (args) => stepwiseHandler("login_step", args),
 );
 
 server.registerTool(

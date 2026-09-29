@@ -99,7 +99,7 @@ acceptance suite asserts none appear.
 ```
 ┌────────────────────────────────────────────────────────────────┐
 │ Agent                                                          │
-│   sees: a catalog of names, seven tools, a CDP endpoint        │
+│   sees: a catalog of names, nine tools, a CDP endpoint         │
 └────────────────────────────┬───────────────────────────────────┘
                              │ MCP over stdio
 ┌────────────────────────────▼───────────────────────────────────┐
@@ -156,10 +156,55 @@ daemon's `Secret` wrapper for the duration of the call, and on the executor's
 stdin. It is zeroed on drop, renders as `***` in any formatting, and never appears
 in a process argument list or an environment block.
 
+## A stepwise login, end to end
+
+`login_begin` / `login_step` (see
+[mcp-tools.md](mcp-tools.md#login_begin-and-login_step) for the full contract)
+replace the single `login` round trip with a `begin` → `step`* → `done` walk,
+so a multi-screen flow the agent cannot predict is driven one action at a
+time instead of guessed as one `steps` array:
+
+```
+Agent                    Broker         tegatad          Executor
+  │ login_begin(id, url)    │              │                │
+  │───────────────────────▶│─────────────▶│  resolve, spawn│
+  │                         │              │───────────────▶│  goto(url), settle
+  │                         │              │  build snapshot │◀───────────────
+  │                         │              │◀────────────────│
+  │                         │  check snapshot for a known secret (exact match)
+  │ {pending, login_id,     │              │                │
+  │  snapshot}              │              │                │
+  │◀───────────────────────│◀─────────────│                │
+  │                         │              │                │
+  │ login_step(click "More options")       │                │
+  │───────────────────────▶│─────────────▶│───────────────▶│  click, settle
+  │ {pending, snapshot}     │              │◀── snapshot ───│
+  │◀───────────────────────│◀─────────────│                │
+  │                         │              │                │
+  │ login_step(fill_submit {{totp}})       │                │
+  │───────────────────────▶│─────────────▶│───────────────▶│  fill, submit, settle
+  │                         │              │  success_selector attached
+  │ {done, session_id,      │              │                │
+  │  cdp endpoint}          │              │                │
+  │◀───────────────────────│◀─────────────│                │
+```
+
+Every snapshot the executor builds is checked against the daemon's registry
+of resolved secrets before it is handed back — the same exact-match search
+described in [security.md](security.md#stepwise-login) — and no answer
+carries a CDP endpoint until `success_selector` attaches and the browser is
+handed off. The daemon keeps a per-`login_id` ledger (principal, browser,
+last-activity time, start time, TOTP codes entered) to enforce
+`stepwise_idle_secs`, `stepwise_max_secs`, the 40-step cap, and that only the
+owning principal can continue a given `login_id`; a stepwise login counts as
+one `login` attempt against the approval gate and the attempt-rate limiter,
+not one attempt per step.
+
 ## The RPC layer
 
 The daemon speaks newline-delimited JSON-RPC 2.0. Method dispatch is an explicit
-allowlist — `status`, `list_credentials`, `login`, `authorize_device`, `logout`, `get_totp`,
+allowlist — `status`, `list_credentials`, `login`, `login_begin`, `login_step`,
+`authorize_device`, `logout`, `get_totp`,
 `lock_vault`, `open_api_proxy`, `open_mcp_server`, plus the administrative methods `admin_peer_issue`,
 `admin_peer_revoke`, `admin_peer_list`, and `admin_token_issue`, and on Windows
 `admin_seal`, `admin_approval_list`, and `admin_approval_decide`. Anything else

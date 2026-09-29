@@ -118,9 +118,9 @@ to container peers as well: sessions owned by another principal return
 
 ### 3. Only a thin, allowlisted RPC crosses the boundary
 
-Nine methods exist: `status`, `list_credentials`, `login`, `authorize_device`,
-`open_api_proxy`, `open_mcp_server`, `logout`, `get_totp`, `lock_vault`, plus
-the administrative
+Eleven methods exist: `status`, `list_credentials`, `login`, `login_begin`,
+`login_step`, `authorize_device`, `open_api_proxy`, `open_mcp_server`,
+`logout`, `get_totp`, `lock_vault`, plus the administrative
 methods `admin_peer_issue`, `admin_peer_revoke`, `admin_peer_list`, and
 `admin_token_issue`, and on Windows `admin_seal`, `admin_approval_list`, and
 `admin_approval_decide`. Anything else is answered with a JSON-RPC method-not-found
@@ -150,6 +150,12 @@ The RPC response leak scan does not cover CDP traffic.
 The executor never writes a trace, a video, a HAR file, or a screenshot. The
 guarantee against artifacts applies only to the executor's own behavior; anything
 the agent extracts through CDP is the agent's responsibility.
+
+A stepwise login (`login_begin` / `login_step`, see
+[below](#stepwise-login)) holds to the same rule: no `login_step` answer ever
+carries a CDP endpoint until the login has actually succeeded and the browser
+is handed off. Before that point, the agent's only view of the page is the
+value-free snapshot described there.
 
 ## How secrets move on the isolated side
 
@@ -335,6 +341,57 @@ way as `peer issue`. Because a live browser session re-exports its cookies when
 it ends, forgetting a credential while its session is still open only clears the
 file until that session's next save — run `logout` first if the intent is to
 remove the saved cookie for good.
+
+## Stepwise login
+
+`login_begin` and `login_step` (see [mcp-tools.md](mcp-tools.md#login_begin-and-login_step))
+let an agent drive a multi-screen login one action at a time instead of
+guessing the whole step list up front, without weakening the no-raw-CDP and
+no-field-value invariants above.
+
+**The snapshot returned between steps carries no field value.** It is built
+on the isolated side from the page's visible interactive elements and their
+non-value attributes only — no `value` property, `value` attribute, or
+`data-*` attribute of any element is ever serialized, regardless of the
+element's type or visibility. `fill_submit`, the only action that may place
+`{{password}}` or `{{totp}}`, fills and submits as one uninterruptible
+operation and clears what it filled from the DOM before any snapshot is
+built, so a secret is never present in a page the snapshot describes.
+
+**Every snapshot is checked for a known secret before it leaves the
+boundary.** The full serialization is searched, in raw, HTML-escaped,
+URL-encoded, base64, and hex form, for an exact match of the credential's
+password and of every TOTP code entered so far. A hit ends the stepwise
+login, discards its browser, and returns `SNAPSHOT_REJECTED` instead of the
+snapshot — the same defense-in-depth posture as the RPC-wide leak scan in
+[invariant 3](#3-only-a-thin-allowlisted-rpc-crosses-the-boundary), applied
+one layer earlier because a stepwise login's snapshot is not itself a fixed
+classification code.
+
+**Partial echoes are an accepted residual risk.** Only exact matches are
+checked. A site that echoes a masked form of the password — `••••••••`, a
+last-four-digits display, or similar — is not flagged, and is not meant to
+be: a partial-match check would need a similarity threshold, and any
+threshold low enough to catch a masked echo is also low enough to misfire on
+a login page that happens to contain a common word from the password (for
+example the literal word "password"). A check that can misfire is not a
+check an operator can trust to be deterministic, so this control stops at
+exact matches and accepts that a masked echo is not a full disclosure of the
+value.
+
+**A stepwise login can reach a re-authentication prompt on an
+already-authenticated page.** Nothing about `login_step` distinguishes a
+fresh login form from a step-up re-authentication screen — GitHub's "sudo
+mode" `input[type=password]`, for example — that appears on a page the
+session already had access to before `login_begin` was called, including a
+page reached immediately through a restored [persistent
+cookie](#persistent-cookies). An agent that walks such a page with
+`login_step` can `fill_submit` the password into that prompt exactly as it
+would a first-time login. This is not a new path: the same is already true
+of an explicit `steps` array passed to `login`. It matters more here because
+cookie restoration means a stepwise login is more likely to start from a
+page that is already signed in, increasing how often the agent's next click
+lands on a re-authentication prompt rather than a first-time login form.
 
 ## Human-in-the-loop approval
 

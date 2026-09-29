@@ -10,6 +10,7 @@ mod peers;
 mod provider;
 mod secure_fs;
 mod sessions;
+mod stepwise;
 mod transport;
 #[cfg(windows)]
 mod windows_cli;
@@ -127,6 +128,10 @@ struct Config {
     session_ttl_secs: Option<u64>,
     #[serde(default = "default_browser_max_lifetime_secs")]
     browser_max_lifetime_secs: u64,
+    #[serde(default = "default_stepwise_idle_secs")]
+    stepwise_idle_secs: u64,
+    #[serde(default = "default_stepwise_max_secs")]
+    stepwise_max_secs: u64,
     #[cfg(windows)]
     #[serde(default = "default_unlock_mode")]
     unlock_mode: UnlockMode,
@@ -153,6 +158,14 @@ fn default_max_pending_connections() -> usize {
 
 fn default_browser_max_lifetime_secs() -> u64 {
     3600
+}
+
+fn default_stepwise_idle_secs() -> u64 {
+    stepwise::DEFAULT_IDLE_SECS
+}
+
+fn default_stepwise_max_secs() -> u64 {
+    stepwise::DEFAULT_MAX_SECS
 }
 
 /// `[[api_proxy]]` の 1 項目。agent は `name` で選ぶだけで、上流・注入ヘッダは設定で固定される。
@@ -624,6 +637,8 @@ struct DaemonState {
     api_proxies: HashMap<String, ApiProxyConfig>,
     mcp_servers: HashMap<String, McpServerConfig>,
     cookie_store: Arc<cookie_store::CookieStore>,
+    /// ハンドオフ前の段階ログインの台帳。
+    stepwise: stepwise::Ledger,
     #[cfg(windows)]
     sealed_blob_path: PathBuf,
 }
@@ -638,6 +653,7 @@ enum ErrorCode {
     MfaRequired,
     SelectorNotFound,
     FillMismatch,
+    SnapshotRejected,
     DeviceCodeRejected,
     LoginResultTimeout,
     VaultLocked,
@@ -662,6 +678,7 @@ impl ErrorCode {
             Self::MfaRequired => "MFA_REQUIRED",
             Self::SelectorNotFound => "SELECTOR_NOT_FOUND",
             Self::FillMismatch => "FILL_MISMATCH",
+            Self::SnapshotRejected => "SNAPSHOT_REJECTED",
             Self::DeviceCodeRejected => "DEVICE_CODE_REJECTED",
             Self::LoginResultTimeout => "LOGIN_RESULT_TIMEOUT",
             Self::VaultLocked => "VAULT_LOCKED",
@@ -761,6 +778,15 @@ struct AuditFields {
     removed: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     all: Option<bool>,
+    /// 段階ログインの行（`login_begin`・`login_step`・終了の行）で、その段階ログインの ID。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    login_id: Option<String>,
+    /// `login_step` の行で、action の種別名。selector や値は載せない。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+    /// 段階ログインに関する行であること。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stepwise: Option<bool>,
 }
 
 /// login 行・セッション終了行に載せる cookie 永続化の監査項目。永続化対象の資格でのみ値を持つ。
@@ -1150,6 +1176,12 @@ async fn run_daemon(
     if config.browser_max_lifetime_secs == 0 {
         return Err("browser_max_lifetime_secs must be at least 1".into());
     }
+    if config.stepwise_idle_secs == 0 {
+        return Err("stepwise_idle_secs must be at least 1".into());
+    }
+    if config.stepwise_max_secs == 0 {
+        return Err("stepwise_max_secs must be at least 1".into());
+    }
     let listeners = normalize_listeners(&config_text, &config)?;
     validate_api_proxies(&config.api_proxy)?;
     validate_mcp_servers(&config.mcp_server)?;
@@ -1241,6 +1273,7 @@ async fn run_daemon(
     }
     spawn_session_reaper(state.clone());
     spawn_provider_expiry_reaper(state.clone());
+    stepwise::spawn_reaper(state.clone());
     if ready {
         let ready_line = r#"{"ready":true}"#;
         println!("{}", ready_line);
@@ -1259,6 +1292,7 @@ async fn serve_transport(
     // transport failure. Reap every live executor before returning so
     // interrupted sessions do not leave orphaned browser processes behind.
     terminate_browsers(&state, drain_browsers(&state, None).await).await;
+    stepwise::terminate(&state, None, stepwise::EndReason::Shutdown).await;
     result
 }
 
@@ -1433,6 +1467,10 @@ async fn build_state(
     let bw_path = resolve_bw_path(&config);
     let session_ttl = Duration::from_secs(config.session_ttl_secs.unwrap_or(300));
     let browser_max_lifetime = Duration::from_secs(config.browser_max_lifetime_secs);
+    let stepwise = stepwise::Ledger::new(
+        Duration::from_secs(config.stepwise_idle_secs),
+        Duration::from_secs(config.stepwise_max_secs),
+    );
     let state_dir = PathBuf::from(&config.state_dir);
     let api_proxies = config
         .api_proxy
@@ -1547,6 +1585,7 @@ async fn build_state(
         api_proxies,
         mcp_servers,
         cookie_store: Arc::new(cookie_store),
+        stepwise,
         #[cfg(windows)]
         sealed_blob_path,
     })
@@ -1870,8 +1909,10 @@ async fn serve_connection<S>(
                     )
                     .await;
                 let mut fields = fields;
-                if request.method == "login"
-                    && handled.outcome == "ok"
+                if matches!(
+                    request.method.as_str(),
+                    "login" | "login_begin" | "login_step"
+                ) && handled.outcome == "ok"
                     && let Some(result) = handled.response.result.as_ref()
                 {
                     fields.session_id = result
@@ -1879,6 +1920,13 @@ async fn serve_connection<S>(
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned);
                     fields.shared = handled.audit_shared;
+                    // 段階ログインを始めた行には、以後の login_step 行と対応づけるため login_id を載せる。
+                    if request.method == "login_begin" {
+                        fields.login_id = result
+                            .get("login_id")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned);
+                    }
                 }
                 if let Some(handler_fields) = handled.audit_fields {
                     fields = handler_fields;
@@ -1937,6 +1985,10 @@ async fn write_response<W: AsyncWrite + Unpin>(
     let registry = daemon.registry.lock().await;
     let leaked = scan_bytes(&response_bytes, registry.as_slice());
     drop(registry);
+    // secret を含むページに対して段階ログインを続けさせないため、差し替えた pending 応答の段階ログインは終了する。
+    let leaked_login_id = (!leaked.is_empty())
+        .then(|| stepwise::pending_login_id(&method, response.result.as_ref()))
+        .flatten();
     let final_outcome = if leaked.is_empty() {
         outcome
     } else {
@@ -1968,6 +2020,9 @@ async fn write_response<W: AsyncWrite + Unpin>(
         eprintln!("tegatad: audit append failed: {error}");
     }
     drop(daemon);
+    if let Some(login_id) = leaked_login_id {
+        stepwise::end_leaked(state, &login_id, peer).await;
+    }
     response_bytes.push(b'\n');
     writer.write_all(&response_bytes).await?;
     writer.flush().await?;
@@ -2109,6 +2164,8 @@ async fn handle_request(
         "status" => status(request, state).await,
         "list_credentials" => list_credentials(request, state).await,
         "login" => login(request, state, peer).await,
+        "login_begin" => stepwise::login_begin(request, state, peer).await,
+        "login_step" => stepwise::login_step(request, state, peer).await,
         "authorize_device" => authorize_device(request, state, peer).await,
         "open_api_proxy" => open_service::<ApiProxyConfig>(request, state, peer).await,
         "open_mcp_server" => open_service::<McpServerConfig>(request, state, peer).await,
@@ -2542,23 +2599,13 @@ async fn start_login(
         Ok(credential) => credential,
         Err(error) => return classified(request.id.clone(), error),
     };
-    let (
-        executor_entry,
-        executor_socket,
-        node_path,
-        browsers_path,
-        ttl,
-        browser_max_lifetime,
-        cookie_store,
-    ) = {
+    let (executor_entry, executor_socket, node_path, browsers_path, cookie_store) = {
         let daemon = state.lock().await;
         (
             daemon.executor_entry.clone(),
             daemon.executor_socket.clone(),
             daemon.node_path.clone(),
             daemon.browsers_path.clone(),
-            daemon.session_ttl,
-            daemon.browser_max_lifetime,
             daemon.cookie_store.clone(),
         )
     };
@@ -2592,10 +2639,72 @@ async fn start_login(
     let ExecutorLoginStarted {
         endpoint,
         target_id,
-        mut executor,
+        executor,
         cookies: returned_cookies,
         steps_skipped,
     } = started;
+    let registration = BrowserRegistration {
+        key: key.clone(),
+        principal,
+        exclusive,
+        persist_cookies,
+        endpoint,
+        target_id,
+        executor,
+        next_id: 2,
+        browser_started_at,
+    };
+    let result = match register_login_browser(&state, registration).await {
+        Ok(result) => result,
+        Err(error) => return classified(request.id.clone(), error),
+    };
+    let cookie_audit = persist_cookies.then(|| {
+        if let Some(cookies) = returned_cookies.as_ref() {
+            save_cookies(&cookie_store, &key, cookies);
+        }
+        CookieAudit::login(restored_cookies.is_some(), steps_skipped)
+    });
+    success(request.id.clone(), result)
+        .with_audit_shared(false)
+        .with_audit_cookies(cookie_audit)
+}
+
+/// ログインを終えた executor を、リースを 1 件持つブラウザとして登録するための値。
+struct BrowserRegistration {
+    key: sessions::BrowserKey,
+    principal: String,
+    exclusive: bool,
+    persist_cookies: bool,
+    endpoint: String,
+    target_id: String,
+    executor: ExecutorHandle,
+    /// executor へ次に送る要求の id。それまでに用いた id と重ならない値とする。
+    next_id: u64,
+    browser_started_at: Instant,
+}
+
+/// ログインを終えた executor をブラウザとして台帳へ登録し、応答を読む reaper を起動する。
+/// 戻り値は `login` の成功応答（`session_id`・`target_id`・`channel`）である。
+/// 登録できない場合は executor を停止して `INTERNAL` を返す。
+async fn register_login_browser(
+    state: &SharedState,
+    registration: BrowserRegistration,
+) -> Result<Value, ErrorCode> {
+    let BrowserRegistration {
+        key,
+        principal,
+        exclusive,
+        persist_cookies,
+        endpoint,
+        target_id,
+        mut executor,
+        next_id,
+        browser_started_at,
+    } = registration;
+    let (ttl, browser_max_lifetime) = {
+        let daemon = state.lock().await;
+        (daemon.session_ttl, daemon.browser_max_lifetime)
+    };
     let deadline = browser_started_at + browser_max_lifetime;
     let session_id = Uuid::new_v4().to_string();
     let reader = executor
@@ -2605,19 +2714,19 @@ async fn start_login(
         Ok(reader) => reader,
         Err(_) => {
             stop_child(executor).await;
-            return classified(request.id.clone(), ErrorCode::Internal);
+            return Err(ErrorCode::Internal);
         }
     };
     let Some(port) = cdp_port_from_endpoint(&endpoint) else {
         stop_child(executor).await;
-        return classified(request.id.clone(), ErrorCode::Internal);
+        return Err(ErrorCode::Internal);
     };
     let (response_sender, response_receiver) = mpsc::unbounded_channel();
     let connection = Arc::new(ExecutorConnection {
         executor: Mutex::new(executor),
         responses: Mutex::new(response_receiver),
         operation: Mutex::new(()),
-        next_id: AtomicU64::new(2),
+        next_id: AtomicU64::new(next_id),
     });
     let browser_id = Uuid::new_v4().to_string();
     let response_target_id = target_id.clone();
@@ -2644,14 +2753,8 @@ async fn start_login(
         ports.insert(session_id.clone(), (principal, port));
     } else {
         shutdown_executor(connection).await;
-        return classified(request.id.clone(), ErrorCode::Internal);
+        return Err(ErrorCode::Internal);
     }
-    let cookie_audit = persist_cookies.then(|| {
-        if let Some(cookies) = returned_cookies.as_ref() {
-            save_cookies(&cookie_store, &key, cookies);
-        }
-        CookieAudit::login(restored_cookies.is_some(), steps_skipped)
-    });
     let mut daemon = state.lock().await;
     daemon.browsers.insert(browser_id.clone(), browser);
     if !exclusive {
@@ -2659,16 +2762,11 @@ async fn start_login(
     }
     drop(daemon);
     spawn_executor_reaper(state.clone(), browser_id, reader, response_sender, None);
-    success(
-        request.id.clone(),
-        json!({
-            "session_id": session_id,
-            "target_id": response_target_id,
-            "channel": { "kind": "cdp", "endpoint": endpoint },
-        }),
-    )
-    .with_audit_shared(false)
-    .with_audit_cookies(cookie_audit)
+    Ok(json!({
+        "session_id": session_id,
+        "target_id": response_target_id,
+        "channel": { "kind": "cdp", "endpoint": endpoint },
+    }))
 }
 
 /// 起動制御を鍵ごとに取り出す。無ければ作成する。
@@ -3763,6 +3861,7 @@ async fn lock_vault(request: &RpcRequest, state: SharedState) -> HandledRequest 
     }
     let browsers = drain_browsers(&state, namespace.as_deref()).await;
     terminate_browsers(&state, browsers).await;
+    stepwise::terminate(&state, namespace.as_deref(), stepwise::EndReason::LockVault).await;
     success(request.id.clone(), json!({ "ok": true }))
 }
 
@@ -3854,6 +3953,7 @@ async fn terminate_browser(
 
 async fn terminate_peer_leases(state: SharedState, peer_id: &str) {
     let principal = format!("peer:{peer_id}");
+    stepwise::terminate_principal(&state, &principal).await;
     let removed = {
         let mut daemon = state.lock().await;
         let browser_ids = daemon.browsers.keys().cloned().collect::<Vec<_>>();
@@ -4532,6 +4632,7 @@ fn parse_error_code(value: &str) -> ErrorCode {
         "MFA_REQUIRED" => ErrorCode::MfaRequired,
         "SELECTOR_NOT_FOUND" => ErrorCode::SelectorNotFound,
         "FILL_MISMATCH" => ErrorCode::FillMismatch,
+        "SNAPSHOT_REJECTED" => ErrorCode::SnapshotRejected,
         "DEVICE_CODE_REJECTED" => ErrorCode::DeviceCodeRejected,
         "LOGIN_RESULT_TIMEOUT" => ErrorCode::LoginResultTimeout,
         "VAULT_LOCKED" => ErrorCode::VaultLocked,
@@ -5152,7 +5253,7 @@ fn optional_namespace(params: &Value) -> Result<Option<String>, ErrorCode> {
 /// method が解釈しないキーまで転記すると、呼び出し側が監査記録を偽装できるためである。
 fn audit_param_keys(method: &str) -> &'static [&'static str] {
     match method {
-        "login" => &["cred_id", "target_url"],
+        "login" | "login_begin" => &["cred_id", "target_url"],
         "authorize_device" => &["cred_id", "verification_url"],
         "logout" => &["session_id"],
         "get_totp" => &["cred_id"],
@@ -5180,17 +5281,27 @@ fn audit_fields(method: &str, params: &Value) -> AuditFields {
     };
     let cred_id = field("cred_id");
     let namespace = match method {
-        "login" | "authorize_device" | "get_totp" => cred_id
+        "login" | "login_begin" | "authorize_device" | "get_totp" => cred_id
             .as_deref()
             .and_then(|cred_id| cred_id.split_once(':'))
             .map(|(namespace, _)| namespace.to_owned()),
         _ => field("namespace"),
+    };
+    let (login_id, action) = match method {
+        "login_step" => (
+            stepwise::audit_login_id(params),
+            stepwise::audit_action(params),
+        ),
+        _ => (None, None),
     };
     AuditFields {
         cred_id,
         target_url,
         session_id: field("session_id"),
         namespace,
+        login_id,
+        action,
+        stepwise: matches!(method, "login_begin" | "login_step").then_some(true),
         ..AuditFields::default()
     }
 }

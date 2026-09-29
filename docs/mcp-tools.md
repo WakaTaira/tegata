@@ -1,6 +1,6 @@
 # MCP tool contract
 
-This is the complete surface tegata exposes to an agent. Seven tools, no generic
+This is the complete surface tegata exposes to an agent. Nine tools, no generic
 escape hatch. Anything not listed here does not cross the boundary.
 
 ## Connecting
@@ -70,7 +70,8 @@ the public code format; arbitrary daemon text is normalised to `INTERNAL`.
 | `APPROVAL_DENIED` | A configured approval hook refused this login |
 | `APPROVAL_TIMEOUT` | The approval hook did not answer within its timeout |
 | `PROVIDER_UNAVAILABLE` | A transient failure of the credential provider (for example the Bitwarden CLI failing or timing out right after a daemon restart); the call may be retried. Returned by `list_credentials`, `login`, `get_totp`, and `lock_vault` when they call a provider |
-| `NOT_FOUND` | The session does not exist or belongs to another principal; its existence is not disclosed |
+| `NOT_FOUND` | The session does not exist or belongs to another principal; its existence is not disclosed. Also returned by `login_step` for an unknown, expired, or foreign `login_id` |
+| `SNAPSHOT_REJECTED` | A `login_step` snapshot would have echoed a secret it just filled; the stepwise login ended and its browser was discarded |
 | `INTERNAL` | Anything else, including a refused response that failed the leak scan |
 
 For an explicit `steps` array, `structuredContent.step` is the zero-based index
@@ -295,6 +296,170 @@ backoff periods of 2 seconds, 5 seconds, then 15 seconds; calls during backoff
 return `RATE_LIMITED`. More than 3 reauthentication attempts for the same key in
 10 minutes also returns `RATE_LIMITED`.
 
+## `login_begin` and `login_step`
+
+Walk a multi-screen login one action at a time instead of guessing the whole
+`steps` array up front. `login_begin` opens the page; each `login_step` drives
+one action and, unless it hands the login off, answers with a fresh snapshot
+that tegata builds and checks before returning it — the agent never receives
+raw CDP, and no field value ever leaves the boundary, until the login
+succeeds.
+
+Use `login` when the whole flow is known ahead of time or is a simple
+single-page form. Use `login_begin` / `login_step` for logins with
+intermediate screens the agent cannot predict — a "More options" choice
+before a TOTP field, for example — where a wrong guess in a `login` `steps`
+array only returns `SELECTOR_NOT_FOUND` with no view of the page that caused
+it.
+
+### `login_begin`
+
+**Input**
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `cred_id` | string | yes | An `id` from `list_credentials` |
+| `target_url` | string | yes | The login page to open |
+| `success_selector` | string | yes | A selector that appears only when login succeeded; stepwise login has no automatic-detection fallback, so this is required |
+| `failure_selector` | string | no | A selector that appears only when login failed |
+| `exclusive` | boolean | no | Defaults to `false`; applies to the browser once it is handed off |
+
+**Output** — one of:
+
+```json
+{ "state": "pending", "login_id": "5c9e...", "snapshot": { "...": "..." } }
+```
+
+```json
+{
+  "state": "done",
+  "session_id": "3f2b1c9e-...",
+  "target_id": "page-target-id",
+  "channel": { "kind": "cdp", "endpoint": "ws://127.0.0.1:41263/devtools/browser/..." }
+}
+```
+
+A non-`exclusive` `login_begin` first tries to join an existing shared browser
+for the same principal, namespace, and `cred_id`, exactly like `login`; a
+successful join returns `state: "done"` immediately, with no browser started
+and no snapshot involved.
+
+### `login_step`
+
+**Input** is flat: `{ "login_id", "action", ...the fields of that action }`.
+
+| Action | Fields | Meaning |
+| --- | --- | --- |
+| `click` | `selector` | Click the element |
+| `wait_for` | `selector` | Wait for the element to become visible; same per-step timeout and `SELECTOR_NOT_FOUND` as `login` |
+| `fill` | `selector`, `value` | Fill one element. `value` must be `{{username}}` — a lone `fill` may not place `{{password}}` or `{{totp}}` |
+| `fill_submit` | `fills` (1–3 of `{selector, value}`), `submit` (`{"click": selector}` or `{"press_enter": selector}`) | Fill one to three elements and submit as one uninterruptible operation; `value` is `{{username}}`, `{{password}}`, or `{{totp}}` — this is the only action that may place a secret |
+| `snapshot` | — | Take a fresh snapshot without acting on the page |
+| `abort` | — | Discard the browser and end the stepwise login |
+
+**Output** is the same three shapes as `login_begin`'s output, plus
+`{ "state": "aborted" }` for `abort`.
+
+`fill_submit` fills its elements with the same native-setter, no-keystroke
+mechanism as `login`, then submits, then waits to settle (below). Whatever it
+filled is cleared from the DOM afterward regardless of outcome. A
+`SELECTOR_NOT_FOUND` during `fill_submit` leaves the stepwise login open for
+another step; a `FILL_MISMATCH` ends it, the same way a suspected
+secret-misroute ends a `login`. While one `fill_submit` runs, other
+`login_step` calls on the same `login_id`, including `snapshot`, wait for it.
+
+Other than inside `fill_submit`, `{{password}}` and `{{totp}}` are rejected —
+by the tool's input schema when called through MCP, and again by the daemon
+when called directly over the socket.
+
+### The snapshot
+
+Built on the isolated side after every settle, from the main frame and any
+open shadow roots:
+
+```json
+{
+  "url": "https://example.com/login/2fa",
+  "title": "Verify it's you",
+  "text": "...",
+  "elements": [
+    {
+      "tag": "button", "type": null, "id": null, "name": null,
+      "role": "button", "placeholder": null, "aria-label": null,
+      "autocomplete": null, "href": null, "disabled": false,
+      "text": "More options", "selector": "#more-options"
+    }
+  ],
+  "settled": true
+}
+```
+
+`text` is `document.body.innerText`, truncated to 2000 characters. `elements`
+lists visible `button`, `a[href]`, `input`, `select`, `textarea`, and
+`[role=button]` / `[role=link]` elements, up to 200, each with only the
+attributes above plus a `selector` tegata generates (an `#id` if unique, else
+a `[name=...]` match, else a positional path) — the same selector the agent
+passes back in the next step. **No `value` property, `value` attribute, or
+`data-*` attribute of any element is ever included**, regardless of the
+element's type or visibility. The whole snapshot is capped at 64 KiB
+serialized; over that, `elements` is trimmed from the end and `truncated:
+true` is added.
+
+`settled` reports whether the page reached a quiet DOM before the snapshot
+was taken: up to 10 seconds for `domcontentloaded` if the action navigated,
+then up to 5 seconds of no DOM mutation for 500 ms straight. Hitting either
+limit still returns a snapshot, marked `settled: false`, rather than an
+error; `networkidle` is not used, matching `login`'s own note about sites
+that long-poll continuously.
+
+The snapshot's username is always replaced with `[username]` — raw,
+HTML-escaped, and URL-encoded forms — before anything else happens to it.
+This is not an omission the agent can rely on for other values: it exists
+because the daemon's own response leak scan would otherwise flag the
+credential's username and turn the whole response into `INTERNAL`.
+
+### `SNAPSHOT_REJECTED`
+
+Before a snapshot is returned, its full serialization — text, attributes, and
+URL — is checked for an exact match, in raw, HTML-escaped, URL-encoded (both
+`encodeURIComponent` and full percent-encoding), base64, and hex form, of the
+credential's password and of every TOTP code entered so far in that stepwise
+login. A single match ends the stepwise login, discards its browser, and
+returns `SNAPSHOT_REJECTED` instead of the snapshot; the same `login_id` then
+answers `NOT_FOUND`. Only exact matches are checked — a masked echo such as
+`••••` or a last-four-digits display is not a full disclosure and is not
+flagged; see [security.md](security.md#stepwise-login) for why partial
+matches are out of scope.
+
+### Timeouts, step count, and rate limiting
+
+A stepwise login ends, its browser is discarded, and a `stepwise_expired`
+audit record is written if either deadline passes:
+
+- `stepwise_idle_secs` (default 120) since the last `login_begin` /
+  `login_step` answer, with no further `login_step`.
+- `stepwise_max_secs` (default 600) since `login_begin`, regardless of
+  activity.
+
+A `login_id` accepts at most 40 `login_step` calls; the 41st returns
+`RATE_LIMITED` and ends the stepwise login.
+
+A stepwise login counts as a single `login` attempt for rate limiting and
+approval: `login_begin` is gated on an approval hook exactly like `login`,
+and counts once against the same-key attempt limit (3 per 10 minutes, with
+the 2/5/15-second backoff). `login_step` calls are never gated and never
+counted — the flow can take many steps without spending the whole budget on
+one login. `abort` does not count as a failure.
+
+### Persistent cookies
+
+When the credential has restored cookies (see
+[security.md](security.md#persistent-cookies)) into a new browser and
+`success_selector` is already visible on the first check, `login_begin`
+finishes as `state: "done"` without ever building or returning a snapshot,
+the same shortcut `login` takes; its audit record carries `cookies:
+"restored"` and `steps_skipped: true`.
+
 ## `logout`
 
 **Input**
@@ -471,7 +636,10 @@ NAT networking cannot reach.
 With `TEGATA_BRIDGE=1`, the broker handles this: after a successful `login` it
 opens a tunnel for that session and rewrites the endpoint's port to the WSL-local
 end before returning it. The agent receives an endpoint it can connect to directly
-and does not need to know a tunnel exists.
+and does not need to know a tunnel exists. `login_begin` / `login_step` get the
+same treatment for their `state: "done"` answer, the only one carrying a CDP
+endpoint; a `pending` or `aborted` answer has no endpoint to rewrite and is
+returned as is.
 
 The tunnel is not general-purpose. The daemon accepts a tunnel request only for the
 CDP port belonging to the named active session. A session belonging to another

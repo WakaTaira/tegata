@@ -23,9 +23,11 @@ const STREAM_SECRET: &str = "fake-stream-secret_A1";
 /// 受けた要求を `executor.js.log` に 1 行ずつ記録する偽 executor の雛形。
 /// `__AFTER_START__` は開始応答の直後に実行する処理に置き換える。停止・終了の応答の直前には
 /// id を持たないイベント行を書き、デーモンがイベント行を応答と取り違えないことを確かめられるようにする。
+/// stdin が閉じても待機を続けるが、親のデーモンが消えたら終了する（テストの後始末で孤児を残さないため、#47）。
 const MCP_EXECUTOR_TEMPLATE: &str = r#"
 const fs = require("node:fs");
 const readline = require("node:readline");
+const parent = process.ppid;
 const log = (value) => fs.appendFileSync(__filename + ".log", JSON.stringify(value) + "\n");
 const event = (action, extra) =>
   process.stdout.write(JSON.stringify({ event: "mcp_server", action, ...extra }) + "\n");
@@ -44,7 +46,7 @@ rl.on("line", (line) => {
     process.exit(0);
   }
 });
-rl.on("close", () => { setInterval(() => {}, 1000); });
+rl.on("close", () => { setInterval(() => { if (process.ppid !== parent) process.exit(0); }, 200); });
 "#;
 
 /// 開始要求を失敗させる偽 executor。

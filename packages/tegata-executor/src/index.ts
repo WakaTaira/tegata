@@ -8,6 +8,7 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import {
   type Browser,
+  type BrowserContext,
   chromium,
   type Locator,
   type Page,
@@ -67,6 +68,18 @@ type DeviceStep = DeviceFillStep | ClickStep | WaitForStep;
 
 type RequestId = number;
 
+/** デーモンと受け渡す cookie の形。Playwright の Cookie 型のうち、ここに挙げる項目のみを扱う。 */
+export type Cookie = {
+  name: string;
+  value: string;
+  domain: string;
+  path: string;
+  expires: number;
+  httpOnly: boolean;
+  secure: boolean;
+  sameSite: "Strict" | "Lax" | "None";
+};
+
 type LoginRequest = {
   op: "login";
   id?: RequestId;
@@ -74,6 +87,8 @@ type LoginRequest = {
   steps: LoginStep[] | null;
   success_selector: string | null;
   failure_selector: string | null;
+  // 省略は null と同じ扱いとし、cookie を復元しない。
+  cookies?: Cookie[] | null;
   secret: {
     username: string;
     password: string;
@@ -96,6 +111,8 @@ type AuthorizeDeviceRequest = {
 type LeaseRequest = { op: "lease"; id?: RequestId };
 
 type ReleaseRequest = { op: "release"; id?: RequestId; target_id: string };
+
+type ExportCookiesRequest = { op: "export_cookies"; id?: RequestId };
 
 type StaticApiProxyStartRequest = {
   op: "api_proxy_start";
@@ -149,6 +166,7 @@ type Request =
   | AuthorizeDeviceRequest
   | LeaseRequest
   | ReleaseRequest
+  | ExportCookiesRequest
   | ApiProxyStartRequest
   | ApiProxyStopRequest
   | McpServerStartRequest
@@ -254,9 +272,12 @@ function requestSecrets(request: DiagnosticRequest): SecretCandidates {
     request.secret.password,
     request.secret.totp,
   ];
-  return request.op === "login"
-    ? loginSecrets
-    : [...loginSecrets, request.user_code];
+  if (request.op !== "login") {
+    return [...loginSecrets, request.user_code];
+  }
+  // 復元用 cookie の値も、失敗時のページ内例外文言に紛れ込みうるため秘匿対象に含める。
+  const cookieValues = (request.cookies ?? []).map((cookie) => cookie.value);
+  return [...loginSecrets, ...cookieValues];
 }
 
 /**
@@ -371,6 +392,7 @@ let activeBrowser: Browser | undefined;
 let activeGuard: CdpGuard | undefined;
 let activeTempDir: string | undefined;
 let activeBrowserContextId: string | undefined;
+let activeLoginContext: BrowserContext | undefined;
 let activeApiProxy: { close: () => Promise<void> } | undefined;
 let activeMcpServer: McpServerHost | undefined;
 let activeMcpStart: Promise<void> | undefined;
@@ -815,6 +837,65 @@ function parseMcpServerStart(
   };
 }
 
+const cookieSameSiteValues: ReadonlySet<unknown> = new Set([
+  "Strict",
+  "Lax",
+  "None",
+]);
+
+// Playwright が受け付ける有効期限の上限（9999-12-31T23:59:59Z）。
+const MAX_COOKIE_EXPIRES_SECONDS = 253_402_300_799;
+
+function isCookieExpires(value: unknown): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isFinite(value) &&
+    (value === -1 || (value > 0 && value <= MAX_COOKIE_EXPIRES_SECONDS))
+  );
+}
+
+/** 形が正しい場合に限り、既知の項目だけを写した cookie を返す。 */
+function toCookie(value: unknown): Cookie | undefined {
+  if (
+    !isRecord(value) ||
+    typeof value.name !== "string" ||
+    typeof value.value !== "string" ||
+    typeof value.domain !== "string" ||
+    value.domain === "" ||
+    typeof value.path !== "string" ||
+    value.path === "" ||
+    !isCookieExpires(value.expires) ||
+    typeof value.httpOnly !== "boolean" ||
+    typeof value.secure !== "boolean" ||
+    !cookieSameSiteValues.has(value.sameSite)
+  ) {
+    return undefined;
+  }
+  return {
+    name: value.name,
+    value: value.value,
+    domain: value.domain,
+    path: value.path,
+    expires: value.expires,
+    httpOnly: value.httpOnly,
+    secure: value.secure,
+    sameSite: value.sameSite as Cookie["sameSite"],
+  };
+}
+
+/**
+ * cookie の内容は executor 自身が過去に返したものであり、信頼境界の外側の入力として扱う。
+ * 形の不正な要素は捨て、要求全体は拒否しない。
+ */
+function parseCookies(value: unknown, id?: RequestId): Cookie[] | null {
+  if (isAbsent(value)) return null;
+  if (!Array.isArray(value)) throw new InvalidRequestError(id);
+  return value.flatMap((item) => {
+    const cookie = toCookie(item);
+    return cookie === undefined ? [] : [cookie];
+  });
+}
+
 export function parseRequest(line: string): Request {
   let value: unknown;
   try {
@@ -830,6 +911,7 @@ export function parseRequest(line: string): Request {
   if (value.op === "hello") return { op: "hello", id };
   if (value.op === "shutdown") return { op: "shutdown", id };
   if (value.op === "lease") return { op: "lease", id };
+  if (value.op === "export_cookies") return { op: "export_cookies", id };
   if (value.op === "api_proxy_stop") return { op: "api_proxy_stop", id };
   if (value.op === "api_proxy_start") return parseApiProxyStart(value, id);
   if (value.op === "mcp_server_stop") return { op: "mcp_server_stop", id };
@@ -918,6 +1000,7 @@ export function parseRequest(line: string): Request {
     steps,
     success_selector: value.success_selector ?? null,
     failure_selector: value.failure_selector ?? null,
+    cookies: parseCookies(value.cookies, id),
     secret: {
       username: secret.username,
       password: secret.password,
@@ -1952,27 +2035,155 @@ async function openBrowserPage() {
   }
 }
 
-async function executeLogin(
+/**
+ * Playwright の cookie から、デーモンと受け渡す項目のみを写す。
+ * toCookie と同じ検証・コピーを再利用する。検証を通らない要素は捨てる
+ * （デーモン側でも再検証するため、ここで例外にしてログイン全体を失敗させない）。
+ */
+export function toExportedCookie(cookie: Cookie): Cookie | undefined {
+  return toCookie(cookie);
+}
+
+async function readContextCookies(
+  guard: CdpGuard,
+  context: BrowserContext,
+): Promise<Cookie[]> {
+  const cookies = await withGuard(guard, () => context.cookies());
+  return cookies.flatMap((cookie) => {
+    const exported = toExportedCookie(cookie);
+    return exported === undefined ? [] : [exported];
+  });
+}
+
+/**
+ * cookie を context へ復元し、受け付けられた件数を返す。Chromium は 1 件でも受け付けない cookie があると
+ * 一括の設定全体を拒否するため、その場合は 1 件ずつ設定し直して受け付けられないものを捨てる。
+ * 個々の失敗の例外は cookie の内容を含みうるため破棄し、ガードの失敗のみを伝播させる。
+ */
+async function restoreCookies(
+  guard: CdpGuard,
+  context: BrowserContext,
+  cookies: Cookie[],
+): Promise<number> {
+  if (cookies.length === 0) return 0;
+  try {
+    await withGuard(guard, () => context.addCookies(cookies));
+    return cookies.length;
+  } catch {
+    guard.assertOpen();
+  }
+  let restored = 0;
+  for (const cookie of cookies) {
+    try {
+      await withGuard(guard, () => context.addCookies([cookie]));
+      restored += 1;
+    } catch {
+      guard.assertOpen();
+    }
+  }
+  return restored;
+}
+
+// 既定ステップ（steps が null）が最初に待つ要素。
+const DEFAULT_FIRST_STEP_SELECTOR = 'input[type="password"]';
+
+// ステップの selector 待ちの上限（1 ステップあたり）。
+const STEP_SELECTOR_TIMEOUT_MS = 10_000;
+
+function firstStepSelector(steps: LoginStep[] | null): string | undefined {
+  if (steps === null) return DEFAULT_FIRST_STEP_SELECTOR;
+  return steps[0]?.selector;
+}
+
+async function waitUntilVisible(
+  page: Page,
+  selector: string,
+): Promise<boolean> {
+  try {
+    await page
+      .locator(selector)
+      .first()
+      .waitFor({ state: "visible", timeout: STEP_SELECTOR_TIMEOUT_MS });
+    return true;
+  } catch (error) {
+    if (isTimeoutError(error)) return false;
+    throw error;
+  }
+}
+
+/**
+ * 成功の要素と最初のステップの要素のどちらが先に可視になるかを返す。
+ * どちらも上限までに現れない場合は undefined を返す。
+ */
+async function raceSuccessAgainstFirstStep(
+  page: Page,
+  successSelector: string,
+  stepSelector: string,
+): Promise<"success" | "steps" | undefined> {
+  const success = waitUntilVisible(page, successSelector).then((visible) =>
+    visible ? ("success" as const) : undefined,
+  );
+  const step = waitUntilVisible(page, stepSelector).then((visible) =>
+    visible ? ("steps" as const) : undefined,
+  );
+  return raceDecisive(
+    [success, step],
+    Promise.all([success, step]).then(() => undefined),
+  );
+}
+
+/**
+ * 復元した cookie によって既にログイン済みであるかを判定する。ログイン済みであれば、ステップを実行せず
+ * （秘密をページへ入れず）に成功として扱える。success_selector が無い場合は判定しない。
+ */
+async function isLoggedInByRestoredCookies(
+  guard: CdpGuard,
+  page: Page,
   request: LoginRequest,
-): Promise<{ endpoint: string; targetId: string }> {
+): Promise<boolean> {
+  const successSelector = request.success_selector;
+  const stepSelector = firstStepSelector(request.steps);
+  if (successSelector === null || stepSelector === undefined) return false;
+  const first = await withGuard(guard, () =>
+    raceSuccessAgainstFirstStep(page, successSelector, stepSelector),
+  );
+  return first === "success";
+}
+
+type LoginOutcome = {
+  endpoint: string;
+  targetId: string;
+  cookies: Cookie[];
+  stepsSkipped: boolean;
+};
+
+async function executeLogin(request: LoginRequest): Promise<LoginOutcome> {
   const { endpoint, page, pageSession, targetId, browserContextId } =
     await openBrowserPage();
   const guard = activeGuard;
   if (guard === undefined) throw new Error("CDP guard is not available");
+  const context = page.context();
+  const restored = await restoreCookies(guard, context, request.cookies ?? []);
   await withGuard(guard, () => page.goto(request.target_url));
-  await withGuard(guard, () => runSteps(page, request.steps, request.secret));
-  await withGuard(guard, () =>
-    waitForLoginResult(
-      page,
-      request.success_selector,
-      request.failure_selector,
-    ),
-  );
+  const stepsSkipped =
+    restored > 0 && (await isLoggedInByRestoredCookies(guard, page, request));
+  if (!stepsSkipped) {
+    await withGuard(guard, () => runSteps(page, request.steps, request.secret));
+    await withGuard(guard, () =>
+      waitForLoginResult(
+        page,
+        request.success_selector,
+        request.failure_selector,
+      ),
+    );
+  }
+  const cookies = await readContextCookies(guard, context);
   await pageSession.detach().catch(() => undefined);
   activeBrowserContextId = browserContextId;
+  activeLoginContext = context;
   monitorGuardFailure(guard);
   guard.assertOpen();
-  return { endpoint, targetId };
+  return { endpoint, targetId, cookies, stepsSkipped };
 }
 
 type ExecutionErrorWriter = (
@@ -2089,7 +2300,7 @@ function killBrowserProcess(browserPid: number | undefined): void {
   }
 }
 
-async function cleanupResources(): Promise<void> {
+export async function cleanupResources(): Promise<void> {
   const guard = activeGuard;
   const browserPid = guard?.browserPid;
   activeGuard = undefined;
@@ -2116,6 +2327,7 @@ async function cleanupResources(): Promise<void> {
   const dir = activeTempDir;
   activeTempDir = undefined;
   activeBrowserContextId = undefined;
+  activeLoginContext = undefined;
   if (dir !== undefined) {
     await rm(dir, { recursive: true, force: true }).catch(() => undefined);
   }
@@ -2193,7 +2405,33 @@ async function handleRelease(request: ReleaseRequest): Promise<void> {
   }
 }
 
-async function handleLogin(request: LoginRequest): Promise<void> {
+/**
+ * login の context の cookie を全件返す。ブラウザまたは login の context が無い場合は空配列を返す。
+ * 例外の文言は cookie の内容を含みうるため、失敗時も診断行を出力しない。
+ */
+export async function handleExportCookies(
+  request: ExportCookiesRequest,
+): Promise<void> {
+  const guard = activeGuard;
+  const context = activeLoginContext;
+  if (
+    activeBrowser === undefined ||
+    guard === undefined ||
+    context === undefined
+  ) {
+    writeResponse({ ok: true, cookies: [] }, request.id);
+    return;
+  }
+
+  try {
+    const cookies = await readContextCookies(guard, context);
+    writeResponse({ ok: true, cookies }, request.id);
+  } catch {
+    writeResponse(formatErrorResponse({ code: "INTERNAL" }), request.id);
+  }
+}
+
+export async function handleLogin(request: LoginRequest): Promise<void> {
   if (activeBrowser !== undefined) {
     const error = new Error("browser is already active");
     const classified = classifyExecutionError(error, "login");
@@ -2203,8 +2441,18 @@ async function handleLogin(request: LoginRequest): Promise<void> {
   }
 
   try {
-    const { endpoint, targetId } = await executeLogin(request);
-    writeResponse({ ok: true, endpoint, target_id: targetId }, request.id);
+    const { endpoint, targetId, cookies, stepsSkipped } =
+      await executeLogin(request);
+    writeResponse(
+      {
+        ok: true,
+        endpoint,
+        target_id: targetId,
+        cookies,
+        steps_skipped: stepsSkipped,
+      },
+      request.id,
+    );
   } catch (error) {
     const classified = classifyExecutionError(error, "login");
     writeExecutorErrorLine(request, "login", classified, error);
@@ -2630,6 +2878,10 @@ async function main(): Promise<void> {
       }
       if (request.op === "release") {
         await handleRelease(request);
+        continue;
+      }
+      if (request.op === "export_cookies") {
+        await handleExportCookies(request);
         continue;
       }
       if (request.op === "authorize_device") {

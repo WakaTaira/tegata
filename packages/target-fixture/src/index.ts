@@ -41,6 +41,19 @@ let mutatingFillState: {
   passwordLength: number;
 } | null = null;
 
+// State of the /persistent-cookies/ login site (Issue #45). A valid `device`
+// cookie skips the login form; every request's cookie names are recorded.
+interface RecordedRequest {
+  method: string;
+  path: string;
+  cookies: string[];
+}
+const validDeviceCookies = new Set<string>();
+const issuedDeviceCookies: string[] = [];
+const issuedSidCookies: string[] = [];
+const persistentCookieRequests: RecordedRequest[] = [];
+let persistentCookieLoginPosts = 0;
+
 function usageError(message: string): never {
   throw new Error(message);
 }
@@ -410,6 +423,106 @@ function busyLoggedInPage(): string {
       '<div id="welcome">login-ok</div><input type="password" hidden>',
     ),
   );
+}
+
+function cookiesFrom(request: IncomingMessage): Map<string, string> {
+  const cookies = new Map<string, string>();
+  const cookieHeader = request.headers.cookie;
+  if (cookieHeader === undefined) return cookies;
+  for (const cookie of cookieHeader.split(";")) {
+    const [name, ...valueParts] = cookie.trim().split("=");
+    if (name !== "") cookies.set(name, valueParts.join("="));
+  }
+  return cookies;
+}
+
+function recordPersistentCookieRequest(request: IncomingMessage): void {
+  persistentCookieRequests.push({
+    method: request.method ?? "",
+    path: request.url ?? "",
+    cookies: [...cookiesFrom(request).keys()],
+  });
+}
+
+function persistentCookieLoginForm(error: boolean): string {
+  return loginForm(error, false).replace(
+    'action="/login"',
+    'action="/persistent-cookies/login"',
+  );
+}
+
+function hasValidDeviceCookie(request: IncomingMessage): boolean {
+  const device = cookiesFrom(request).get("device");
+  return device !== undefined && validDeviceCookies.has(device);
+}
+
+function handlePersistentCookieLogin(
+  request: IncomingMessage,
+  response: ServerResponse,
+  credentials: Credentials,
+): void {
+  persistentCookieLoginPosts += 1;
+  readRequestBody(request, (body) => {
+    const form = new URLSearchParams(body);
+    if (
+      form.get("username") !== credentials.username ||
+      form.get("password") !== credentials.password
+    ) {
+      writePage(response, persistentCookieLoginForm(true));
+      return;
+    }
+    const device = `device-canary-${randomBytes(16).toString("hex")}`;
+    const sid = `sid-canary-${randomBytes(16).toString("hex")}`;
+    validDeviceCookies.add(device);
+    issuedDeviceCookies.push(device);
+    issuedSidCookies.push(sid);
+    response.writeHead(200, {
+      "Content-Type": "text/html; charset=utf-8",
+      "Set-Cookie": [
+        `device=${device}; Max-Age=86400; Path=/; SameSite=Lax`,
+        `sid=${sid}; HttpOnly; Path=/; SameSite=Lax`,
+      ],
+    });
+    response.end(loggedInPage());
+  });
+}
+
+/**
+ * Login site that issues a one-day persistent `device` cookie and a session
+ * `sid` cookie, and serves the logged-in page straight away to a request
+ * carrying a valid `device`. Returns false for requests it does not handle.
+ */
+function handlePersistentCookieRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  credentials: Credentials,
+): boolean {
+  const route = `${request.method} ${request.url}`;
+  if (route === "GET /persistent-cookies/state") {
+    writeJson(response, 200, {
+      login_posts: persistentCookieLoginPosts,
+      requests: persistentCookieRequests,
+      device_values: issuedDeviceCookies,
+      sid_values: issuedSidCookies,
+    });
+  } else if (route === "POST /persistent-cookies/invalidate") {
+    validDeviceCookies.clear();
+    writeJson(response, 200, { ok: true });
+  } else if (route === "GET /persistent-cookies/") {
+    recordPersistentCookieRequest(request);
+    writePage(
+      response,
+      hasValidDeviceCookie(request)
+        ? loggedInPage()
+        : persistentCookieLoginForm(false),
+    );
+  } else if (route === "POST /persistent-cookies/login") {
+    recordPersistentCookieRequest(request);
+    handlePersistentCookieLogin(request, response, credentials);
+  } else {
+    return false;
+  }
+  return true;
 }
 
 function devicePage(): string {
@@ -840,6 +953,8 @@ function handleRequest(
   }
 
   if (handleOAuthRequest(request, response)) return;
+
+  if (handlePersistentCookieRequest(request, response, credentials)) return;
 
   if (request.method === "POST" && request.url === "/device/issue") {
     const userCode = newDeviceCode();

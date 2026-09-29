@@ -271,6 +271,11 @@ environment behind the boundary instead of the agent's own; an experimental
 Herdr integration in
 [`integrations/herdr`](integrations/herdr) that shows a logged-in session in a
 Herdr browser pane;
+opt-in persistent cookies per credential
+([#45](https://github.com/WakaTaira/tegata/issues/45)) — the daemon keeps a
+credential's unexpired persistent cookies for each caller, so a site sees the
+same device on the next login instead of a new one, and a login whose restored
+cookies already sign in skips the form;
 and prebuilt release binaries and bundles for non-Nix deployments,
 published from tags on the
 [releases page](https://github.com/WakaTaira/tegata/releases).

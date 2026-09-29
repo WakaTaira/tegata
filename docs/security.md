@@ -276,6 +276,66 @@ trade: it costs about 30 seconds of secrecy on a value that is useless without t
 password, and it buys the ability for the agent to survive a step-up prompt without
 a human present. Exposing the seed is not on the table under any configuration.
 
+## Persistent cookies
+
+Some sites treat a browser that arrives with an empty profile on every visit as a
+new, untrusted device and throttle or block it after a handful of logins, even
+though the credential and the human behind it have not changed. `persist_cookies`
+lets an operator opt a credential into carrying its device-trust cookies from one
+`login` to the next, without giving the agent anything new to read.
+
+**Default is off.** A provider's `persist_cookies` list is empty unless set, and an
+empty list means no cookie of that provider's credentials is ever written to disk —
+the behavior is identical to a deployment that has never heard of this feature.
+Setting it is a deliberate, per-credential choice, made the same way as
+`totp_exposable`: list backend ids, or `"*"` for every credential in that
+provider.
+
+**What is kept, and what is not.** Only cookies that carry an expiry in the
+future survive a saved session; session cookies (no expiry, or one already past)
+are discarded before the file is written. Only cookies are kept — `localStorage`,
+`IndexedDB`, service workers, and the browser's cache are not, and the browser
+profile itself is thrown away with the rest of the browser process at the end of
+every session. The reason is not disk space: `localStorage` and the rest are
+places an agent driving the page over CDP could plant its own state, and letting
+that state ride along into the next `login` would hand a future fill whatever
+script the agent (or an injected instruction) left behind. A saved cookie is a
+bearer token in its own right: on its own, without the credential it is paired
+with, it can grant a logged-in session (see [mcp-tools.md](mcp-tools.md) for how
+`login` short-circuits when one is restored). That is exactly why persistence
+defaults to off, is an explicit per-credential opt-in, is isolated per
+`(principal, namespace, credential)`, is kept in the daemon's state directory
+rather than the browser worker's, and the locally saved copy can be deleted
+with `tegatad cookies forget`. Deleting the local copy does not revoke the
+session on the site itself; an operator who needs that must log out of the
+site (or otherwise invalidate the session there).
+
+**Storage and isolation.** Saved cookies live under the daemon's state directory,
+in `cookies/`, one file per `(principal, namespace, credential)` — the same
+granularity as a browser session — so one principal's saved device trust for a
+credential is never handed to a different principal using the same credential.
+That directory sits next to the rest of the daemon's private state, not the
+browser worker's: on Linux the `tegata-browser` account has no read access to it,
+matching the boundary the rest of this document describes for the state
+directory as a whole. On Linux the files are plain JSON, protected by filesystem
+permissions alone — a saved cookie is a bearer token in exactly the sense a
+session cookie always is, and losing it to whoever can read that file is exactly
+as bad as losing any other bearer token in the state directory. On Windows the
+file is sealed with the same DPAPI mechanism used for the master password, so it
+is decryptable only by the daemon's own account on the same machine.
+
+**`lock_vault` does not touch saved cookies.** Locking discards the *unlocked*
+vault session material, not files on disk; a saved cookie is only ever read back
+during a `login` that has already passed the approval gate and the provider's
+unlock ceremony, so leaving the file in place between locks does not widen what
+an agent can do with it. To remove saved cookies explicitly, an operator runs
+`tegatad cookies forget <cred_id>` for one credential or `tegatad cookies forget
+--all` for every saved credential; both are administrative RPCs, gated the same
+way as `peer issue`. Because a live browser session re-exports its cookies when
+it ends, forgetting a credential while its session is still open only clears the
+file until that session's next save — run `logout` first if the intent is to
+remove the saved cookie for good.
+
 ## Human-in-the-loop approval
 
 The boundary keeps credentials away from the agent, but it cannot tell a

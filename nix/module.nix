@@ -176,6 +176,10 @@ in
             type = lib.types.listOf lib.types.str;
             default = [];
           };
+          persist_cookies = lib.mkOption {
+            type = lib.types.listOf lib.types.str;
+            default = [];
+          };
           session_ttl_secs = lib.mkOption {
             type = lib.types.nullOr lib.types.ints.unsigned;
             default = null;

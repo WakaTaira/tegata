@@ -249,7 +249,7 @@ they are meant to be read as the specification of what the boundary guarantees.
 
 Implemented today: the systemd and Windows service boundaries; three credential
 backends behind the provider trait — Bitwarden CLI, age-encrypted file, and GNU
-pass — usable together; the Playwright form executor; the seven MCP tools;
+pass — usable together; the Playwright form executor; the nine MCP tools;
 human-in-the-loop login approval — an external command on Linux, and on Windows
 an approval queue the operator answers from an elevated PowerShell with
 `tegatad approval allow/deny` — with optional time-limited grants per caller and
@@ -275,7 +275,12 @@ opt-in persistent cookies per credential
 ([#45](https://github.com/WakaTaira/tegata/issues/45)) — the daemon keeps a
 credential's unexpired persistent cookies for each caller, so a site sees the
 same device on the next login instead of a new one, and a login whose restored
-cookies already sign in skips the form;
+cookies already sign in skips the form; stepwise login
+([#46](https://github.com/WakaTaira/tegata/issues/46)) — `login_begin` and
+`login_step` let the agent work through a multi-screen login one action at a
+time, seeing only page snapshots tegata builds without field values and checks
+for the credential's secrets before returning, with CDP handed over only once
+the login succeeds;
 and prebuilt release binaries and bundles for non-Nix deployments,
 published from tags on the
 [releases page](https://github.com/WakaTaira/tegata/releases).

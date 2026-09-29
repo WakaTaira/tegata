@@ -121,6 +121,8 @@ type AuthorizeDeviceRequest = {
   steps: DeviceStep[] | null;
   success_selector: string;
   failure_selector: string | null;
+  // 省略は null と同じ扱いとし、cookie を復元しない。
+  cookies?: Cookie[] | null;
   secret: LoginRequest["secret"];
 };
 
@@ -148,6 +150,8 @@ type OAuthRequestConfig = {
   steps: DeviceStep[] | null;
   success_selector: string;
   failure_selector: string | null;
+  // 省略は null と同じ扱いとし、cookie を復元しない。
+  cookies?: Cookie[] | null;
   secret: LoginRequest["secret"];
 };
 
@@ -304,6 +308,10 @@ function removeUrlQueryAndFragment(value: string): string {
   });
 }
 
+function cookieValues(cookies: Cookie[] | null | undefined): string[] {
+  return (cookies ?? []).map((cookie) => cookie.value);
+}
+
 function requestSecrets(request: DiagnosticRequest): SecretCandidates {
   // env にはリテラルも含まれるが、秘密との区別を executor では行わず、すべて置換対象とする。
   if (request.op === "mcp_server_start") {
@@ -315,6 +323,7 @@ function requestSecrets(request: DiagnosticRequest): SecretCandidates {
           request.oauth.secret.username,
           request.oauth.secret.password,
           request.oauth.secret.totp,
+          ...cookieValues(request.oauth.cookies),
         ]
       : [request.header_value];
   }
@@ -332,12 +341,15 @@ function requestSecrets(request: DiagnosticRequest): SecretCandidates {
     request.secret.password,
     request.secret.totp,
   ];
-  if (request.op !== "login") {
-    return [...loginSecrets, request.user_code];
-  }
   // 復元用 cookie の値も、失敗時のページ内例外文言に紛れ込みうるため秘匿対象に含める。
-  const cookieValues = (request.cookies ?? []).map((cookie) => cookie.value);
-  return [...loginSecrets, ...cookieValues];
+  if (request.op !== "login") {
+    return [
+      ...loginSecrets,
+      request.user_code,
+      ...cookieValues(request.cookies),
+    ];
+  }
+  return [...loginSecrets, ...cookieValues(request.cookies)];
 }
 
 /**
@@ -802,6 +814,7 @@ function parseOAuthConfig(value: unknown, id?: RequestId): OAuthRequestConfig {
     steps: parseDeviceSteps(value.steps, id),
     success_selector: value.success_selector,
     failure_selector: value.failure_selector ?? null,
+    cookies: parseCookies(value.cookies, id),
     secret: {
       username: value.secret.username,
       password: value.secret.password,
@@ -1117,6 +1130,7 @@ export function parseRequest(line: string): Request {
       steps: parseDeviceSteps(value.steps, id),
       success_selector: value.success_selector,
       failure_selector: value.failure_selector ?? null,
+      cookies: parseCookies(value.cookies, id),
       secret: {
         username: secret.username,
         password: secret.password,
@@ -2660,43 +2674,185 @@ function throwIfDeviceAuthorizationAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new Error("device authorization was aborted");
 }
 
+// 既定のデバイス段（steps が null）が最初に入力する要素。
+const DEFAULT_FIRST_DEVICE_STEP_SELECTOR =
+  'input[name="user_code"], input[autocomplete="one-time-code"]';
+
+/** デバイス段で最初に操作する要素の selector を返す。ステップが空の場合は undefined を返す。 */
+export function firstDeviceStepSelector(
+  steps: DeviceStep[] | null,
+): string | undefined {
+  if (steps === null) return DEFAULT_FIRST_DEVICE_STEP_SELECTOR;
+  return steps[0]?.selector;
+}
+
+/**
+ * デバイス段の最初の要素とログインフォーム（可視の password 欄）のどちらが先に可視になるかを返す。
+ * どちらも上限までに現れない場合は undefined を返す。
+ */
+export async function raceDeviceStageAgainstLogin(
+  page: Page,
+  deviceSelector: string,
+): Promise<"device" | "login" | undefined> {
+  const device = waitUntilVisible(page, deviceSelector).then((visible) =>
+    visible ? ("device" as const) : undefined,
+  );
+  const login = waitUntilVisible(page, DEFAULT_FIRST_STEP_SELECTOR).then(
+    (visible) => (visible ? ("login" as const) : undefined),
+  );
+  return raceDecisive(
+    [device, login],
+    Promise.all([device, login]).then(() => undefined),
+  );
+}
+
+/**
+ * ログイン段を省略したデバイス段の失敗のうち、ログイン段からやり直す対象であるかを判定する。
+ * 承認ページが未認証でも空の形で表示されるサイトでは、操作する要素が見つからない形で失敗するため、
+ * failure_selector による拒否へ分類されなかった要素の不在のみを対象とする。
+ */
+export function isLoginFallbackError(error: unknown): boolean {
+  return error instanceof SelectorNotFoundError;
+}
+
+/** 実行中の段を記録しながら、中断の確認とガードの監視の下で各操作を行う。 */
+type DeviceAuthorizationRunner = {
+  page: Page;
+  run: <T>(stage: ExecutionStage, action: () => Promise<T>) => Promise<T>;
+};
+
+async function runDeviceLoginStage(
+  runner: DeviceAuthorizationRunner,
+  request: AuthorizeDeviceRequest,
+): Promise<void> {
+  const { page } = runner;
+  await runner.run("login", () => page.goto(request.login_url));
+  await runner.run("login", () =>
+    runSteps(page, null, request.secret, { automaticTotp: true }),
+  );
+  await runner.run("login", () => waitForLoginResult(page, null, null));
+}
+
+async function runDeviceStage(
+  runner: DeviceAuthorizationRunner,
+  request: AuthorizeDeviceRequest,
+): Promise<void> {
+  const { page } = runner;
+  await runner.run("device", () => page.goto(request.verification_url));
+  await runner.run("device", () => executeDeviceFlow(page, request));
+}
+
+/**
+ * 復元した cookie によって承認ページへ到達できるかを判定する。承認ページの要素が先に可視になった場合に限り
+ * true を返し、このときページは承認ページに留まる。
+ */
+async function isDevicePageReachedByRestoredCookies(
+  runner: DeviceAuthorizationRunner,
+  request: AuthorizeDeviceRequest,
+): Promise<boolean> {
+  const deviceSelector = firstDeviceStepSelector(request.steps);
+  if (deviceSelector === undefined) return false;
+  const { page } = runner;
+  await runner.run("device", () => page.goto(request.verification_url));
+  const first = await runner.run("device", () =>
+    raceDeviceStageAgainstLogin(page, deviceSelector),
+  );
+  return first === "device";
+}
+
+/**
+ * ログイン段を省略して、表示中の承認ページでデバイス段を行う。要素の不在で失敗した場合に限り、
+ * 1 回だけログイン段からやり直す。ログイン段を省略できたかを返す。
+ */
+async function authorizeOnReachedDevicePage(
+  runner: DeviceAuthorizationRunner,
+  request: AuthorizeDeviceRequest,
+): Promise<boolean> {
+  try {
+    await runner.run("device", () => executeDeviceFlow(runner.page, request));
+    return true;
+  } catch (error) {
+    if (!isLoginFallbackError(error)) throw error;
+  }
+  await runDeviceLoginStage(runner, request);
+  await runDeviceStage(runner, request);
+  return false;
+}
+
+/** ログイン段とデバイス段を行い、ログイン段を省略できたかを返す。 */
+async function authorizeDevice(
+  runner: DeviceAuthorizationRunner,
+  request: AuthorizeDeviceRequest,
+  restored: number,
+): Promise<boolean> {
+  if (
+    restored > 0 &&
+    (await isDevicePageReachedByRestoredCookies(runner, request))
+  ) {
+    return authorizeOnReachedDevicePage(runner, request);
+  }
+  await runDeviceLoginStage(runner, request);
+  await runDeviceStage(runner, request);
+  return false;
+}
+
+type DeviceAuthorizationOutcome = {
+  cookies: Cookie[];
+  stepsSkipped: boolean;
+};
+
+type DeviceAuthorizationResult =
+  | ({ ok: true } & DeviceAuthorizationOutcome)
+  | { ok: false; error: ClassifiedExecutionError };
+
+/** device 承認の成功応答に載せる cookie とログイン段の省略の有無を返す。 */
+export function formatDeviceAuthorizationFields(
+  outcome: DeviceAuthorizationOutcome,
+): { cookies: Cookie[]; steps_skipped: boolean } {
+  return { cookies: outcome.cookies, steps_skipped: outcome.stepsSkipped };
+}
+
 /**
  * device 承認をブラウザで行う。`signal` が中断された場合は、ブラウザ起動の後および各段の前で打ち切る。
- * ブラウザの後始末は呼び出し側が行う。
+ * 成功した場合は、ブラウザを閉じる前の context の cookie を返す。ブラウザの後始末は呼び出し側が行う。
  */
 async function executeAuthorizeDevice(
   request: AuthorizeDeviceRequest,
   writeError: ExecutionErrorWriter = (stage, classified, cause) =>
     writeExecutorErrorLine(request, stage, classified, cause),
   signal?: AbortSignal,
-): Promise<ClassifiedExecutionError | undefined> {
+): Promise<DeviceAuthorizationResult> {
   let stage: ExecutionStage = "login";
   try {
     throwIfDeviceAuthorizationAborted(signal);
     const { page, pageSession } = await openBrowserPage();
     const guard = activeGuard;
     if (guard === undefined) throw new Error("CDP guard is not available");
-    const runStage = <T>(action: () => Promise<T>): Promise<T> => {
-      throwIfDeviceAuthorizationAborted(signal);
-      return withGuard(guard, action);
+    const runner: DeviceAuthorizationRunner = {
+      page,
+      run: (nextStage, action) => {
+        stage = nextStage;
+        throwIfDeviceAuthorizationAborted(signal);
+        return withGuard(guard, action);
+      },
     };
     try {
-      await runStage(() => page.goto(request.login_url));
-      await runStage(() =>
-        runSteps(page, null, request.secret, { automaticTotp: true }),
+      const context = page.context();
+      const restored = await runner.run("login", () =>
+        restoreCookies(guard, context, request.cookies ?? []),
       );
-      await runStage(() => waitForLoginResult(page, null, null));
-      stage = "device";
-      await runStage(() => page.goto(request.verification_url));
-      await runStage(() => executeDeviceFlow(page, request));
+      const stepsSkipped = await authorizeDevice(runner, request, restored);
+      const cookies = await runner.run("device", () =>
+        readContextCookies(guard, context),
+      );
+      return { ok: true, cookies, stepsSkipped };
     } finally {
       await pageSession.detach().catch(() => undefined);
     }
-    return undefined;
   } catch (error) {
     const classified = classifyExecutionError(error, stage);
     writeError(stage, classified, error);
-    return classified;
+    return { ok: false, error: classified };
   }
 }
 
@@ -2978,7 +3134,7 @@ export async function handleLoginStep(
   }
 }
 
-async function handleAuthorizeDevice(
+export async function handleAuthorizeDevice(
   request: AuthorizeDeviceRequest,
 ): Promise<void> {
   if (activeBrowser !== undefined) {
@@ -2989,10 +3145,12 @@ async function handleAuthorizeDevice(
     return;
   }
 
-  const classified = await executeAuthorizeDevice(request);
+  const result = await executeAuthorizeDevice(request);
   await cleanupResources();
   writeResponse(
-    classified === undefined ? { ok: true } : formatErrorResponse(classified),
+    result.ok
+      ? { ok: true, ...formatDeviceAuthorizationFields(result) }
+      : formatErrorResponse(result.error),
     request.id,
   );
 }
@@ -3003,7 +3161,7 @@ async function closeApiProxy(): Promise<void> {
   if (proxy !== undefined) await proxy.close();
 }
 
-async function handleApiProxyStart(
+export async function handleApiProxyStart(
   request: ApiProxyStartRequest,
 ): Promise<void> {
   if (activeApiProxy !== undefined) {
@@ -3058,6 +3216,7 @@ function toAuthorizeDeviceRequest(
     steps: oauth.steps,
     success_selector: oauth.success_selector,
     failure_selector: oauth.failure_selector,
+    cookies: oauth.cookies ?? null,
     secret: oauth.secret,
   };
 }
@@ -3088,7 +3247,7 @@ async function authorizeDeviceInBrowser(
   deadline: number,
   signal: AbortSignal,
   runtimeSecrets: string[],
-): Promise<ClassifiedExecutionError | undefined> {
+): Promise<DeviceAuthorizationResult> {
   const cancel = new AbortController();
   const onAbort = (): void => cancel.abort();
   signal.addEventListener("abort", onAbort, { once: true });
@@ -3133,13 +3292,19 @@ async function authorizeDeviceInBrowser(
   }
 }
 
-/** device-code grant で access token を得る。ブラウザ段の失敗は分類済みの結果として返す。 */
+/**
+ * device-code grant で access token を得る。ブラウザ段の失敗は分類済みの結果として返す。
+ * 成功時はブラウザ段で得た cookie とログイン段の省略の有無も返す。
+ */
 async function acquireOAuthTokens(
   request: OAuthApiProxyStartRequest,
   deadline: number,
   signal: AbortSignal,
   runtimeSecrets: string[],
-): Promise<{ tokens: TokenSet; issuedAt: number } | ClassifiedExecutionError> {
+): Promise<
+  | { tokens: TokenSet; issuedAt: number; browser: DeviceAuthorizationOutcome }
+  | ClassifiedExecutionError
+> {
   const { oauth } = request;
   const device = await requestDeviceAuthorization(
     oauth,
@@ -3149,14 +3314,14 @@ async function acquireOAuthTokens(
   );
   const receivedAt = Date.now();
   runtimeSecrets.push(device.deviceCode, device.userCode);
-  const browserError = await authorizeDeviceInBrowser(
+  const browser = await authorizeDeviceInBrowser(
     request,
     device,
     deadline,
     signal,
     runtimeSecrets,
   );
-  if (browserError !== undefined) return browserError;
+  if (!browser.ok) return browser.error;
   const tokens = await pollForToken(
     oauth,
     device,
@@ -3173,7 +3338,7 @@ async function acquireOAuthTokens(
   );
   runtimeSecrets.push(tokens.accessToken);
   if (tokens.refreshToken !== null) runtimeSecrets.push(tokens.refreshToken);
-  return { tokens, issuedAt: Date.now() };
+  return { tokens, issuedAt: Date.now(), browser };
 }
 
 /** 取得した token でプロキシを起動する。起動できない場合は token を失効させてから例外を返す。 */
@@ -3239,7 +3404,15 @@ async function runOAuthApiProxyStart(
       acquired.issuedAt,
     );
     activeApiProxy = session;
-    writeResponse({ ok: true, port, secret }, request.id);
+    writeResponse(
+      {
+        ok: true,
+        port,
+        secret,
+        ...formatDeviceAuthorizationFields(acquired.browser),
+      },
+      request.id,
+    );
     // デーモンは初回要求の応答を最初の 1 行として読むため、イベント行は応答の後に出力する。
     writeOAuthTokenEvent("issued");
   } catch (error) {
@@ -3272,7 +3445,9 @@ async function handleOAuthApiProxyStart(
   }
 }
 
-async function handleApiProxyStop(request: ApiProxyStopRequest): Promise<void> {
+export async function handleApiProxyStop(
+  request: ApiProxyStopRequest,
+): Promise<void> {
   await closeApiProxy();
   writeResponse({ ok: true }, request.id);
 }

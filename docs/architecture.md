@@ -314,7 +314,11 @@ hands its current cookies back in the response, and on session end — `logout`,
 TTL expiry, or `lock_vault` — the daemon asks the executor to export cookies one
 last time before tearing the browser down. Either exchange is dropped from the
 RPC response, the audit log, and the daemon's stderr; only a `"restored"` /
-`"none"` marker and a `steps_skipped` flag reach the audit record. See
+`"none"` marker and a `steps_skipped` flag reach the audit record. `authorize_device`
+and the OAuth `open_api_proxy` follow the same path: the daemon loads the saved
+cookies into the request, and the executor returns its current cookies in the
+success response, before it closes its browser. Neither flow has a session
+to export from, so the OAuth lease does no export when it ends. See
 [security.md](security.md#persistent-cookies) for what is kept, where it is
 stored, and how it is removed.
 

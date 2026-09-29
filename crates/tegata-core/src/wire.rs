@@ -100,6 +100,9 @@ pub struct ExecutorAuthorizeDeviceRequest {
     pub success_selector: String,
     pub failure_selector: Option<String>,
     pub secret: ExecutorSecret,
+    /// ログイン段の前に復元する保管済みの永続 cookie（Playwright の `Cookie` 形）。
+    /// 永続化対象外の資格、または保管済みの cookie が無い場合は null とする。
+    pub cookies: Option<Vec<Value>>,
 }
 
 #[derive(Serialize)]
@@ -186,6 +189,9 @@ pub struct ExecutorApiProxyOAuth {
     pub success_selector: String,
     pub failure_selector: Option<String>,
     pub secret: ExecutorApiProxyOAuthSecret,
+    /// ブラウザログインの前に復元する保管済みの永続 cookie（Playwright の `Cookie` 形）。
+    /// 永続化対象外の資格、または保管済みの cookie が無い場合は null とする。
+    pub cookies: Option<Vec<Value>>,
 }
 
 /// OAuth のブラウザログイン資格。直列化後も秘密の保持領域をゼロ化する。

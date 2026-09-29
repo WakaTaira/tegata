@@ -288,7 +288,9 @@ Some sites treat a browser that arrives with an empty profile on every visit as 
 new, untrusted device and throttle or block it after a handful of logins, even
 though the credential and the human behind it have not changed. `persist_cookies`
 lets an operator opt a credential into carrying its device-trust cookies from one
-`login` to the next, without giving the agent anything new to read.
+login to the next, without giving the agent anything new to read. The setting
+applies to three flows: `login`, `authorize_device`, and the login behind an OAuth
+`open_api_proxy`.
 
 **Default is off.** A provider's `persist_cookies` list is empty unless set, and an
 empty list means no cookie of that provider's credentials is ever written to disk —
@@ -330,11 +332,27 @@ as bad as losing any other bearer token in the state directory. On Windows the
 file is sealed with the same DPAPI mechanism used for the master password, so it
 is decryptable only by the daemon's own account on the same machine.
 
+**One store serves all three flows.** `login`, `authorize_device`, and the OAuth
+proxy's login read and write the same saved file, keyed by `(principal,
+namespace, credential)`. Seen from the site, that is one device for one account
+rather than three, and the isolation between principals is exactly as strong as
+for `login` alone. `authorize_device` and the OAuth proxy never hand the agent a
+CDP channel, so cookies restored in those flows are never reachable by the agent
+either. When a cookie is restored, the flow first opens the device approval page:
+only if that page actually renders is the login stage skipped, so no secret is
+typed into the page. If the approval page does not render, or the approval form
+does not go through (retried once), the flow performs the ordinary login. A saved
+cookie never skips the approval hook (`approve_cmd`) or the provider's unlock
+confirmation; both run before any cookie is read. For an opted-in credential, the
+audit record of an `authorize_device` or OAuth `open_api_proxy` call carries
+`cookies` (`"restored"` or `"none"`) and `steps_skipped`, as `login` does; cookie
+values never appear in the audit log.
+
 **`lock_vault` does not touch saved cookies.** Locking discards the *unlocked*
 vault session material, not files on disk; a saved cookie is only ever read back
-during a `login` that has already passed the approval gate and the provider's
-unlock ceremony, so leaving the file in place between locks does not widen what
-an agent can do with it. To remove saved cookies explicitly, an operator runs
+during a `login`, `authorize_device`, or OAuth proxy start that has already
+passed the approval gate and the provider's unlock ceremony, so leaving the file
+in place between locks does not widen what an agent can do with it. To remove saved cookies explicitly, an operator runs
 `tegatad cookies forget <cred_id>` for one credential or `tegatad cookies forget
 --all` for every saved credential; both are administrative RPCs, gated the same
 way as `peer issue`. Because a live browser session re-exports its cookies when

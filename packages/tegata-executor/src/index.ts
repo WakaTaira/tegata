@@ -2278,6 +2278,8 @@ function firstStepSelector(steps: LoginStep[] | null): string | undefined {
   return steps[0]?.selector;
 }
 
+// 競争は可視の一致のいずれかで判定するため、先頭の一致が非表示でも後続の可視の一致を検出する。
+// 最終判定（waitForLoginResult 等）は attach で判定しており、競争とは基準が異なる。
 async function waitUntilVisible(
   page: Page,
   selector: string,
@@ -2285,6 +2287,7 @@ async function waitUntilVisible(
   try {
     await page
       .locator(selector)
+      .filter({ visible: true })
       .first()
       .waitFor({ state: "visible", timeout: STEP_SELECTOR_TIMEOUT_MS });
     return true;
@@ -2298,7 +2301,7 @@ async function waitUntilVisible(
  * 成功の要素と最初のステップの要素のどちらが先に可視になるかを返す。
  * どちらも上限までに現れない場合は undefined を返す。
  */
-async function raceSuccessAgainstFirstStep(
+export async function raceSuccessAgainstFirstStep(
   page: Page,
   successSelector: string,
   stepSelector: string,

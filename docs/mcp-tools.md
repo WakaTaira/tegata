@@ -305,12 +305,17 @@ that tegata builds and checks before returning it — the agent never receives
 raw CDP, and no field value ever leaves the boundary, until the login
 succeeds.
 
-Use `login` when the whole flow is known ahead of time or is a simple
-single-page form. Use `login_begin` / `login_step` for logins with
-intermediate screens the agent cannot predict — a "More options" choice
-before a TOTP field, for example — where a wrong guess in a `login` `steps`
-array only returns `SELECTOR_NOT_FOUND` with no view of the page that caused
-it.
+For an unfamiliar or multi-screen login, `login_begin` / `login_step` is the
+default: intermediate screens the agent cannot predict — a "More options"
+choice before a TOTP field, for example — are visible in each snapshot, whereas
+a wrong guess in a `login` `steps` array only returns `SELECTOR_NOT_FOUND` with
+no view of the page that caused it. `login` is the faster path for sites whose
+steps are already known. The broker's MCP server instructions steer agents
+toward this policy. For Claude Code, `integrations/claude-code/` provides a
+`tegata-login` subagent definition that lets a small model drive the stepwise
+login and return only the outcome: on success, `session_id`, `target_id`, and
+`endpoint`; on failure, a summary of the last snapshot and the error code. See
+[its README](../integrations/claude-code/README.md).
 
 ### `login_begin`
 
@@ -347,6 +352,12 @@ and no snapshot involved.
 ### `login_step`
 
 **Input** is flat: `{ "login_id", "action", ...the fields of that action }`.
+
+The tool's listed input schema is a single flat object (`login_id`, `action`,
+and the optional `selector`, `value`, `fills`, `submit`) so that MCP clients
+see every field. Which fields each action accepts is still enforced by the
+broker, and fields that do not belong to the chosen action are dropped before
+the call reaches the daemon.
 
 | Action | Fields | Meaning |
 | --- | --- | --- |

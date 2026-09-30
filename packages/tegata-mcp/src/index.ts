@@ -53,6 +53,22 @@ const loginStep = z.union([
   }),
 ]);
 
+// fill_submit の fills / submit の定義。loginStepParams と公開用スキーマで共有する。
+const stepwiseFills = z
+  .array(
+    z.object({
+      selector: z.string(),
+      value: z.enum(["{{username}}", "{{password}}", "{{totp}}"]),
+    }),
+  )
+  .min(1)
+  .max(3);
+
+const stepwiseSubmit = z.union([
+  z.object({ click: z.string() }),
+  z.object({ press_enter: z.string() }),
+]);
+
 // Issue #46: login_step のフラット形パラメータ。action ごとに許される field を discriminated
 // union で表現し、単独 fill を {{username}} のみに、fill_submit の secret プレースホルダを
 // 3 種のみに制限する（デーモン側の再検査と合わせた二重防御）。テストからスキーマ単体を
@@ -77,19 +93,8 @@ export const loginStepParams = z.discriminatedUnion("action", [
   z.object({
     login_id: z.string(),
     action: z.literal("fill_submit"),
-    fills: z
-      .array(
-        z.object({
-          selector: z.string(),
-          value: z.enum(["{{username}}", "{{password}}", "{{totp}}"]),
-        }),
-      )
-      .min(1)
-      .max(3),
-    submit: z.union([
-      z.object({ click: z.string() }),
-      z.object({ press_enter: z.string() }),
-    ]),
+    fills: stepwiseFills,
+    submit: stepwiseSubmit,
   }),
   z.object({
     login_id: z.string(),
@@ -434,105 +439,172 @@ export async function openApiProxyHandler(params: unknown) {
   }
 }
 
-const server = new McpServer({ name: "tegata-mcp", version: "0.0.0" });
+// Issue #55: 段階ログインを既定経路へ誘導する server instructions。
+const INSTRUCTIONS = [
+  "tegata logs the agent into sites with stored credentials without handing over the secrets; the agent gets a signed-in browser (CDP) or an API proxy.",
+  "For an unfamiliar or multi-screen login, use login_begin / login_step. If the client has a `tegata-login` subagent, delegate the login to it.",
+  "Use login with fixed steps only when the site's steps are already known.",
+  "Call login_begin once per login; do not keep retrying it (each call counts against the rate limit and sites throttle repeated attempts).",
+  "On RATE_LIMITED or a failed login_begin, report to the user instead of retrying.",
+  "If a stepwise login was aborted and the success_selector looks wrong, retry once with a corrected selector, and no more.",
+].join("\n");
 
-server.registerTool(
-  "list_credentials",
-  { inputSchema: { namespace: z.string().optional() } },
-  (args) => forward("list_credentials", args),
-);
+// Issue #54: MCP クライアントへ一覧されるのは JSON Schema の object である必要があるため、
+// discriminatedUnion（トップレベルが anyOf になる）ではなくフラットな object を公開する。
+// action ごとの厳密な検査は loginStepParams に委ね、その issue を転記する。
+const loginStepInputSchema = z
+  .object({
+    login_id: z
+      .string()
+      .describe("Id returned by login_begin. Always required."),
+    action: z
+      .enum(["click", "wait_for", "fill", "fill_submit", "snapshot", "abort"])
+      .describe("The step to perform."),
+    selector: z
+      .string()
+      .optional()
+      .describe("Target element selector. Used by click, wait_for and fill."),
+    value: z
+      .literal("{{username}}")
+      .optional()
+      .describe(
+        "Placeholder to type. Used by fill only; only {{username}} is allowed.",
+      ),
+    fills: stepwiseFills
+      .optional()
+      .describe(
+        "Fields to fill (1 to 3). Used by fill_submit only; the only action that may use {{password}} / {{totp}}.",
+      ),
+    submit: stepwiseSubmit
+      .optional()
+      .describe(
+        "How to submit after the fills: exactly one of { click: selector } or { press_enter: selector }. Used by fill_submit only.",
+      ),
+  })
+  .superRefine((args, ctx) => {
+    const result = loginStepParams.safeParse(args);
+    if (result.success) return;
+    for (const issue of result.error.issues) {
+      ctx.addIssue({
+        code: "custom",
+        path: issue.path,
+        message: issue.message,
+      });
+    }
+  });
 
-server.registerTool(
-  "login",
-  {
-    inputSchema: {
-      cred_id: z.string(),
-      target_url: z.string(),
-      steps: z.array(loginStep).optional(),
-      success_selector: z.string().optional(),
-      failure_selector: z.string().optional(),
-      exclusive: z.boolean().optional(),
+export function createServer(): McpServer {
+  const server = new McpServer(
+    { name: "tegata-mcp", version: "0.0.0" },
+    { instructions: INSTRUCTIONS },
+  );
+
+  server.registerTool(
+    "list_credentials",
+    { inputSchema: { namespace: z.string().optional() } },
+    (args) => forward("list_credentials", args),
+  );
+
+  server.registerTool(
+    "login",
+    {
+      description:
+        "Fast path for when the site's steps are already known: sign in with fixed steps in one call. Wrong steps only return SELECTOR_NOT_FOUND and the page is not visible, so use login_begin for unfamiliar or multi-screen sites.",
+      inputSchema: {
+        cred_id: z.string(),
+        target_url: z.string(),
+        steps: z.array(loginStep).optional(),
+        success_selector: z.string().optional(),
+        failure_selector: z.string().optional(),
+        exclusive: z.boolean().optional(),
+      },
     },
-  },
-  (args) => loginHandler(args),
-);
+    (args) => loginHandler(args),
+  );
 
-server.registerTool(
-  "login_begin",
-  {
-    description:
-      "Begin a stepwise login: tegata navigates to target_url and returns a value-free snapshot of the page for the agent to drive one login_step at a time.",
-    inputSchema: {
-      cred_id: z.string(),
-      target_url: z.string(),
-      success_selector: z.string(),
-      failure_selector: z.string().optional(),
-      exclusive: z.boolean().optional(),
+  server.registerTool(
+    "login_begin",
+    {
+      description:
+        "Default for unfamiliar or multi-screen sites: begin a stepwise login. tegata navigates to target_url and returns a value-free snapshot of the page, then the agent drives one login_step at a time. Call once per login and do not retry.",
+      inputSchema: {
+        cred_id: z.string(),
+        target_url: z.string(),
+        success_selector: z.string(),
+        failure_selector: z.string().optional(),
+        exclusive: z.boolean().optional(),
+      },
     },
-  },
-  (args) => stepwiseHandler("login_begin", args),
-);
+    (args) => stepwiseHandler("login_begin", args),
+  );
 
-server.registerTool(
-  "login_step",
-  {
-    description:
-      "Drive one step of a stepwise login started with login_begin. fill_submit is the only action that may use the {{password}} / {{totp}} placeholders.",
-    inputSchema: loginStepParams,
-  },
-  (args) => stepwiseHandler("login_step", args),
-);
-
-server.registerTool(
-  "authorize_device",
-  {
-    description: "Authorize an OAuth device flow with a stored credential.",
-    inputSchema: {
-      cred_id: z.string(),
-      verification_url: z.string(),
-      user_code: z.string(),
-      steps: z.array(authorizeDeviceStep).optional(),
-      success_selector: z.string(),
-      failure_selector: z.string().optional(),
+  server.registerTool(
+    "login_step",
+    {
+      description:
+        "Drive one step of a stepwise login started with login_begin. fill_submit is the only action that may use the {{password}} / {{totp}} placeholders.",
+      inputSchema: loginStepInputSchema,
     },
-  },
-  (args) => forward("authorize_device", args),
-);
+    // Issue #54: flat な一覧用スキーマを通過した入力を union で再構文解析し、
+    // action に無関係な field を落としてからデーモンへ渡す。
+    (args) => stepwiseHandler("login_step", loginStepParams.parse(args)),
+  );
 
-server.registerTool(
-  "open_api_proxy",
-  {
-    description:
-      "Open a configured API proxy that injects a stored credential into requests to its fixed upstream. Send requests to base_url followed by the upstream path; close it with logout.",
-    inputSchema: { name: z.string() },
-  },
-  (args) => openApiProxyHandler(args),
-);
+  server.registerTool(
+    "authorize_device",
+    {
+      description: "Authorize an OAuth device flow with a stored credential.",
+      inputSchema: {
+        cred_id: z.string(),
+        verification_url: z.string(),
+        user_code: z.string(),
+        steps: z.array(authorizeDeviceStep).optional(),
+        success_selector: z.string(),
+        failure_selector: z.string().optional(),
+      },
+    },
+    (args) => forward("authorize_device", args),
+  );
 
-server.registerTool(
-  "logout",
-  { inputSchema: { session_id: z.string() } },
-  (args) => forward("logout", args),
-);
+  server.registerTool(
+    "open_api_proxy",
+    {
+      description:
+        "Open a configured API proxy that injects a stored credential into requests to its fixed upstream. Send requests to base_url followed by the upstream path; close it with logout.",
+      inputSchema: { name: z.string() },
+    },
+    (args) => openApiProxyHandler(args),
+  );
 
-server.registerTool(
-  "get_totp",
-  { inputSchema: { cred_id: z.string() } },
-  (args) => forward("get_totp", args),
-);
+  server.registerTool(
+    "logout",
+    { inputSchema: { session_id: z.string() } },
+    (args) => forward("logout", args),
+  );
 
-server.registerTool(
-  "lock_vault",
-  { inputSchema: { namespace: z.string().optional() } },
-  (args) => forward("lock_vault", args),
-);
+  server.registerTool(
+    "get_totp",
+    { inputSchema: { cred_id: z.string() } },
+    (args) => forward("get_totp", args),
+  );
+
+  server.registerTool(
+    "lock_vault",
+    { inputSchema: { namespace: z.string().optional() } },
+    (args) => forward("lock_vault", args),
+  );
+
+  return server;
+}
 
 if (
   process.argv[1] !== undefined &&
   pathToFileURL(process.argv[1]).href === import.meta.url
 ) {
   const transport = new StdioServerTransport();
-  server.connect(transport).catch(() => {
-    process.exitCode = 1;
-  });
+  createServer()
+    .connect(transport)
+    .catch(() => {
+      process.exitCode = 1;
+    });
 }

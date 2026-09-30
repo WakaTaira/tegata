@@ -630,6 +630,12 @@ claude mcp add tegata --env TEGATA_SOCKET=/run/tegata/tegatad.sock \
   -- nix run github:WakaTaira/tegata#tegata-mcp
 ```
 
+Claude Code users can also install the `tegata-login` subagent from
+`integrations/claude-code/` (see [its README](../integrations/claude-code/README.md));
+it drives stepwise logins on a small model and returns only the outcome. The
+README describes the recommended permissions: allow only
+`mcp__tegata__login_step` and leave `login_begin` prompting.
+
 Or, as MCP client configuration:
 
 ```json

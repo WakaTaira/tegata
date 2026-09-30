@@ -429,6 +429,10 @@ Without Nix in the distro, build the broker from a checkout — `npm ci && npm
 run build --workspace @tegata/mcp` — and use
 `node packages/tegata-mcp/dist/index.js` as the command instead.
 
+Claude Code users can also install the `tegata-login` subagent from
+`integrations/claude-code/` (see [its README](../integrations/claude-code/README.md));
+it drives stepwise logins on a small model and returns only the outcome.
+
 `TEGATA_BRIDGE=1` matters. The CDP endpoint the daemon returns names a port on the
 Windows side, which a NAT-networked WSL client cannot reach. With the flag set, the
 broker opens a tunnel for the session after a successful `login` and rewrites the

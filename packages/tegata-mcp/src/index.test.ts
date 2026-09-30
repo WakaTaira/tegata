@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { join } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { afterEach, describe, expect, test } from "vitest";
 import {
+  createServer as createMcpServer,
   loginHandler,
   loginStepParams,
   openApiProxyHandler,
@@ -661,5 +664,139 @@ describe("login_step input schema", () => {
     expect(
       loginStepParams.safeParse({ login_id: "l1", action: "type" }).success,
     ).toBe(false);
+  });
+});
+
+type ListedSchema = {
+  type?: string;
+  properties?: Record<
+    string,
+    {
+      type?: string;
+      enum?: string[];
+      const?: string;
+      anyOf?: Array<{ type?: string }>;
+    }
+  >;
+};
+
+async function connectClient() {
+  const [clientTransport, serverTransport] =
+    InMemoryTransport.createLinkedPair();
+  const server = createMcpServer();
+  const client = new Client({ name: "test", version: "0.0.0" });
+  await Promise.all([
+    server.connect(serverTransport),
+    client.connect(clientTransport),
+  ]);
+  return { client, server };
+}
+
+// Issue #54 / #55: MCP クライアントから見える一覧スキーマと instructions。
+describe("createServer tool listing", () => {
+  test("lists every tool with a non-empty object inputSchema and a full login_step schema", async () => {
+    const { client, server } = await connectClient();
+    try {
+      const { tools } = await client.listTools();
+      for (const tool of tools) {
+        const schema = tool.inputSchema as ListedSchema;
+        expect(schema.type, tool.name).toBe("object");
+        expect(
+          Object.keys(schema.properties ?? {}).length,
+          tool.name,
+        ).toBeGreaterThan(0);
+      }
+      const loginStep = tools.find((t) => t.name === "login_step");
+      const listed = (loginStep?.inputSchema ?? {}) as ListedSchema;
+      const props = listed.properties ?? {};
+      expect(new Set(props.action?.enum)).toEqual(
+        new Set([
+          "click",
+          "wait_for",
+          "fill",
+          "fill_submit",
+          "snapshot",
+          "abort",
+        ]),
+      );
+      expect(props.fills?.type).toBe("array");
+      expect(props.submit?.anyOf).toHaveLength(2);
+      for (const branch of props.submit?.anyOf ?? []) {
+        expect(branch.type).toBe("object");
+      }
+      expect(props.value?.const ?? props.value?.enum).toEqual(
+        props.value?.const === undefined ? ["{{username}}"] : "{{username}}",
+      );
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  test("rejects inputs that only the discriminated union refuses", async () => {
+    const { client, server } = await connectClient();
+    try {
+      for (const args of [
+        { login_id: "l1", action: "fill" },
+        {
+          login_id: "l1",
+          action: "fill_submit",
+          fills: [{ selector: "#u", value: "{{username}}" }],
+        },
+      ]) {
+        const result = await client.callTool({
+          name: "login_step",
+          arguments: args,
+        });
+        expect(result.isError).toBe(true);
+        expect(JSON.stringify(result.content)).toContain(
+          "Input validation error",
+        );
+      }
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  test("instructions point agents at login_begin", async () => {
+    const { client, server } = await connectClient();
+    try {
+      expect(client.getInstructions()).toContain("login_begin");
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+});
+
+describe.sequential("login_step handler params", () => {
+  test("forwards the union's parse result and drops unrelated fields", async () => {
+    const fake = await startFakeStepwiseServer({
+      result: { state: "pending", login_id: "l1" },
+    });
+    const { client, server } = await connectClient();
+    try {
+      const result = await client.callTool({
+        name: "login_step",
+        arguments: {
+          login_id: "l1",
+          action: "click",
+          selector: "#next",
+          fills: [{ selector: "#p", value: "{{password}}" }],
+        },
+      });
+      expect(result.isError).toBeFalsy();
+      expect(fake.calls).toEqual([
+        {
+          method: "login_step",
+          params: { login_id: "l1", action: "click", selector: "#next" },
+        },
+      ]);
+    } finally {
+      await client.close();
+      await server.close();
+      await stopFakeServer(fake.server);
+    }
   });
 });

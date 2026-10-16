@@ -71,12 +71,14 @@ export const PREAMBLE_ERRORS = ["UNAUTHORIZED", "FORBIDDEN"] as const;
 /**
  * Files under the daemon's ProgramData directory that must be unreadable from
  * the agent side, expressed relative to TEGATA_WIN_PROGRAMDATA. This is the
- * pinned on-disk layout of the Windows service.
+ * pinned on-disk layout of the Windows service. Since Phase 4a the daemon
+ * imports `state/token_hash` into `state/peers.json` at startup and renames
+ * the old file, so the token hashes live in `peers.json`.
  */
 export const PROTECTED_FILES = [
   "config.toml",
   "state/sealed.blob",
-  "state/token_hash",
+  "state/peers.json",
 ];
 
 export interface RigEnv {

@@ -44,6 +44,25 @@ whoami.exe /groups | grep 'Mandatory Level'
 Expect `Mandatory Label\Medium Mandatory Level`. `High Mandatory Level` means the
 launcher is elevated and the gate is open; fix the launcher first.
 
+### A standard account for daily use
+
+The account that runs WSL does not need to be an administrator, and the setup is
+stronger when it is not: on a standard account the WSL side holds no
+administrator rights at all, so no launcher mistake can hand interop a token the
+administrative gate would accept. The elevated steps below are then run by
+entering a separate administrator account's credentials at the UAC prompt. That
+shell runs *as the administrator account*, which the gate accepts, and the
+daemon seals the master password under its own service account, so which
+administrator runs `seal` does not matter.
+
+Two things differ from an administrator daily account:
+
+- `whoami /user` in the elevated shell reports the administrator's SID. Take the
+  SID for `allowed_sids` and `operator_sid` from a non-elevated shell of the
+  daily account instead.
+- `approval allow` and `approval deny` ask for the administrator's credentials
+  each time, because every answer goes through the elevated gate.
+
 ## Prerequisites on the Windows host
 
 - Node.js LTS
@@ -113,8 +132,8 @@ and browser directories, applies a protected DACL to each, and — when
 `operator_sid` is set — grants that SID permission to start and stop the service.
 
 The DACL names only the service account and `SYSTEM`. The local administrators
-group is deliberately left out: the WSL file server behind `/mnt/c` reads with that
-group enabled, so including it would hand the WSL side exactly the read this
+group is deliberately left out: when the WSL user is an administrator, the WSL
+file server behind `/mnt/c` reads with that group enabled, so including it would hand the WSL side exactly the read this
 boundary exists to prevent. Administrators keep *ownership* of the paths they
 created, which is enough to repair a DACL without being enough to read through one.
 
@@ -520,7 +539,9 @@ also reports
 `tegatad: admin rpc refused: peer origin <origin> (elevated=<bool>, administrator=<bool>)`.
 See [How the
 distro is started matters](#how-the-distro-is-started-matters) and keep the
-distro on a non-elevated interactive token.
+distro on a non-elevated interactive token. On a standard daily account, elevate
+with the administrator account's credentials; see [A standard account for daily
+use](#a-standard-account-for-daily-use).
 
 **The daemon starts but no credential resolves.** The master password has not been
 sealed on this machine, or was sealed by a different account. DPAPI blobs are

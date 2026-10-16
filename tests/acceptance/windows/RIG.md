@@ -24,6 +24,19 @@ skips) when the rig is not configured — see `requireRig()` in
   `seal` calls land on the daemon (see `docs/setup-windows-wsl.md`, "How the
   distro is started matters"). `whoami.exe /groups` must report
   `Medium Mandatory Level`.
+  A host whose everyday WSL distro has interop disabled
+  (`[interop] enabled=false`) can still host the rig in a second distro kept
+  for it alone, with interop and automount enabled; `/etc/wsl.conf` is
+  per-distro. Run the suite only from that distro: in the interop-disabled
+  one `requireRig()` still passes, because `powershell.exe` exists under
+  `/mnt/c`, and the first test fails at spawn time instead.
+- **The Windows account** — may be an administrator or a standard account.
+  On a standard account the one-time setup below is run from a shell
+  elevated with a separate administrator's credentials, and the SIDs in the
+  rig config (`allowed_sids`, `operator_sid`) must still be the everyday
+  account's, taken from its non-elevated shell. AC-24, AC-94, and AC-97 then
+  refuse because the caller is not an administrator rather than because it
+  is not elevated; the expected outcome is the same.
 
 ## One-time Windows setup (the Windows host, elevated)
 

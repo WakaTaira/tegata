@@ -69,8 +69,9 @@ kernel itself observed on the connecting process. A uid absent from
 **Windows.** The daemon runs under the virtual service account
 `NT SERVICE\tegatad`. Files that hold, or briefly hold, secrets get a protected
 DACL naming only the daemon's own account and `SYSTEM`. The local administrators
-group is deliberately *excluded*: the WSL file server that backs `/mnt/c` reads
-with a token in which that group is enabled, so granting it would hand the agent
+group is deliberately *excluded*: when the Windows user is an administrator, the
+WSL file server that backs `/mnt/c` reads with a token in which that group is
+enabled, so granting it would hand the agent
 side of the machine exactly the read it must not have. Administrators retain
 ownership of the paths they create during installation, which is enough to repair
 the DACL without being enough to read through it.

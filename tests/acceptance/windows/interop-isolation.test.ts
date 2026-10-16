@@ -14,6 +14,13 @@ import {
 
 let programData: string;
 
+/** Convert a /mnt/<drive>/... path back to its Windows form (C:\\...). */
+function wslToWin(wslPath: string): string {
+  const m = /^\/mnt\/([a-z])\/(.*)$/.exec(wslPath);
+  if (!m) throw new Error(`not a /mnt drive path: ${wslPath}`);
+  return `${m[1].toUpperCase()}:\\${m[2].replaceAll("/", "\\")}`;
+}
+
 beforeAll(() => {
   requireRig();
   programData = rigEnv().programData;
@@ -21,7 +28,7 @@ beforeAll(() => {
 
 test("AC-22: agent-side reads of the daemon's protected files are denied", async () => {
   // Given: WSL with interop + automount enabled, and the daemon's protected
-  // files present under C:\ProgramData\tegata
+  // files present under TEGATA_WIN_PROGRAMDATA (C:\ProgramData\tegata by default)
   for (const rel of PROTECTED_FILES) {
     const wslPath = path.join(programData, rel);
 
@@ -34,7 +41,7 @@ test("AC-22: agent-side reads of the daemon's protected files are denied", async
     }
 
     // ... and again via powershell.exe over interop
-    const winPath = `C:\\ProgramData\\tegata\\${rel.replaceAll("/", "\\")}`;
+    const winPath = wslToWin(wslPath);
     const ps = await psRun(
       `try { Get-Content -Raw -LiteralPath '${winPath}' -ErrorAction Stop; 'READABLE' } ` +
         `catch { if ($_.CategoryInfo.Category -eq 'PermissionDenied') { 'DENIED' } else { 'ERR:' + $_.CategoryInfo.Category } }`,

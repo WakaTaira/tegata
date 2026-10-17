@@ -1026,6 +1026,488 @@ function handleStepwiseRequest(
   return true;
 }
 
+// State of the /trap/ pages (Issue #57). Every recorded field value is masked
+// by `maskStepwiseValue`, so the state never carries a credential.
+interface TrapPost {
+  path: string;
+  fields: Record<string, string>;
+}
+interface TrapInput {
+  path: string;
+  origin: string;
+  field: string;
+  value: string;
+}
+const trapRequests: Array<{ method: string; host: string; path: string }> = [];
+const trapPosts: TrapPost[] = [];
+const trapInputs: TrapInput[] = [];
+
+/** Default values planted on /trap/values/; none of them may reach a snapshot. */
+const TRAP_VALUE_CANARIES = {
+  defaultValue: "trapval-default-value-4c1e9a",
+  csrfToken: "trapval-hidden-csrf-token-8d2f71",
+  dataAttribute: "trapval-data-attribute-5b7e03",
+  scriptVariable: "trapval-inline-script-variable-a9c4d6",
+  textarea: "trapval-textarea-default-31f8b2",
+  explicitRole: "trapval-explicit-role-note-e60d5c",
+  labeledText: "trapval-labeled-placeholder-text-7a3c19",
+  labeledPassword: "trapval-labeled-placeholder-password-0f92e4",
+} as const;
+
+/** Number of archive links that push the /trap/huge/ pages past 64 KiB. */
+const TRAP_HUGE_ARTICLES = 1200;
+
+// input イベントを同期要求で報告する。iframe の中（別 origin・srcdoc を含む）にも同じ処理を置き、
+// どの文書のどの欄に値が入ったかを fixture へ届ける。値は fixture 側で伏せて記録する。
+const TRAP_INPUT_REPORTER_SOURCE = `document.addEventListener("input", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement) && !(target instanceof HTMLTextAreaElement)) return;
+  const request = new XMLHttpRequest();
+  request.open("POST", "/trap/input", false);
+  request.setRequestHeader("Content-Type", "application/json");
+  request.send(JSON.stringify({
+    path: location.pathname,
+    origin: location.origin,
+    field: target.name || target.id,
+    value: target.value
+  }));
+}, true);`;
+
+function trapPage(title: string, body: string): string {
+  return `<!doctype html>
+<html lang="en">
+<head><title>${title}</title></head>
+<body>
+${body}
+<script>${TRAP_INPUT_REPORTER_SOURCE}</script>
+</body>
+</html>`;
+}
+
+function trapSignedInPage(username: string): string {
+  return trapPage(
+    "Welcome",
+    `<h1>Welcome</h1>
+<div id="signed-in">Signed in as ${escapeHtml(username)}</div>`,
+  );
+}
+
+function trapErrorPage(): string {
+  return trapPage(
+    "Sign in failed",
+    '<div id="login-error">Incorrect username or password</div>',
+  );
+}
+
+function trapNamesUsernamePage(error?: string): string {
+  return trapPage(
+    "Sign in to Trap",
+    `<h1>Sign in to Trap</h1>
+${stepwiseError(error)}
+<form method="POST" action="/trap/names/username">
+<span id="identifier-label">Phone, email, or username</span>
+<input id="identifier" name="username" type="text" aria-labelledby="identifier-label" autocomplete="username">
+<button id="next-step" type="submit"><svg width="20" height="20" viewBox="0 0 20 20"><title>Next step</title><path d="M4 10h12M12 6l4 4-4 4"></path></svg></button>
+<input id="log-in" type="submit" value="Log in">
+<button id="forgot" type="button"><img alt="Forgot password" width="16" height="16" src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=="></button>
+</form>`,
+  );
+}
+
+function trapNamesPasswordPage(error?: string): string {
+  return trapPage(
+    "Enter your password",
+    `<h1>Enter your password</h1>
+${stepwiseError(error)}
+<form method="POST" action="/trap/names/password">
+<label for="password">Password</label>
+<input id="password" name="password" type="password" autocomplete="current-password">
+<button id="sign-in" type="submit">Sign in</button>
+</form>`,
+  );
+}
+
+function trapOneScreenPage(): string {
+  return trapPage(
+    "Sign in",
+    `<div style="display:none">
+<form method="POST" action="/trap/one-screen/hidden">
+<label for="hidden-user">Hidden username</label>
+<input id="hidden-user" name="username" type="text">
+<label for="hidden-pass">Hidden password</label>
+<input id="hidden-pass" name="password" type="password">
+<button type="submit">Hidden duplicate sign in</button>
+</form>
+</div>
+<h1>Sign in</h1>
+${trapLoginForm("/trap/one-screen/login")}`,
+  );
+}
+
+function trapRememberedPage(username: string): string {
+  return trapPage(
+    "Welcome back",
+    `<h1>Welcome back</h1>
+<p>Continue as <strong>${escapeHtml(username)}</strong></p>
+<form method="POST" action="/trap/remembered/login">
+<label for="pass">Password</label>
+<input id="pass" name="password" type="password" autocomplete="current-password">
+<button id="continue" type="submit">Continue</button>
+</form>`,
+  );
+}
+
+function trapFramesPage(port: string): string {
+  const embedded = `<label for="embedded-pass">Embedded password</label>
+<input id="embedded-pass" name="password" type="password">
+<script>${TRAP_INPUT_REPORTER_SOURCE}</script>`;
+  return trapPage(
+    "Partner sign in",
+    `<h1>Partner sign in</h1>
+<iframe id="same-frame" title="Sign in frame" src="/trap/frames/same" width="420" height="200"></iframe>
+<iframe id="cross-frame" title="Partner frame" src="http://localhost:${port}/trap/frames/cross" width="420" height="120"></iframe>
+<iframe id="srcdoc-frame" title="Embedded frame" srcdoc="${escapeHtml(embedded)}" width="420" height="120"></iframe>
+<iframe id="spoof-frame" title="Spoofed frame" src="http://localhost:${port}/trap/frames/spoof" width="420" height="120"></iframe>
+<iframe id="widget-frame" title="Widget frame" src="/trap/frames/widget" width="420" height="80"></iframe>
+<button id="remove-widget" type="button">Remove widget frame</button>
+<script>
+document.getElementById("remove-widget")?.addEventListener("click", () => {
+  document.getElementById("widget-frame")?.remove();
+});
+</script>`,
+  );
+}
+
+function trapFramesSamePage(): string {
+  return trapPage(
+    "Sign in frame",
+    `<form method="POST" action="/trap/frames/same/login" target="_top">
+<label for="frame-user">Frame username</label>
+<input id="frame-user" name="username" type="text">
+<label for="frame-pass">Frame password</label>
+<input id="frame-pass" name="password" type="password">
+<button id="frame-sign-in" type="submit">Frame sign in</button>
+</form>`,
+  );
+}
+
+function trapFramesCrossPage(): string {
+  return trapPage(
+    "Partner frame",
+    `<label for="partner-pass">Partner password</label>
+<input id="partner-pass" name="password" type="password">
+<button type="button">Partner continue</button>`,
+  );
+}
+
+// ownerDocument を差し替え、page の JS から見える文書の origin を main frame の origin と偽る。
+function trapFramesSpoofPage(port: string): string {
+  const claimed = JSON.stringify(`http://127.0.0.1:${port}`);
+  return trapPage(
+    "Spoofed frame",
+    `<script>
+(() => {
+  const claimedOrigin = ${claimed};
+  const claimedLocation = { origin: claimedOrigin, href: claimedOrigin + "/trap/frames/" };
+  const descriptor = Object.getOwnPropertyDescriptor(Node.prototype, "ownerDocument");
+  const realGetter = descriptor.get;
+  Object.defineProperty(Node.prototype, "ownerDocument", {
+    configurable: true,
+    get() {
+      const doc = realGetter.call(this);
+      if (doc === null) return doc;
+      return new Proxy(doc, {
+        get(target, property) {
+          if (property === "location") return claimedLocation;
+          const value = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      });
+    }
+  });
+})();
+</script>
+<label for="spoof-pass">Spoofed password</label>
+<input id="spoof-pass" name="password" type="password">`,
+  );
+}
+
+function trapFramesWidgetPage(): string {
+  return trapPage(
+    "Widget frame",
+    '<button id="widget-action" type="button">Widget action</button>',
+  );
+}
+
+function trapValuesPage(): string {
+  const c = TRAP_VALUE_CANARIES;
+  return trapPage(
+    "Sign in",
+    `<h1>Sign in</h1>
+<script>window.trapSessionToken = ${JSON.stringify(c.scriptVariable)};</script>
+<form method="POST" action="/trap/values/login">
+<input type="hidden" name="csrf" value="${c.csrfToken}">
+<label for="username">Username</label>
+<input id="username" name="username" type="text" placeholder="you@example.com" autocomplete="username">
+<label for="password">Password</label>
+<input id="password" name="password" type="password" placeholder="Your password" value="${c.labeledPassword}">
+<label for="display-name">Display name</label>
+<input id="display-name" name="display_name" type="text" value="${c.defaultValue}">
+<label for="referral">Referral code</label>
+<input id="referral" name="referral" type="text" placeholder="Optional code" value="${c.labeledText}">
+<label for="notes">Notes</label>
+<textarea id="notes" name="notes">${c.textarea}</textarea>
+<input id="account-note" name="account_note" type="text" role="note" aria-label="Account note" value="${c.explicitRole}">
+<p data-token="${c.dataAttribute}">Promotional terms apply.</p>
+<button id="sign-in" type="submit">Sign in</button>
+</form>`,
+  );
+}
+
+function trapArchiveList(): string {
+  const items: string[] = [];
+  for (let index = 1; index <= TRAP_HUGE_ARTICLES; index += 1) {
+    items.push(
+      `<li><a href="/trap/huge/article/${index}.html">Archive article number ${index}</a></li>`,
+    );
+  }
+  return `<ul id="archive">\n${items.join("\n")}\n</ul>`;
+}
+
+function trapHugePage(): string {
+  return trapPage(
+    "Archive",
+    `<h1>Archive</h1>
+<button id="collapse" type="button">Collapse archive</button>
+<button id="expand" type="button">Expand archive</button>
+${trapArchiveList()}
+${trapLoginForm("/trap/huge/login")}
+<script>
+const archive = document.getElementById("archive");
+document.getElementById("collapse")?.addEventListener("click", () => {
+  if (archive !== null) archive.hidden = true;
+});
+document.getElementById("expand")?.addEventListener("click", () => {
+  if (archive !== null) archive.hidden = false;
+});
+</script>`,
+  );
+}
+
+function trapLoginForm(action: string): string {
+  return `<form method="POST" action="${action}">
+<label for="user">Username</label>
+<input id="user" name="username" type="text" autocomplete="username">
+<label for="pass">Password</label>
+<input id="pass" name="password" type="password" autocomplete="current-password">
+<button id="sign-in" type="submit">Sign in</button>
+</form>`;
+}
+
+function trapHugeEchoResultPage(password: string): string {
+  return trapPage(
+    "Archive",
+    `<h1>Archive</h1>
+${trapArchiveList()}
+<p id="echo">Your password is ${escapeHtml(password)}</p>`,
+  );
+}
+
+function trapEchoResultPage(password: string): string {
+  const shown = escapeHtml(password);
+  return trapPage(
+    "Welcome",
+    `<h1>Welcome ${shown}</h1>
+<p>Your password is ${shown}</p>
+<button id="echo-name" type="button">${shown}</button>
+<button id="echo-label" type="button" aria-label="${shown}">Continue</button>
+<label for="recovery">Recovery value</label>
+<input id="recovery" name="recovery" type="text" value="${shown}">`,
+  );
+}
+
+function recordTrapPost(
+  path: string,
+  form: URLSearchParams,
+  credentials: Credentials,
+): void {
+  const fields: Record<string, string> = {};
+  for (const [name, value] of form) {
+    fields[name] = maskStepwiseValue(value, credentials);
+  }
+  trapPosts.push({ path, fields });
+}
+
+function validTrapLogin(form: URLSearchParams, credentials: Credentials) {
+  return (
+    form.get("username") === credentials.username &&
+    form.get("password") === credentials.password
+  );
+}
+
+/** Read and record a form POST, then answer with the page `render` builds. */
+function handleTrapPost(
+  path: string,
+  request: IncomingMessage,
+  response: ServerResponse,
+  credentials: Credentials,
+  render: (form: URLSearchParams) => string,
+): void {
+  readRequestBody(request, (body) => {
+    const form = new URLSearchParams(body);
+    recordTrapPost(path, form, credentials);
+    writePage(response, render(form));
+  });
+}
+
+/** Test-only endpoints of the trap pages (state and in-page reports). */
+function handleTrapControl(
+  route: string,
+  request: IncomingMessage,
+  response: ServerResponse,
+  credentials: Credentials,
+): boolean {
+  if (route === "GET /trap/state") {
+    writeJson(response, 200, {
+      requests: trapRequests,
+      posts: trapPosts,
+      inputs: trapInputs,
+    });
+  } else if (route === "POST /trap/input") {
+    recordStepwiseJson(request, response, (value) => {
+      if (
+        typeof value.path !== "string" ||
+        typeof value.origin !== "string" ||
+        typeof value.field !== "string" ||
+        typeof value.value !== "string"
+      )
+        return false;
+      trapInputs.push({
+        path: value.path,
+        origin: value.origin,
+        field: value.field,
+        value: maskStepwiseValue(value.value, credentials),
+      });
+      return true;
+    });
+  } else {
+    return false;
+  }
+  return true;
+}
+
+/** Form POST routes of the trap pages and the page each one answers with. */
+function trapPostRoutes(
+  credentials: Credentials,
+): Record<string, (form: URLSearchParams) => string> {
+  const signedIn = (form: URLSearchParams) =>
+    validTrapLogin(form, credentials)
+      ? trapSignedInPage(credentials.username)
+      : trapErrorPage();
+  return {
+    "/trap/names/username": (form) =>
+      form.get("username") === credentials.username
+        ? trapNamesPasswordPage()
+        : trapNamesUsernamePage("Unknown user"),
+    "/trap/names/password": (form) =>
+      form.get("password") === credentials.password
+        ? trapSignedInPage(credentials.username)
+        : trapNamesPasswordPage("Incorrect password"),
+    "/trap/one-screen/login": signedIn,
+    "/trap/one-screen/hidden": () => trapErrorPage(),
+    "/trap/remembered/login": (form) =>
+      form.get("password") === credentials.password
+        ? trapSignedInPage(credentials.username)
+        : trapErrorPage(),
+    "/trap/frames/same/login": signedIn,
+    "/trap/values/login": signedIn,
+    "/trap/huge/login": signedIn,
+    "/trap/huge/echo/login": (form) =>
+      trapHugeEchoResultPage(form.get("password") ?? ""),
+    "/trap/echo/login": (form) =>
+      trapEchoResultPage(form.get("password") ?? ""),
+  };
+}
+
+/** GET routes of the trap pages. `port` is the fixture's port. */
+function trapGetPage(
+  path: string,
+  port: string,
+  credentials: Credentials,
+): string | undefined {
+  switch (path) {
+    case "/trap/names/":
+      return trapNamesUsernamePage();
+    case "/trap/one-screen/":
+      return trapOneScreenPage();
+    case "/trap/remembered/":
+      return trapRememberedPage(credentials.username);
+    case "/trap/frames/":
+      return trapFramesPage(port);
+    case "/trap/frames/same":
+      return trapFramesSamePage();
+    case "/trap/frames/cross":
+      return trapFramesCrossPage();
+    case "/trap/frames/spoof":
+      return trapFramesSpoofPage(port);
+    case "/trap/frames/widget":
+      return trapFramesWidgetPage();
+    case "/trap/values/":
+      return trapValuesPage();
+    case "/trap/huge/":
+      return trapHugePage();
+    case "/trap/huge/echo/":
+      return trapPage("Sign in", trapLoginForm("/trap/huge/echo/login"));
+    case "/trap/echo/":
+      return trapPage("Sign in", trapLoginForm("/trap/echo/login"));
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Trap pages for the aria snapshot (Issue #57): `names` (elements named only
+ * through aria-labelledby, an SVG title, an image alt or a submit value),
+ * `one-screen` (a hidden duplicate form before the real one), `remembered`
+ * (the username shown as text), `frames` (same-origin, cross-origin, srcdoc,
+ * ownerDocument-spoofing and removable iframes; the cross-origin ones live on
+ * `localhost`), `values` (planted default values), `huge` (past 64 KiB, with
+ * a form near the end, and `huge/echo/` echoing the password at the end) and
+ * `echo` (the password shown in a heading, a button name, an aria-label, an
+ * input value and a paragraph). Returns false for other requests.
+ */
+function handleTrapRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  credentials: Credentials,
+): boolean {
+  const url = new URL(request.url ?? "/", requestOrigin(request));
+  if (!url.pathname.startsWith("/trap/")) return false;
+  const route = `${request.method} ${url.pathname}`;
+  if (handleTrapControl(route, request, response, credentials)) return true;
+  trapRequests.push({
+    method: request.method ?? "",
+    host: url.host,
+    path: url.pathname,
+  });
+  if (request.method === "POST") {
+    const render = trapPostRoutes(credentials)[url.pathname];
+    if (render !== undefined) {
+      handleTrapPost(url.pathname, request, response, credentials, render);
+      return true;
+    }
+  } else if (request.method === "GET") {
+    const page = trapGetPage(url.pathname, url.port, credentials);
+    if (page !== undefined) {
+      writePage(response, page);
+      return true;
+    }
+  }
+  response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+  response.end("not found");
+  return true;
+}
+
 function devicePage(): string {
   return `<!doctype html>
 <html lang="en">
@@ -1619,6 +2101,8 @@ function handleRequest(
   if (handleDeviceCookieRequest(request, response)) return;
 
   if (handleStepwiseRequest(request, response, credentials)) return;
+
+  if (handleTrapRequest(request, response, credentials)) return;
 
   if (request.method === "POST" && request.url === "/device/issue") {
     const userCode = newDeviceCode();

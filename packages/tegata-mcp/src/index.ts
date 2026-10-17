@@ -33,6 +33,7 @@ const ERROR_CODES = [
   "ADMIN_REQUIRED",
   "ADMIN_SEAL_UNAVAILABLE",
   "SNAPSHOT_REJECTED",
+  "FILL_TARGET_REFUSED",
 ] as const;
 type ErrorCode = (typeof ERROR_CODES)[number];
 const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
@@ -53,20 +54,46 @@ const loginStep = z.union([
   }),
 ]);
 
+// Issue #57: 要素の指し方。ref（スナップショットの `[ref=…]`）と selector はどちらか一方だけを受け付ける。
+const stepRef = z
+  .string()
+  .regex(/^(f\d+)?e\d+$/)
+  .max(32);
+
+// fills[] の要素と submit の値で共有する、ref / selector 排他の対象指定。
+const refTarget = z.strictObject({ ref: stepRef });
+const selectorTarget = z.strictObject({ selector: z.string() });
+const stepTarget = z.union([refTarget, selectorTarget]);
+
+// click / wait_for / fill 用のフラットな対象 field。排他は xorTarget で検査する。
+const targetFields = {
+  ref: stepRef.optional(),
+  selector: z.string().optional(),
+};
+
+function xorTarget(args: { ref?: string; selector?: string }): boolean {
+  return (args.ref === undefined) !== (args.selector === undefined);
+}
+
+const xorMessage = "Exactly one of ref or selector is required.";
+
 // fill_submit の fills / submit の定義。loginStepParams と公開用スキーマで共有する。
+const stepwiseValue = z.enum(["{{username}}", "{{password}}", "{{totp}}"]);
+
 const stepwiseFills = z
   .array(
-    z.object({
-      selector: z.string(),
-      value: z.enum(["{{username}}", "{{password}}", "{{totp}}"]),
-    }),
+    z.union([
+      z.strictObject({ ref: stepRef, value: stepwiseValue }),
+      z.strictObject({ selector: z.string(), value: stepwiseValue }),
+    ]),
   )
   .min(1)
   .max(3);
 
+// 文字列形は selector の省略形。
 const stepwiseSubmit = z.union([
-  z.object({ click: z.string() }),
-  z.object({ press_enter: z.string() }),
+  z.object({ click: z.union([z.string(), stepTarget]) }),
+  z.object({ press_enter: z.union([z.string(), stepTarget]) }),
 ]);
 
 // Issue #46: login_step のフラット形パラメータ。action ごとに許される field を discriminated
@@ -74,22 +101,28 @@ const stepwiseSubmit = z.union([
 // 3 種のみに制限する（デーモン側の再検査と合わせた二重防御）。テストからスキーマ単体を
 // 検証できるよう export する。
 export const loginStepParams = z.discriminatedUnion("action", [
-  z.object({
-    login_id: z.string(),
-    action: z.literal("click"),
-    selector: z.string(),
-  }),
-  z.object({
-    login_id: z.string(),
-    action: z.literal("wait_for"),
-    selector: z.string(),
-  }),
-  z.object({
-    login_id: z.string(),
-    action: z.literal("fill"),
-    selector: z.string(),
-    value: z.literal("{{username}}"),
-  }),
+  z
+    .object({
+      login_id: z.string(),
+      action: z.literal("click"),
+      ...targetFields,
+    })
+    .refine(xorTarget, { message: xorMessage }),
+  z
+    .object({
+      login_id: z.string(),
+      action: z.literal("wait_for"),
+      ...targetFields,
+    })
+    .refine(xorTarget, { message: xorMessage }),
+  z
+    .object({
+      login_id: z.string(),
+      action: z.literal("fill"),
+      ...targetFields,
+      value: z.literal("{{username}}"),
+    })
+    .refine(xorTarget, { message: xorMessage }),
   z.object({
     login_id: z.string(),
     action: z.literal("fill_submit"),
@@ -446,6 +479,7 @@ const INSTRUCTIONS = [
   "Use login with fixed steps only when the site's steps are already known.",
   "Call login_begin once per login; do not keep retrying it (each call counts against the rate limit and sites throttle repeated attempts).",
   "On RATE_LIMITED or a failed login_begin, report to the user instead of retrying.",
+  'A stepwise snapshot is { url, title, page, settled, truncated? }. Point at an element by the [ref=…] on its line in `page` (for example { action: "click", ref: "e9" }); only refs from the latest snapshot are valid.',
   "If a stepwise login was aborted and the success_selector looks wrong, retry once with a corrected selector, and no more.",
 ].join("\n");
 
@@ -460,10 +494,17 @@ const loginStepInputSchema = z
     action: z
       .enum(["click", "wait_for", "fill", "fill_submit", "snapshot", "abort"])
       .describe("The step to perform."),
+    ref: stepRef
+      .optional()
+      .describe(
+        "Target element ref, the [ref=…] of a line in the latest snapshot's page. Used by click, wait_for and fill; give exactly one of ref or selector.",
+      ),
     selector: z
       .string()
       .optional()
-      .describe("Target element selector. Used by click, wait_for and fill."),
+      .describe(
+        "Target element CSS selector. Used by click, wait_for and fill; give exactly one of ref or selector.",
+      ),
     value: z
       .literal("{{username}}")
       .optional()
@@ -473,12 +514,12 @@ const loginStepInputSchema = z
     fills: stepwiseFills
       .optional()
       .describe(
-        "Fields to fill (1 to 3). Used by fill_submit only; the only action that may use {{password}} / {{totp}}.",
+        "Fields to fill (1 to 3), each { ref, value } or { selector, value }. Used by fill_submit only; the only action that may use {{password}} / {{totp}}.",
       ),
     submit: stepwiseSubmit
       .optional()
       .describe(
-        "How to submit after the fills: exactly one of { click: selector } or { press_enter: selector }. Used by fill_submit only.",
+        "How to submit after the fills: exactly one of { click: target } or { press_enter: target }, where target is { ref }, { selector } or a selector string. Used by fill_submit only.",
       ),
   })
   .superRefine((args, ctx) => {
@@ -542,7 +583,7 @@ export function createServer(): McpServer {
     "login_step",
     {
       description:
-        "Drive one step of a stepwise login started with login_begin. fill_submit is the only action that may use the {{password}} / {{totp}} placeholders.",
+        "Drive one step of a stepwise login started with login_begin. Point at elements by the [ref=…] on a line of the latest snapshot's page (refs from older snapshots are invalid), or by selector. fill_submit is the only action that may use the {{password}} / {{totp}} placeholders.",
       inputSchema: loginStepInputSchema,
     },
     // Issue #54: flat な一覧用スキーマを通過した入力を union で再構文解析し、

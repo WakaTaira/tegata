@@ -368,10 +368,15 @@ guessing the whole step list up front, without weakening the no-raw-CDP and
 no-field-value invariants above.
 
 **The snapshot returned between steps carries no field value.** It is built
-on the isolated side from the page's visible interactive elements and their
-non-value attributes only — no `value` property, `value` attribute, or
-`data-*` attribute of any element is ever serialized, regardless of the
-element's type or visibility. `fill_submit`, the only action that may place
+on the isolated side as an accessibility-tree view of the page (roles and
+accessible names, including the contents of iframes), and the value of every
+input, textarea, and combobox is removed from it: a field that held a value is
+marked `[filled]` and shows nothing else. No `value` attribute or `data-*`
+attribute is serialized. The removal covers each value-bearing role, including
+elements that carry an explicit `role` attribute, because the browser reports an
+input's value whatever role it was given. If the accessibility output has a
+shape tegata does not recognise, no snapshot is returned and the stepwise login
+ends. `fill_submit`, the only action that may place
 `{{password}}` or `{{totp}}`, fills and submits as one uninterruptible
 operation and then makes a best-effort attempt to clear what it filled from
 the DOM before any snapshot is built; that clearing can fail silently, and a
@@ -380,14 +385,29 @@ outside what it clears. The actual backstop is the snapshot check below, not
 this clearing.
 
 **Every snapshot is checked for a known secret before it leaves the
-boundary.** The full serialization is searched, in raw, HTML-escaped,
-URL-encoded, base64, and hex form, for an exact match of the credential's
-password and of every TOTP code entered so far. A hit ends the stepwise
+boundary.** The full content, before any size truncation, is searched, in raw,
+HTML-escaped, URL-encoded, base64, and hex form, and in the forms the snapshot
+itself displays (whitespace-normalised, and JSON- or YAML-escaped, including
+inside quoted names), for an exact match of the credential's password and of
+every TOTP code entered so far. The final serialization is searched again after
+truncation. A hit ends the stepwise
 login, discards its browser, and returns `SNAPSHOT_REJECTED` instead of the
 snapshot — the same defense-in-depth posture as the RPC-wide leak scan in
 [invariant 3](#3-only-a-thin-allowlisted-rpc-crosses-the-boundary), applied
 one layer earlier because a stepwise login's snapshot is not itself a fixed
 classification code.
+
+**Values are only entered into the main frame's origin.** The snapshot includes
+iframes, and `ref` addresses elements inside them, so `fill` and `fill_submit`
+check where each target lives before entering anything. The element's frame URL
+(as reported by the browser, not by page script) must have the same origin as
+the main frame's current URL; a frame at `about:blank`, a `srcdoc` frame, or a
+`data:` frame is refused. The `sandbox` attribute is not consulted. If any target
+fails the check, nothing is filled, the stepwise login ends, its browser is
+discarded, and the call returns `FILL_TARGET_REFUSED`. `click`, `wait_for`, and
+`snapshot` are not restricted, so the agent can still read and operate a
+cross-origin frame such as an embedded sign-in widget; it just cannot type a
+credential into it.
 
 **Partial echoes are an accepted residual risk.** Only exact matches are
 checked. A site that echoes a masked form of the password — `••••••••`, a
@@ -399,6 +419,20 @@ example the literal word "password"). A check that can misfire is not a
 check an operator can trust to be deterministic, so this control stops at
 exact matches and accepts that a masked echo is not a full disclosure of the
 value.
+
+**The snapshot widens the prompt-injection surface, and the username mask is
+best-effort.** The agent now receives the whole page's text, not a short list of
+form controls, so a page can place more injected instructions in front of it.
+The `[username]` mask relies on exact matches of the forms the browser
+displays; a page that writes the username differently (different case, spacing,
+or an altered form) can leak it into the snapshot, and the username is not
+treated as a secret to the same degree as the password and TOTP code. An
+`A → B → A` nesting of frames, where a frame of the main frame's origin sits
+inside a different-origin frame, passes the origin check, so a value can be
+entered into it. An element with `contenteditable` but no ARIA role is
+reported by the browser as a generic node together with its contents, so any
+default text the page puts in it appears in the snapshot; that text is page
+content rather than a value tegata removes.
 
 **A stepwise login can reach a re-authentication prompt on an
 already-authenticated page.** Nothing about `login_step` distinguishes a

@@ -28,6 +28,6 @@ The main session picks the credential (for example with `list_credentials`) and 
 It replies with exactly one JSON block:
 
 - Success: `{"ok": true, "session_id", "target_id", "endpoint"}`. Connect to `endpoint` over CDP.
-- Failure: `{"ok": false, "error", "url", "title", "text", "elements"}`, where `error` is a tegata error code, `ABORTED`, or `MISSING_INPUT`, and the page fields describe the last snapshot (`text` is cut to 500 characters, `elements` to 10).
+- Failure: `{"ok": false, "error", "url", "title", "page"}`, where `error` is a tegata error code, `ABORTED`, or `MISSING_INPUT`, and the page fields describe the last snapshot (`page` is cut to 1500 characters).
 
 On failure, do not retry; report the JSON to the user. The only exception is when `error` is `ABORTED` and a mismatched `success_selector` is suspected: fix the selector and delegate once more, only once. For any other failure, such as `RATE_LIMITED` or a failed `login_begin`, only report it to the user.

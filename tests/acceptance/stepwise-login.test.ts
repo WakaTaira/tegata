@@ -4,15 +4,27 @@
 // echoed secrets rejected), with secrets filled only inside `fill_submit`,
 // no CDP endpoint before the handoff, a principal-bound `login_id`, idle
 // expiry, one approval and one rate-limit attempt per stepwise login, and
-// the Issue #45 cookie restore.
+// the Issue #45 cookie restore. Rewritten for the Issue #57 snapshot shape:
+// the snapshot carries `page` (the value-free AI aria snapshot) instead of
+// `text` / `elements`, and elements are addressed by the `[ref=…]` of the
+// line the agent would pick.
 // Traceability: docs/secret/briefs/tegata-issue46-stepwise-login.md
-// acceptance condition AC-159 .. AC-172.
+// acceptance condition AC-159 .. AC-172, rewritten per
+// docs/secret/briefs/tegata-issue57-aria-snapshot.md (scope: AC-159 .. AC-172).
 
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { chromium } from "playwright-core";
 import { expect, test } from "vitest";
+import {
+  driveFlow,
+  expectDone,
+  expectPending,
+  findLine,
+  nthUnnamedRef,
+  refOf,
+} from "./support/aria-snapshot.js";
 import { rawRpc } from "./support/harness.js";
 import { cookieStoreFiles } from "./support/persistent-cookies.js";
 import { readAuditRecords, waitUntil } from "./support/phase3.js";
@@ -20,13 +32,10 @@ import { issuePeer, sleep, tcpRpc } from "./support/phase4.js";
 import {
   beginParams,
   browserCount,
-  type DoneResult,
   maskedDigest,
   mcpCaller,
   type PendingResult,
   rpcCaller,
-  type Snapshot,
-  type SnapshotElement,
   type StepOutcome,
   type StepwiseCaller,
   type StepwiseStack,
@@ -39,47 +48,6 @@ import {
 /** Value attribute of the visible checkbox on the fixture's username page. */
 const VALUE_MARKER = "stepwise-value-attribute-marker";
 
-function expectPending(outcome: StepOutcome, what: string): PendingResult {
-  expect(outcome.error, `${what} failed: ${outcome.raw}`).toBeUndefined();
-  expect(outcome.result?.state, `${what}: ${outcome.raw}`).toBe("pending");
-  return outcome.result as PendingResult;
-}
-
-function expectDone(outcome: StepOutcome, what: string): DoneResult {
-  expect(outcome.error, `${what} failed: ${outcome.raw}`).toBeUndefined();
-  expect(outcome.result?.state, `${what}: ${outcome.raw}`).toBe("done");
-  return outcome.result as DoneResult;
-}
-
-const byName =
-  (name: string) =>
-  (e: SnapshotElement): boolean =>
-    e.name === name;
-
-const byText =
-  (text: string) =>
-  (e: SnapshotElement): boolean =>
-    (e.text ?? "").trim() === text;
-
-const isAuthenticatorLink = (e: SnapshotElement): boolean =>
-  e.tag.toLowerCase() === "a" && /authenticator app/i.test(e.text ?? "");
-
-/** The tegata-generated selector of the element the agent would pick. */
-function selectorOf(
-  snapshot: Snapshot,
-  what: string,
-  match: (e: SnapshotElement) => boolean,
-): string {
-  const element = snapshot.elements.find(match);
-  expect(
-    element,
-    `no ${what} in the snapshot of ${snapshot.url}`,
-  ).toBeDefined();
-  const selector = element?.selector;
-  expect(typeof selector, `${what} has no selector`).toBe("string");
-  return selector as string;
-}
-
 interface Begun {
   outcome: StepOutcome;
   pending: PendingResult;
@@ -91,93 +59,6 @@ async function begin(
 ): Promise<Begun> {
   const outcome = await call("login_begin", params);
   return { outcome, pending: expectPending(outcome, "login_begin") };
-}
-
-interface FlowRun {
-  /** Every `login_step` outcome, in order. */
-  outcomes: StepOutcome[];
-  /** The outcome of the final `fill_submit` (the TOTP), not yet checked. */
-  last: StepOutcome;
-}
-
-/**
- * The AC-160 procedure from the username page: fill the username, click
- * Next, `fill_submit` the password, click More options, click the
- * authenticator app link, `fill_submit` the TOTP. Every selector comes from
- * the latest snapshot. Every step but the last must answer `pending`; with
- * `snapshotBetween`, a `snapshot` action follows each of them.
- */
-async function driveFlow(
-  call: StepwiseCaller,
-  loginId: string,
-  start: Snapshot,
-  opts: { snapshotBetween?: boolean } = {},
-): Promise<FlowRun> {
-  const outcomes: StepOutcome[] = [];
-  let snapshot = start;
-  const step = async (what: string, action: Record<string, unknown>) => {
-    const outcome = await call("login_step", { login_id: loginId, ...action });
-    outcomes.push(outcome);
-    snapshot = expectPending(outcome, what).snapshot;
-    if (opts.snapshotBetween) {
-      const again = await call("login_step", {
-        login_id: loginId,
-        action: "snapshot",
-      });
-      outcomes.push(again);
-      snapshot = expectPending(again, `snapshot after ${what}`).snapshot;
-    }
-  };
-  await step("fill the username", {
-    action: "fill",
-    selector: selectorOf(snapshot, "username field", byName("username")),
-    value: "{{username}}",
-  });
-  await step("click Next", {
-    action: "click",
-    selector: selectorOf(snapshot, "Next button", byText("Next")),
-  });
-  await step("fill_submit the password", {
-    action: "fill_submit",
-    fills: [
-      {
-        selector: selectorOf(snapshot, "password field", byName("password")),
-        value: "{{password}}",
-      },
-    ],
-    submit: {
-      click: selectorOf(snapshot, "Sign in button", byText("Sign in")),
-    },
-  });
-  await step("click More options", {
-    action: "click",
-    selector: selectorOf(
-      snapshot,
-      "More options button",
-      byText("More options"),
-    ),
-  });
-  await step("click the authenticator app link", {
-    action: "click",
-    selector: selectorOf(
-      snapshot,
-      "authenticator app link",
-      isAuthenticatorLink,
-    ),
-  });
-  const last = await call("login_step", {
-    login_id: loginId,
-    action: "fill_submit",
-    fills: [
-      {
-        selector: selectorOf(snapshot, "code field", byName("otp")),
-        value: "{{totp}}",
-      },
-    ],
-    submit: { click: selectorOf(snapshot, "Verify button", byText("Verify")) },
-  });
-  outcomes.push(last);
-  return { outcomes, last };
 }
 
 /** Logout over the UNIX socket and wait until that browser is gone. */
@@ -253,28 +134,23 @@ test("AC-159: login_begin answers pending with a value-free snapshot", async () 
       beginParams(stack.fixture),
     );
 
-    // Then: state "pending" with a login_id, and snapshot.elements holds the
-    // username field and the Next button, each with a selector
+    // Then: state "pending" with a login_id, and snapshot.page holds the
+    // line of the username field and the line of the Next button, each with
+    // a ref
     const pending = expectPending(outcome, "login_begin");
     expect(typeof pending.login_id).toBe("string");
     expect(pending.login_id.length).toBeGreaterThan(0);
-    const { elements } = pending.snapshot;
-    const username = elements.find(byName("username"));
-    const next = elements.find(byText("Next"));
-    expect(username, "username field").toBeDefined();
-    expect(typeof username?.selector).toBe("string");
-    expect(next, "Next button").toBeDefined();
-    expect(typeof next?.selector).toBe("string");
+    const { snapshot } = pending;
+    refOf(snapshot, "textbox", "Username or email address");
+    refOf(snapshot, "button", "Next");
 
-    // Then: no element carries a value field (the page has a visible
-    // checkbox whose value attribute is a marker; it is listed, its value
-    // is not)
-    expect(
-      elements.find(byName("remember")),
-      "remember checkbox",
-    ).toBeDefined();
-    for (const element of elements)
-      expect(Object.keys(element)).not.toContain("value");
+    // Then: the snapshot carries no value field (no `text` / `elements`, and
+    // the page has a visible checkbox whose value attribute is a marker; it
+    // is listed, its value is not)
+    expect(Object.keys(snapshot)).not.toContain("text");
+    expect(Object.keys(snapshot)).not.toContain("elements");
+    expect(Object.keys(snapshot)).not.toContain("value");
+    findLine(snapshot, "checkbox", "Remember me");
     expect(outcome.raw).not.toContain(VALUE_MARKER);
 
     // Then: the response holds none of the credential canaries
@@ -348,7 +224,7 @@ test("AC-161: lone secret fills and literal values are refused", async () => {
       await call("login_step", {
         login_id: loginId,
         action: "fill",
-        selector: selectorOf(snapshot, "username field", byName("username")),
+        ref: refOf(snapshot, "textbox", "Username or email address"),
         value: "{{username}}",
       }),
       "fill the username",
@@ -357,16 +233,12 @@ test("AC-161: lone secret fills and literal values are refused", async () => {
       await call("login_step", {
         login_id: loginId,
         action: "click",
-        selector: selectorOf(snapshot, "Next button", byText("Next")),
+        ref: refOf(snapshot, "button", "Next"),
       }),
       "click Next",
     ).snapshot;
-    const passwordField = selectorOf(
-      snapshot,
-      "password field",
-      byName("password"),
-    );
-    const signIn = selectorOf(snapshot, "Sign in button", byText("Sign in"));
+    const passwordField = refOf(snapshot, "textbox", "Password");
+    const signIn = refOf(snapshot, "button", "Sign in");
     const before = await stepwiseState(stack.fixture);
     // The fixture's input recorder works (the username fill was recorded).
     expect(before.inputs.map((i) => i.value)).toContain("<username>");
@@ -377,14 +249,14 @@ test("AC-161: lone secret fills and literal values are refused", async () => {
     const loneFill = {
       login_id: loginId,
       action: "fill",
-      selector: passwordField,
+      ref: passwordField,
       value: "{{password}}",
     };
     const literalFill = {
       login_id: loginId,
       action: "fill_submit",
-      fills: [{ selector: passwordField, value: literalValue }],
-      submit: { click: signIn },
+      fills: [{ ref: passwordField, value: literalValue }],
+      submit: { click: { ref: signIn } },
     };
     const mcpLone = await stack.mcp.callTool("login_step", loneFill);
     const mcpLiteral = await stack.mcp.callTool("login_step", literalFill);
@@ -450,11 +322,12 @@ test("AC-162: the username in a snapshot is masked as [username]", async () => {
       action: "snapshot",
     });
 
-    // Then: snapshot.text contains "[username]" and not the raw username
+    // Then: snapshot.page contains "[username]" and not the raw username
     const { snapshot } = expectPending(outcome, "snapshot");
     expect(snapshot.url).toContain("/stepwise/home");
-    expect(snapshot.text).toContain("[username]");
-    expect(snapshot.text).not.toContain(stack.canaries.username);
+    expect(typeof snapshot.page, outcome.raw).toBe("string");
+    expect(snapshot.page).toContain("[username]");
+    expect(snapshot.page).not.toContain(stack.canaries.username);
     expect(outcome.raw).not.toContain(stack.canaries.username);
   } finally {
     await stopStepwiseStack(stack);
@@ -477,31 +350,17 @@ test("AC-163: a page echoing the password is rejected and torn down", async () =
       const loginId = begun.pending.login_id;
       const snapshot = begun.pending.snapshot;
 
-      // When: fill_submit with {{password}}
+      // When: fill_submit with {{password}} (the echo form's fields have no
+      // accessible name: the first unnamed textbox is the username field and
+      // the second is the password field)
       const rejected = await call("login_step", {
         login_id: loginId,
         action: "fill_submit",
         fills: [
-          {
-            selector: selectorOf(
-              snapshot,
-              "username field",
-              byName("username"),
-            ),
-            value: "{{username}}",
-          },
-          {
-            selector: selectorOf(
-              snapshot,
-              "password field",
-              byName("password"),
-            ),
-            value: "{{password}}",
-          },
+          { ref: nthUnnamedRef(snapshot, "textbox", 0), value: "{{username}}" },
+          { ref: nthUnnamedRef(snapshot, "textbox", 1), value: "{{password}}" },
         ],
-        submit: {
-          click: selectorOf(snapshot, "Sign in button", byText("Sign in")),
-        },
+        submit: { click: { ref: refOf(snapshot, "button", "Sign in") } },
       });
       surfaces.push({ label: `fill_submit ${kind}`, text: rejected.raw });
       const after = await call("login_step", {
@@ -552,23 +411,16 @@ test("AC-164: filled fields are cleared after fill_submit", async () => {
     let snapshot = begun.pending.snapshot;
 
     // When: fill_submit with the wrong-password credential -> click (any
-    // element)
+    // element). The sticky form's fields have no accessible name: the first
+    // unnamed textbox is the username field and the second the password field.
     const submitted = await call("login_step", {
       login_id: loginId,
       action: "fill_submit",
       fills: [
-        {
-          selector: selectorOf(snapshot, "username field", byName("username")),
-          value: "{{username}}",
-        },
-        {
-          selector: selectorOf(snapshot, "password field", byName("password")),
-          value: "{{password}}",
-        },
+        { ref: nthUnnamedRef(snapshot, "textbox", 0), value: "{{username}}" },
+        { ref: nthUnnamedRef(snapshot, "textbox", 1), value: "{{password}}" },
       ],
-      submit: {
-        click: selectorOf(snapshot, "Sign in button", byText("Sign in")),
-      },
+      submit: { click: { ref: refOf(snapshot, "button", "Sign in") } },
     });
 
     // Then: the fill_submit answer is a pending snapshot
@@ -576,7 +428,7 @@ test("AC-164: filled fields are cleared after fill_submit", async () => {
     const clicked = await call("login_step", {
       login_id: loginId,
       action: "click",
-      selector: selectorOf(snapshot, "Help button", byText("Help")),
+      ref: refOf(snapshot, "button", "Help"),
     });
     expectPending(clicked, "click Help");
 

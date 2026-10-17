@@ -67,18 +67,105 @@ struct StepParams {
     action: StepAction,
 }
 
+/// `ref` の最大長。
+const MAX_REF_LEN: usize = 32;
+
+/// 要素の指定。`ref`（スナップショットの参照）か `selector`（CSS）のどちらか一方だけを持つ。
+/// executor へは持っている方だけを平坦に送る。
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+struct ElementRef {
+    #[serde(
+        rename = "ref",
+        default,
+        deserialize_with = "present_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    element_ref: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "present_string",
+        skip_serializing_if = "Option::is_none"
+    )]
+    selector: Option<String>,
+}
+
+/// キーが存在する場合は文字列だけを受け付け、明示的な `null` を拒否する（キーの欠落は `default` で `None`）。
+fn present_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
+}
+
+impl ElementRef {
+    fn selector(selector: &str) -> Self {
+        Self {
+            element_ref: None,
+            selector: Some(selector.to_owned()),
+        }
+    }
+
+    /// どちらか一方だけが指定され、`ref` は形式（`^(f\d+)?e\d+$`、32 文字以下）に合うかを判定する。
+    fn is_valid(&self) -> bool {
+        match (&self.element_ref, &self.selector) {
+            (Some(element_ref), None) => is_valid_ref(element_ref),
+            (None, Some(_)) => true,
+            _ => false,
+        }
+    }
+}
+
+/// `ref` の形式 `^(f\d+)?e\d+$`（32 文字以下）を判定する。
+fn is_valid_ref(value: &str) -> bool {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    if value.len() > MAX_REF_LEN {
+        return false;
+    }
+    let rest = match value.strip_prefix('f') {
+        Some(framed) => match framed.split_once('e') {
+            Some((frame, element)) => return digits(frame) && digits(element),
+            None => return false,
+        },
+        None => value,
+    };
+    rest.strip_prefix('e').is_some_and(digits)
+}
+
+/// `submit` の対象。文字列形（selector の省略形）とオブジェクト形を受け付け、
+/// executor へは常にオブジェクト形で送る。
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(transparent)]
+struct SubmitTarget(ElementRef);
+
+impl<'de> Deserialize<'de> for SubmitTarget {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Selector(String),
+            Element(ElementRef),
+        }
+        Ok(Self(match Raw::deserialize(deserializer)? {
+            Raw::Selector(selector) => ElementRef::selector(&selector),
+            Raw::Element(element) => element,
+        }))
+    }
+}
+
 /// `login_step` の action。executor へはこの形のまま（`action` と各フィールドを平坦に）送る。
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum StepAction {
     Click {
-        selector: String,
+        #[serde(flatten)]
+        target: ElementRef,
     },
     WaitFor {
-        selector: String,
+        #[serde(flatten)]
+        target: ElementRef,
     },
     Fill {
-        selector: String,
+        #[serde(flatten)]
+        target: ElementRef,
         value: String,
     },
     FillSubmit {
@@ -91,20 +178,45 @@ enum StepAction {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 struct FillField {
-    selector: String,
+    #[serde(flatten)]
+    target: ElementRef,
     value: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Submit {
-    Click(String),
-    PressEnter(String),
+    Click(SubmitTarget),
+    PressEnter(SubmitTarget),
+}
+
+impl Submit {
+    fn target(&self) -> &ElementRef {
+        match self {
+            Self::Click(target) | Self::PressEnter(target) => &target.0,
+        }
+    }
 }
 
 impl StepAction {
-    /// 値がプレースホルダであり、secret（`{{password}}` / `{{totp}}`）が `fill_submit` の中にだけ現れるかを判定する。
+    /// 要素の指定（`ref` と `selector` の排他・`ref` の形式）が正しいかを判定する。
+    fn has_valid_targets(&self) -> bool {
+        match self {
+            Self::Click { target } | Self::WaitFor { target } | Self::Fill { target, .. } => {
+                target.is_valid()
+            }
+            Self::FillSubmit { fills, submit } => {
+                fills.iter().all(|fill| fill.target.is_valid()) && submit.target().is_valid()
+            }
+            Self::Snapshot | Self::Abort => true,
+        }
+    }
+
+    /// 要素の指定が正しく、値がプレースホルダであり、secret（`{{password}}` / `{{totp}}`）が `fill_submit` の中にだけ現れるかを判定する。
     fn is_valid(&self) -> bool {
+        if !self.has_valid_targets() {
+            return false;
+        }
         match self {
             Self::Fill { value, .. } => value == USERNAME_PLACEHOLDER,
             Self::FillSubmit { fills, .. } => {
@@ -530,7 +642,11 @@ impl EndReason {
             self,
             Self::Rejected
                 | Self::Expired
-                | Self::Failed(ErrorCode::FillMismatch | ErrorCode::InvalidCredential)
+                | Self::Failed(
+                    ErrorCode::FillMismatch
+                        | ErrorCode::FillTargetRefused
+                        | ErrorCode::InvalidCredential
+                )
         )
     }
 }
@@ -1252,7 +1368,7 @@ mod tests {
         assert_eq!(
             parsed.action,
             StepAction::Click {
-                selector: "#next".to_owned()
+                target: ElementRef::selector("#next")
             }
         );
         let parsed = valid(json!({ "login_id": "x", "action": "snapshot" }));
@@ -1267,10 +1383,10 @@ mod tests {
             parsed.action,
             StepAction::FillSubmit {
                 fills: vec![FillField {
-                    selector: "#p".to_owned(),
+                    target: ElementRef::selector("#p"),
                     value: "{{password}}".to_owned(),
                 }],
-                submit: Submit::PressEnter("#p".to_owned()),
+                submit: Submit::PressEnter(SubmitTarget(ElementRef::selector("#p"))),
             }
         );
     }
@@ -1308,6 +1424,197 @@ mod tests {
     }
 
     #[test]
+    fn ref_and_selector_are_mutually_exclusive() {
+        for action in ["click", "wait_for"] {
+            assert!(step(json!({ "login_id": "x", "action": action, "ref": "e9" })).is_ok());
+            assert!(step(json!({ "login_id": "x", "action": action, "selector": "#a" })).is_ok());
+            assert!(step(json!({ "login_id": "x", "action": action })).is_err());
+            assert!(
+                step(json!({ "login_id": "x", "action": action, "ref": "e9", "selector": "#a" }))
+                    .is_err()
+            );
+        }
+        let fill = |extra: Value| {
+            let mut params = json!({ "login_id": "x", "action": "fill", "value": "{{username}}" });
+            params
+                .as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().expect("object").clone());
+            step(params)
+        };
+        assert!(fill(json!({ "ref": "f1e2" })).is_ok());
+        assert!(fill(json!({ "ref": "e2", "selector": "#u" })).is_err());
+        assert!(fill(json!({})).is_err());
+        let fills = |field: Value| {
+            step(json!({
+                "login_id": "x", "action": "fill_submit",
+                "fills": [field], "submit": { "click": "#go" },
+            }))
+        };
+        assert!(fills(json!({ "ref": "e4", "value": "{{username}}" })).is_ok());
+        assert!(fills(json!({ "selector": "#u", "value": "{{username}}" })).is_ok());
+        assert!(fills(json!({ "ref": "e4", "selector": "#u", "value": "{{username}}" })).is_err());
+        assert!(fills(json!({ "value": "{{username}}" })).is_err());
+    }
+
+    #[test]
+    fn explicit_null_targets_are_refused_but_absent_keys_are_not() {
+        for (key, other) in [("ref", ("selector", "#a")), ("selector", ("ref", "e1"))] {
+            for action in ["click", "wait_for"] {
+                let mut params = json!({ "login_id": "x", "action": action });
+                params[key] = Value::Null;
+                params[other.0] = json!(other.1);
+                assert!(step(params.clone()).is_err(), "{params}");
+            }
+            let mut fill = json!({ "login_id": "x", "action": "fill", "value": "{{username}}" });
+            fill[key] = Value::Null;
+            fill[other.0] = json!(other.1);
+            assert!(step(fill.clone()).is_err(), "{fill}");
+
+            let mut field = json!({ "value": "{{username}}" });
+            field[key] = Value::Null;
+            field[other.0] = json!(other.1);
+            let fills = json!({
+                "login_id": "x", "action": "fill_submit",
+                "fills": [field], "submit": { "click": "#go" },
+            });
+            assert!(step(fills.clone()).is_err(), "{fills}");
+
+            let mut target = json!({});
+            target[key] = Value::Null;
+            target[other.0] = json!(other.1);
+            for kind in ["click", "press_enter"] {
+                let submit = json!({
+                    "login_id": "x", "action": "fill_submit",
+                    "fills": [{ "selector": "#p", "value": "{{password}}" }],
+                    "submit": { kind: target.clone() },
+                });
+                assert!(step(submit.clone()).is_err(), "{submit}");
+            }
+        }
+        assert!(step(json!({ "login_id": "x", "action": "click", "ref": "e1" })).is_ok());
+    }
+
+    #[test]
+    fn ref_format_and_length_are_enforced() {
+        for valid_ref in [
+            "e1",
+            "e123",
+            "f1e2",
+            "f12e345",
+            &format!("e{}", "1".repeat(31)),
+        ] {
+            assert!(is_valid_ref(valid_ref), "{valid_ref}");
+        }
+        let too_long = format!("e{}", "1".repeat(32));
+        for invalid in [
+            "", "e", "f", "fe1", "f1e", "x1", "e1x", "E1", "ee1", "f1f1e1", "e-1", "e1 ", "１e1",
+            &too_long,
+        ] {
+            assert!(!is_valid_ref(invalid), "{invalid}");
+            let params = json!({ "login_id": "x", "action": "click", "ref": invalid });
+            assert!(step(params).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn submit_accepts_string_and_object_forms_and_normalizes_for_the_executor() {
+        let submit = |submit: Value| {
+            step(json!({
+                "login_id": "x", "action": "fill_submit",
+                "fills": [{ "selector": "#p", "value": "{{password}}" }], "submit": submit,
+            }))
+        };
+        for (input, expected) in [
+            (
+                json!({ "click": "#go" }),
+                json!({ "click": { "selector": "#go" } }),
+            ),
+            (
+                json!({ "press_enter": "#p" }),
+                json!({ "press_enter": { "selector": "#p" } }),
+            ),
+            (
+                json!({ "click": { "selector": "#go" } }),
+                json!({ "click": { "selector": "#go" } }),
+            ),
+            (
+                json!({ "click": { "ref": "e9" } }),
+                json!({ "click": { "ref": "e9" } }),
+            ),
+            (
+                json!({ "press_enter": { "ref": "f1e3" } }),
+                json!({ "press_enter": { "ref": "f1e3" } }),
+            ),
+        ] {
+            let parsed = submit(input.clone()).unwrap_or_else(|_| panic!("refused: {input}"));
+            let sent = serde_json::to_value(&parsed.action).expect("serialize");
+            assert_eq!(sent["submit"], expected, "{input}");
+        }
+        for invalid in [
+            json!({ "click": {} }),
+            json!({ "click": { "ref": "e9", "selector": "#go" } }),
+            json!({ "click": { "ref": "bad" } }),
+            json!({ "press_enter": 1 }),
+        ] {
+            assert!(submit(invalid.clone()).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn element_targets_reach_the_executor_distinguished() {
+        let action = StepAction::FillSubmit {
+            fills: vec![
+                FillField {
+                    target: ElementRef {
+                        element_ref: Some("e4".to_owned()),
+                        selector: None,
+                    },
+                    value: "{{username}}".to_owned(),
+                },
+                FillField {
+                    target: ElementRef::selector("#p"),
+                    value: "{{password}}".to_owned(),
+                },
+            ],
+            submit: Submit::Click(SubmitTarget(ElementRef::selector("#go"))),
+        };
+        assert_eq!(
+            serde_json::to_value(&action).expect("serialize"),
+            json!({
+                "action": "fill_submit",
+                "fills": [
+                    { "ref": "e4", "value": "{{username}}" },
+                    { "selector": "#p", "value": "{{password}}" },
+                ],
+                "submit": { "click": { "selector": "#go" } },
+            })
+        );
+        let click = StepAction::Click {
+            target: ElementRef {
+                element_ref: Some("e9".to_owned()),
+                selector: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&click).expect("serialize"),
+            json!({ "action": "click", "ref": "e9" })
+        );
+    }
+
+    #[test]
+    fn fill_target_refused_is_a_terminating_failure_with_its_own_outcome() {
+        assert!(matches!(
+            parse_error_code("FILL_TARGET_REFUSED"),
+            ErrorCode::FillTargetRefused
+        ));
+        assert_eq!(
+            EndReason::Failed(ErrorCode::FillTargetRefused).outcome(),
+            "FILL_TARGET_REFUSED"
+        );
+    }
+
+    #[test]
     fn only_totp_fill_submits_need_a_totp_code() {
         let needs = |params: Value| valid(params).action.needs_totp();
         assert!(needs(fill_submit(&["{{username}}", "{{totp}}"])));
@@ -1318,7 +1625,7 @@ mod tests {
     #[test]
     fn the_executor_request_is_flat_and_carries_the_totp_slot() {
         let action = StepAction::Click {
-            selector: "#next".to_owned(),
+            target: ElementRef::selector("#next"),
         };
         let request = ExecutorStepRequest {
             op: "login_step",
@@ -1486,6 +1793,7 @@ mod tests {
         assert!(EndReason::Rejected.counts_as_failure());
         assert!(EndReason::Expired.counts_as_failure());
         assert!(EndReason::Failed(ErrorCode::FillMismatch).counts_as_failure());
+        assert!(EndReason::Failed(ErrorCode::FillTargetRefused).counts_as_failure());
         assert!(EndReason::Failed(ErrorCode::InvalidCredential).counts_as_failure());
         assert!(!EndReason::Aborted.counts_as_failure());
         assert!(!EndReason::Failed(ErrorCode::Internal).counts_as_failure());

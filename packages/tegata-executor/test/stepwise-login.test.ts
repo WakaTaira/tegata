@@ -1,6 +1,5 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { type Browser, chromium, type Page } from "playwright-core";
 import {
   afterAll,
   afterEach,
@@ -20,23 +19,12 @@ import {
   handleLoginStep,
   parseRequest,
 } from "../src/index.js";
-import {
-  buildSnapshotInPage,
-  finalizeSnapshot,
-  PAGE_SNAPSHOT_LIMITS,
-  type RawSnapshot,
-  SNAPSHOT_MAX_BYTES,
-  SnapshotRejectedError,
-  secretForms,
-} from "../src/snapshot.js";
-import { sanitizeRawSnapshot } from "../src/stepwise.js";
+import { parseSnapshotLine } from "../src/snapshot.js";
 
 const USERNAME = "alice&co@example.test";
 const PASSWORD = "correct horse/battery+staple";
 const TOTP_CODE = "493817";
 const SESSION_VALUE = "session-canary-5d1e";
-
-const secrets = { username: USERNAME, password: PASSWORD, totpCodes: [] };
 
 function escapeHtml(value: string): string {
   return value
@@ -72,7 +60,8 @@ function passwordPage(error: boolean): string {
     "Password",
     `${error ? '<p id="login-error">Incorrect password</p>' : ""}
     <form method="post" action="/password">
-      <input name="password" type="password" autocomplete="current-password">
+      <input name="password" type="password" autocomplete="current-password"
+        aria-label="Password">
       <button type="submit">Sign in</button>
     </form>`,
   );
@@ -88,9 +77,9 @@ function echoForm(kind: string): string {
   return html(
     "Echo",
     `<form method="post" action="/echo-login?kind=${kind}">
-      <input id="username" name="username" type="text">
-      <input id="password" name="password" type="password">
-      <input id="otp" name="otp" type="text">
+      <input id="username" name="username" type="text" aria-label="Username">
+      <input id="password" name="password" type="password" aria-label="Password">
+      <input id="otp" name="otp" type="text" aria-label="Code">
       <button id="submit" type="submit">Sign in</button>
     </form>`,
   );
@@ -113,7 +102,7 @@ function echoPage(kind: string, form: URLSearchParams): string | undefined {
 const stickyPage = html(
   "Sticky",
   `<form id="sticky-form">
-    <input id="password" name="password" type="password">
+    <input id="password" name="password" type="password" aria-label="Password">
     <button id="submit" type="submit">Sign in</button>
   </form>
   <button id="help" type="button">Help</button>
@@ -277,40 +266,45 @@ function step(action: Record<string, unknown>, totp: string | null = null) {
   return captureResponse(() => handleLoginStep(request));
 }
 
-type Element = { selector: string; name?: string; text?: string };
+type Snapshot = {
+  url: string;
+  title: string;
+  page: string;
+  settled: boolean;
+  truncated?: true;
+};
 
-function snapshotOf(response: Response) {
+function snapshotOf(response: Response): Snapshot {
   expect(response).toMatchObject({ ok: true, state: "pending" });
-  return response.snapshot as {
-    url: string;
-    text: string;
-    elements: Element[];
-    settled: boolean;
-  };
+  return response.snapshot as Snapshot;
 }
 
-function selectorOf(response: Response, match: (e: Element) => boolean) {
-  const element = snapshotOf(response).elements.find(match);
-  expect(element).toBeDefined();
-  return (element as Element).selector;
+/** 応答のスナップショットから、役割と名前で 1 行を探してその ref を返す。 */
+function refOf(response: Response, role: string, name?: string): string {
+  const line = snapshotOf(response)
+    .page.split("\n")
+    .map((raw) => parseSnapshotLine(raw))
+    .find((parsed) => parsed?.role === role && parsed.name === name);
+  const ref = line?.attrs
+    .find((attr) => attr.startsWith("ref="))
+    ?.slice("ref=".length);
+  expect(ref, `${role} ${name ?? ""}`).toMatch(/^(f\d+)?e\d+$/);
+  return ref as string;
 }
-
-const byName = (name: string) => (e: Element) => e.name === name;
-const byText = (text: string) => (e: Element) => e.text === text;
 
 /** username 画面から password 画面まで進める。 */
 async function advanceToPassword(
   fields: Record<string, unknown> = {},
 ): Promise<Response> {
   const begun = await begin("/login", fields);
-  await step({
+  const filled = await step({
     action: "fill",
-    selector: selectorOf(begun, byName("username")),
+    ref: refOf(begun, "textbox", "Username"),
     value: "{{username}}",
   });
   const next = await step({
     action: "click",
-    selector: selectorOf(begun, byText("Next")),
+    ref: refOf(filled, "button", "Next"),
   });
   expect(snapshotOf(next).url).toBe(`${origin}/username`);
   return next;
@@ -319,318 +313,10 @@ async function advanceToPassword(
 function submitPassword(page: Response) {
   return step({
     action: "fill_submit",
-    fills: [
-      { selector: selectorOf(page, byName("password")), value: "{{password}}" },
-    ],
-    submit: { click: selectorOf(page, byText("Sign in")) },
+    fills: [{ ref: refOf(page, "textbox", "Password"), value: "{{password}}" }],
+    submit: { click: { ref: refOf(page, "button", "Sign in") } },
   });
 }
-
-describe("snapshot building", { timeout: 60_000 }, () => {
-  let browser: Browser;
-  let page: Page;
-
-  beforeAll(async () => {
-    browser = await chromium.launch({ headless: true });
-  });
-
-  afterAll(async () => {
-    await browser.close();
-  });
-
-  beforeEach(async () => {
-    page = await browser.newPage();
-  });
-
-  afterEach(async () => {
-    await page.close();
-  });
-
-  const markers = [
-    "value-attribute-marker",
-    "typed-value-marker",
-    "checkbox-value-marker",
-    "textarea-default-marker",
-    "typed-textarea-marker",
-    "option-value-marker",
-    "hidden-value-marker",
-    "data-attribute-marker",
-  ];
-
-  const form = `
-    <form id="f1">
-      <label for="user">User name</label>
-      <input id="user" name="user" type="text" value="value-attribute-marker"
-        data-secret="data-attribute-marker" data-key="user">
-      <label><input name="remember" type="checkbox" value="checkbox-value-marker"
-        data-key="remember"> Remember me</label>
-      <label>Note <textarea name="note" data-key="note">textarea-default-marker</textarea></label>
-      <select name="choice" data-key="choice">
-        <option value="option-value-marker">Visible option</option>
-      </select>
-      <input type="hidden" name="csrf" value="hidden-value-marker">
-      <button type="submit" data-key="submit1">Continue</button>
-    </form>
-    <form><button type="submit" data-key="submit2">Continue</button></form>
-    <button id="dup" data-key="dup1">Dup one</button>
-    <button id="dup" data-key="dup2">Dup two</button>
-    <a href="/next" data-key="link">Next page</a>
-    <div role="button" data-key="role">Role button</div>
-    <button hidden data-key="invisible">Invisible</button>
-    <div id="host"></div>
-    <script>
-      document.getElementById("host").attachShadow({ mode: "open" }).innerHTML =
-        '<span>Shadow</span><button data-key="shadow">Shadow button</button>';
-    </script>
-  `;
-
-  async function build(): Promise<RawSnapshot> {
-    return sanitizeRawSnapshot(
-      await page.evaluate(buildSnapshotInPage, PAGE_SNAPSHOT_LIMITS),
-    );
-  }
-
-  test("lists visible controls without values, value attributes or data-*", async () => {
-    await page.setContent(form);
-    await page.fill("#user", "typed-value-marker");
-    await page.fill("textarea", "typed-textarea-marker");
-
-    const snapshot = finalizeSnapshot(await build(), page.url(), true, secrets);
-    const serialized = JSON.stringify(snapshot);
-
-    for (const marker of markers) expect(serialized).not.toContain(marker);
-    for (const element of snapshot.elements) {
-      expect(Object.keys(element)).not.toContain("value");
-      expect(Object.keys(element).some((key) => key.startsWith("data"))).toBe(
-        false,
-      );
-    }
-    const texts = snapshot.elements.map((element) => element.text);
-    expect(texts).toContain("User name");
-    expect(texts).toContain("Remember me");
-    expect(texts).toContain("Note");
-    expect(texts).toContain("Shadow button");
-    expect(texts).not.toContain("Invisible");
-    expect(snapshot.elements.find((e) => e.name === "csrf")).toBeUndefined();
-  });
-
-  test("gives every element a selector that resolves to that element only", async () => {
-    await page.setContent(form);
-
-    const snapshot = finalizeSnapshot(await build(), page.url(), true, secrets);
-
-    const keys: string[] = [];
-    for (const element of snapshot.elements) {
-      const locator = page.locator(element.selector);
-      expect(await locator.count(), element.selector).toBe(1);
-      keys.push((await locator.getAttribute("data-key")) ?? "");
-    }
-    expect(keys.sort()).toEqual(
-      [
-        "user",
-        "remember",
-        "note",
-        "choice",
-        "submit1",
-        "submit2",
-        "dup1",
-        "dup2",
-        "link",
-        "role",
-        "shadow",
-      ].sort(),
-    );
-    const user = snapshot.elements.find((e) => e.name === "user");
-    expect(user?.selector).toBe("#user");
-    const remember = snapshot.elements.find((e) => e.name === "remember");
-    expect(remember?.selector).toBe('input[name="remember"]');
-  });
-
-  test("omits an element whose selector cannot be made unique", async () => {
-    // shadow host の light DOM の子と shadow root の子は、Playwright の規則では同じ経路に一致する。
-    await page.setContent(`
-      <div id="host"><button data-key="light">Light</button></div>
-      <script>
-        document.getElementById("host").attachShadow({ mode: "open" }).innerHTML =
-          '<button data-key="shadow">Shadow</button><slot></slot>';
-      </script>
-    `);
-
-    const snapshot = finalizeSnapshot(await build(), page.url(), true, secrets);
-
-    for (const element of snapshot.elements) {
-      expect(await page.locator(element.selector).count()).toBe(1);
-    }
-  });
-});
-
-describe("snapshot inspection", () => {
-  function raw(overrides: Partial<RawSnapshot> = {}): RawSnapshot {
-    return {
-      title: "Sign in",
-      text: "Welcome",
-      elements: [
-        {
-          tag: "button",
-          type: "button",
-          disabled: false,
-          text: "Continue",
-          selectors: ["#continue"],
-        },
-      ],
-      ...overrides,
-    };
-  }
-
-  function element(label: string) {
-    return {
-      tag: "button",
-      disabled: false,
-      "aria-label": label,
-      selectors: ["#b"],
-    };
-  }
-
-  const url = "https://example.test/login";
-
-  test("masks the raw, HTML-escaped and URL-encoded username", () => {
-    const snapshot = finalizeSnapshot(
-      raw({
-        title: `Hello ${USERNAME}`,
-        text: `Signed in as ${USERNAME}`,
-        elements: [element(escapeHtml(USERNAME))],
-      }),
-      `${url}?u=${encodeURIComponent(USERNAME)}`,
-      true,
-      secrets,
-    );
-
-    expect(snapshot.text).toBe("Signed in as [username]");
-    expect(snapshot.title).toBe("Hello [username]");
-    expect(snapshot.url).toBe(`${url}?u=[username]`);
-    expect(snapshot.elements[0]["aria-label"]).toBe("[username]");
-    expect(JSON.stringify(snapshot)).not.toContain(USERNAME);
-  });
-
-  test("prefers a selector that does not contain the username", () => {
-    const snapshot = finalizeSnapshot(
-      raw({
-        elements: [
-          {
-            tag: "input",
-            disabled: false,
-            selectors: [`#${USERNAME}`, "html > body > input:nth-of-type(1)"],
-          },
-        ],
-      }),
-      url,
-      true,
-      secrets,
-    );
-
-    expect(snapshot.elements[0].selector).toBe(
-      "html > body > input:nth-of-type(1)",
-    );
-  });
-
-  test.each(secretForms(PASSWORD).map((form) => [form]))(
-    "rejects the password in the form %s wherever it appears",
-    (form) => {
-      const placements: Array<[RawSnapshot, string]> = [
-        [raw({ text: `echo ${form} echo` }), url],
-        [raw({ title: form }), url],
-        [raw({ elements: [element(form)] }), url],
-        [raw(), `${url}?p=${form}`],
-      ];
-      for (const [snapshot, at] of placements) {
-        expect(() => finalizeSnapshot(snapshot, at, true, secrets)).toThrow(
-          SnapshotRejectedError,
-        );
-      }
-    },
-  );
-
-  test("covers raw, HTML, percent, base64 and hex forms", () => {
-    const bytes = Buffer.from(PASSWORD);
-    const forms = secretForms(PASSWORD);
-    expect(forms).toContain(PASSWORD);
-    expect(forms).toContain(escapeHtml(PASSWORD));
-    expect(forms).toContain(encodeURIComponent(PASSWORD));
-    expect(forms).toContain(
-      [...bytes].map((b) => `%${b.toString(16).toUpperCase()}`).join(""),
-    );
-    expect(forms).toContain(bytes.toString("base64").replace(/=+$/u, ""));
-    expect(forms).toContain(bytes.toString("hex"));
-  });
-
-  test("rejects an entered TOTP code", () => {
-    expect(() =>
-      finalizeSnapshot(raw({ text: `Code ${TOTP_CODE}` }), url, true, {
-        ...secrets,
-        totpCodes: [TOTP_CODE],
-      }),
-    ).toThrow(SnapshotRejectedError);
-  });
-
-  test("rejects a password that straddles the text limit", () => {
-    const text = `${"x".repeat(1990)}${PASSWORD}`;
-    expect(() => finalizeSnapshot(raw({ text }), url, true, secrets)).toThrow(
-      SnapshotRejectedError,
-    );
-  });
-
-  test("does not reject a partial echo", () => {
-    const partial = PASSWORD.slice(0, -1);
-    const snapshot = finalizeSnapshot(
-      raw({ text: `${partial} ••••${PASSWORD.slice(-4)}` }),
-      url,
-      true,
-      secrets,
-    );
-    expect(snapshot.text).toContain(partial);
-  });
-
-  test("drops elements from the end to stay within 64 KiB", () => {
-    const elements = Array.from({ length: 200 }, (_, index) => ({
-      tag: "button",
-      disabled: false,
-      "aria-label": `${"label ".repeat(80)}${index}`,
-      selectors: [`#b${index}`],
-    }));
-
-    const snapshot = finalizeSnapshot(raw({ elements }), url, false, secrets);
-
-    expect(snapshot.truncated).toBe(true);
-    expect(snapshot.settled).toBe(false);
-    expect(snapshot.elements.length).toBeLessThan(200);
-    expect(snapshot.elements[0].selector).toBe("#b0");
-    expect(Buffer.byteLength(JSON.stringify(snapshot))).toBeLessThanOrEqual(
-      SNAPSHOT_MAX_BYTES,
-    );
-  });
-
-  test("copies only the allowed fields from what the page returns", () => {
-    const sanitized = sanitizeRawSnapshot({
-      title: "t",
-      text: "x",
-      elements: [
-        {
-          tag: "input",
-          disabled: false,
-          selectors: ["#a"],
-          value: "leaked",
-          "data-x": "leaked",
-          name: "a",
-        },
-        { tag: "input", disabled: false, selectors: [] },
-        "garbage",
-      ],
-    });
-    expect(sanitized.elements).toEqual([
-      { tag: "input", disabled: false, selectors: ["#a"], name: "a" },
-    ]);
-  });
-});
 
 describe("login_step parsing", () => {
   function parseStep(action: Record<string, unknown>) {
@@ -663,14 +349,113 @@ describe("login_step parsing", () => {
     expect(
       parseStep({
         action: "fill_submit",
-        fills: [fill, { selector: "#o", value: "{{totp}}" }],
+        fills: [fill, { ref: "e7", value: "{{totp}}" }],
         submit: { press_enter: "#o" },
         totp: TOTP_CODE,
       })(),
     ).toMatchObject({
-      action: { action: "fill_submit", submit: { press_enter: "#o" } },
+      action: {
+        action: "fill_submit",
+        fills: [fill, { ref: "e7", value: "{{totp}}" }],
+        submit: { press_enter: { selector: "#o" } },
+      },
       totp: TOTP_CODE,
     });
+  });
+
+  test("takes exactly one of ref and selector wherever an element is named", () => {
+    const both = { ref: "e3", selector: "#a" };
+    const invalid = [
+      { action: "click", ...both },
+      { action: "click" },
+      { action: "wait_for", ...both },
+      { action: "fill", ...both, value: "{{username}}" },
+      { action: "fill", value: "{{username}}" },
+      {
+        action: "fill_submit",
+        fills: [{ ...both, value: "{{password}}" }],
+        submit: { click: "#s" },
+      },
+      {
+        action: "fill_submit",
+        fills: [{ value: "{{password}}" }],
+        submit: { click: "#s" },
+      },
+      {
+        action: "fill_submit",
+        fills: [{ ref: "e1", value: "{{password}}" }],
+        submit: { click: both },
+      },
+      {
+        action: "fill_submit",
+        fills: [{ ref: "e1", value: "{{password}}" }],
+        submit: { press_enter: {} },
+      },
+    ];
+    for (const action of invalid) expect(parseStep(action)).toThrow();
+  });
+
+  test("refuses an explicit null ref or selector", () => {
+    const fills = [{ ref: "e1", value: "{{password}}" }];
+    const invalid = [
+      { action: "click", ref: null, selector: "#a" },
+      { action: "click", ref: "e1", selector: null },
+      { action: "wait_for", ref: null },
+      { action: "fill", selector: null, ref: "e2", value: "{{username}}" },
+      {
+        action: "fill_submit",
+        fills: [{ ref: null, selector: "#p", value: "{{password}}" }],
+        submit: { click: "#s" },
+      },
+      { action: "fill_submit", fills, submit: { click: null } },
+      { action: "fill_submit", fills, submit: { click: { ref: null } } },
+      {
+        action: "fill_submit",
+        fills,
+        submit: { press_enter: { selector: "#x", ref: null } },
+      },
+    ];
+    for (const action of invalid) expect(parseStep(action)).toThrow();
+
+    expect(parseStep({ action: "click", ref: "f2e10" })()).toMatchObject({
+      action: { action: "click", ref: "f2e10" },
+    });
+    expect(parseStep({ action: "wait_for", selector: "#a" })()).toMatchObject({
+      action: { action: "wait_for", selector: "#a" },
+    });
+    for (const submit of [
+      { click: { ref: "e9" } },
+      { click: { selector: "#next" } },
+      { press_enter: { ref: "f1e2" } },
+      { press_enter: { selector: "#x" } },
+    ]) {
+      expect(
+        parseStep({
+          action: "fill_submit",
+          fills: [{ ref: "e1", value: "{{password}}" }],
+          submit,
+        })(),
+      ).toMatchObject({ action: { submit } });
+    }
+    expect(
+      parseStep({
+        action: "fill_submit",
+        fills: [{ ref: "e1", value: "{{password}}" }],
+        submit: { click: "#next" },
+      })(),
+    ).toMatchObject({ action: { submit: { click: { selector: "#next" } } } });
+  });
+
+  test("accepts only refs of the e<n> / f<n>e<n> form up to 32 characters", () => {
+    for (const ref of ["e", "f1", "1e2", "e1 ", "E1", "e-1", "f1f2e3", 5]) {
+      expect(parseStep({ action: "click", ref })).toThrow();
+    }
+    const long = `f${"1".repeat(29)}e1`;
+    expect(long.length).toBe(32);
+    expect(parseStep({ action: "click", ref: long })()).toMatchObject({
+      action: { ref: long },
+    });
+    expect(parseStep({ action: "click", ref: `f${long}` })).toThrow();
   });
 
   test("requires a success_selector on login_begin", () => {
@@ -716,8 +501,10 @@ describe("stepwise login", { timeout: 90_000 }, () => {
     const snapshot = snapshotOf(begun);
     expect(snapshot.url).toBe(`${origin}/login`);
     expect(snapshot.settled).toBe(true);
-    expect(snapshot.elements.map((e) => e.name)).toContain("username");
-    expect(snapshot.elements.map((e) => e.text)).toContain("Next");
+    expect(snapshot).not.toHaveProperty("text");
+    expect(snapshot).not.toHaveProperty("elements");
+    refOf(begun, "textbox", "Username");
+    refOf(begun, "button", "Next");
   });
 
   test("hands off with an endpoint once the success selector appears", async () => {
@@ -761,7 +548,55 @@ describe("stepwise login", { timeout: 90_000 }, () => {
     const again = await step({ action: "snapshot" });
 
     expect(missing).toEqual({ ok: false, error: "SELECTOR_NOT_FOUND", id: 2 });
-    expect(snapshotOf(again).elements.map((e) => e.text)).toContain("Next");
+    refOf(again, "button", "Next");
+  });
+
+  test("answers SELECTOR_NOT_FOUND for a ref the latest snapshot does not carry", async () => {
+    const begun = await begin("/login");
+
+    const unknown = await step({ action: "click", ref: "e99999" });
+    const next = await step({
+      action: "click",
+      ref: refOf(begun, "button", "Next"),
+    });
+
+    expect(unknown).toEqual({ ok: false, error: "SELECTOR_NOT_FOUND", id: 2 });
+    expect(snapshotOf(next).url).toBe(`${origin}/username`);
+  });
+
+  test("keeps {{password}} out of a non-password field named by ref", async () => {
+    const begun = await begin("/login");
+
+    const refused = await step({
+      action: "fill_submit",
+      fills: [
+        { ref: refOf(begun, "textbox", "Username"), value: "{{password}}" },
+      ],
+      submit: { click: { ref: refOf(begun, "button", "Next") } },
+    });
+
+    expect(refused).toEqual({
+      ok: false,
+      error: "FILL_MISMATCH",
+      step: 0,
+      id: 2,
+    });
+    expect(site.posts).toEqual([]);
+  });
+
+  test("marks the field the agent filled and leaves its value out", async () => {
+    const begun = await begin("/login", { success_selector: "#never" });
+
+    const filled = await step({
+      action: "fill",
+      ref: refOf(begun, "textbox", "Username"),
+      value: "{{username}}",
+    });
+
+    const { page } = snapshotOf(filled);
+    expect(page).toMatch(/^\s*- textbox "Username" \[ref=e\d+\] \[filled\]$/mu);
+    expect(page).not.toContain("[username]");
+    expect(JSON.stringify(filled)).not.toContain(USERNAME);
   });
 
   test("masks the username on a page that shows it", async () => {
@@ -773,7 +608,7 @@ describe("stepwise login", { timeout: 90_000 }, () => {
 
     const snapshot = snapshotOf(home);
     expect(snapshot.url).toBe(`${origin}/home`);
-    expect(snapshot.text).toContain("Signed in as [username]");
+    expect(snapshot.page).toContain("Signed in as [username]");
     expect(JSON.stringify(home)).not.toContain(USERNAME);
     expect(JSON.stringify(home)).not.toContain(encodeURIComponent(USERNAME));
   });
@@ -804,7 +639,7 @@ describe("stepwise login", { timeout: 90_000 }, () => {
           { selector: "#username", value: "{{username}}" },
           { selector: "#password", value: "{{password}}" },
         ],
-        submit: { click: selectorOf(begun, byText("Sign in")) },
+        submit: { click: { ref: refOf(begun, "button", "Sign in") } },
       });
 
       expect(rejected).toEqual({

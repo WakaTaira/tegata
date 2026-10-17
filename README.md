@@ -280,8 +280,11 @@ carried into `authorize_device` and the OAuth proxy's device-code login
 ([#49](https://github.com/WakaTaira/tegata/issues/49)); stepwise login
 ([#46](https://github.com/WakaTaira/tegata/issues/46)) — `login_begin` and
 `login_step` let the agent work through a multi-screen login one action at a
-time, seeing only page snapshots tegata builds without field values and checks
-for the credential's secrets before returning, with CDP handed over only once
+time, seeing the whole page as an accessibility snapshot with field values
+removed, whose elements it points at by ref
+([#57](https://github.com/WakaTaira/tegata/issues/57)), which tegata checks
+for the credential's secrets before returning, with values entered only into
+frames of the page's own origin and CDP handed over only once
 the login succeeds — the default path for unfamiliar sites, which the broker's
 instructions point agents to, and which a Claude Code `tegata-login` subagent in
 [`integrations/claude-code`](integrations/claude-code) can drive on a small model,

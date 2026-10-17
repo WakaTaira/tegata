@@ -656,6 +656,7 @@ enum ErrorCode {
     MfaRequired,
     SelectorNotFound,
     FillMismatch,
+    FillTargetRefused,
     SnapshotRejected,
     DeviceCodeRejected,
     LoginResultTimeout,
@@ -681,6 +682,7 @@ impl ErrorCode {
             Self::MfaRequired => "MFA_REQUIRED",
             Self::SelectorNotFound => "SELECTOR_NOT_FOUND",
             Self::FillMismatch => "FILL_MISMATCH",
+            Self::FillTargetRefused => "FILL_TARGET_REFUSED",
             Self::SnapshotRejected => "SNAPSHOT_REJECTED",
             Self::DeviceCodeRejected => "DEVICE_CODE_REJECTED",
             Self::LoginResultTimeout => "LOGIN_RESULT_TIMEOUT",
@@ -4727,7 +4729,10 @@ fn cdp_port_from_endpoint(endpoint: &str) -> Option<u16> {
 }
 
 fn selector_step(response: &ExecutorResponse, code: ErrorCode) -> Option<usize> {
-    if !matches!(code, ErrorCode::SelectorNotFound | ErrorCode::FillMismatch) {
+    if !matches!(
+        code,
+        ErrorCode::SelectorNotFound | ErrorCode::FillMismatch | ErrorCode::FillTargetRefused
+    ) {
         return None;
     }
     response
@@ -4744,6 +4749,7 @@ fn parse_error_code(value: &str) -> ErrorCode {
         "MFA_REQUIRED" => ErrorCode::MfaRequired,
         "SELECTOR_NOT_FOUND" => ErrorCode::SelectorNotFound,
         "FILL_MISMATCH" => ErrorCode::FillMismatch,
+        "FILL_TARGET_REFUSED" => ErrorCode::FillTargetRefused,
         "SNAPSHOT_REJECTED" => ErrorCode::SnapshotRejected,
         "DEVICE_CODE_REJECTED" => ErrorCode::DeviceCodeRejected,
         "LOGIN_RESULT_TIMEOUT" => ErrorCode::LoginResultTimeout,
@@ -5531,7 +5537,12 @@ fn error_response_with_step(id: Value, error: ErrorCode, step: Option<usize>) ->
         error: Some(RpcError {
             code: CLASSIFICATION_ERROR,
             message: error.as_str().to_owned(),
-            data: if matches!(error, ErrorCode::SelectorNotFound | ErrorCode::FillMismatch) {
+            data: if matches!(
+                error,
+                ErrorCode::SelectorNotFound
+                    | ErrorCode::FillMismatch
+                    | ErrorCode::FillTargetRefused
+            ) {
                 step.map(|step| json!({ "step": step }))
             } else {
                 None

@@ -33,7 +33,7 @@ const snapshot = (page) => ({ url: "http://127.0.0.1/" + page, title: page, text
 const reply = (id, body) => process.stdout.write(JSON.stringify({ id, ...body }) + "\n");
 let username = "";
 const step = (request) => {
-  const target = request.selector ?? (request.submit ? request.submit.click ?? request.submit.press_enter : undefined);
+  const target = request.selector ?? (request.submit ? (request.submit.click ?? request.submit.press_enter).selector : undefined);
   if (request.action === "abort") return reply(request.id, { ok: true, state: "aborted" });
   if (target === "#missing") return reply(request.id, { ok: false, error: "SELECTOR_NOT_FOUND", step: 0 });
   if (target === "#reject") return reply(request.id, { ok: false, error: "SNAPSHOT_REJECTED" });

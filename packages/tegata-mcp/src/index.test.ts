@@ -565,6 +565,25 @@ describe.sequential("login_begin / login_step forwarding", () => {
     }
   });
 
+  test("relays FILL_TARGET_REFUSED from the daemon", async () => {
+    const fake = await startFakeStepwiseServer({
+      error: { message: "FILL_TARGET_REFUSED" },
+    });
+    delete process.env.TEGATA_BRIDGE;
+    try {
+      const result = await stepwiseHandler("login_step", {
+        login_id: "l1",
+        action: "snapshot",
+      });
+      expect(result).toEqual({
+        isError: true,
+        content: [{ type: "text", text: "FILL_TARGET_REFUSED" }],
+      });
+    } finally {
+      await stopFakeServer(fake.server);
+    }
+  });
+
   test("relays SNAPSHOT_REJECTED from the daemon", async () => {
     const fake = await startFakeStepwiseServer({
       error: { message: "SNAPSHOT_REJECTED" },
@@ -660,6 +679,75 @@ describe("login_step input schema", () => {
     ).toBe(false);
   });
 
+  test("accepts ref targets and both submit forms", () => {
+    const valid = [
+      { login_id: "l1", action: "click", ref: "e9" },
+      { login_id: "l1", action: "wait_for", ref: "f1e3" },
+      { login_id: "l1", action: "fill", ref: "e4", value: "{{username}}" },
+      {
+        login_id: "l1",
+        action: "fill_submit",
+        fills: [
+          { ref: "e4", value: "{{username}}" },
+          { selector: "#p", value: "{{password}}" },
+        ],
+        submit: { click: { ref: "e9" } },
+      },
+      {
+        login_id: "l1",
+        action: "fill_submit",
+        fills: [{ ref: "e4", value: "{{password}}" }],
+        submit: { press_enter: { selector: "#o" } },
+      },
+    ];
+    for (const candidate of valid) {
+      expect(
+        loginStepParams.safeParse(candidate).success,
+        JSON.stringify(candidate),
+      ).toBe(true);
+    }
+  });
+
+  test("rejects ref and selector together or neither", () => {
+    const invalid = [
+      { login_id: "l1", action: "click", ref: "e9", selector: "#a" },
+      { login_id: "l1", action: "wait_for" },
+      {
+        login_id: "l1",
+        action: "fill",
+        ref: "e4",
+        selector: "#u",
+        value: "{{username}}",
+      },
+      { login_id: "l1", action: "click", ref: "not-a-ref" },
+      { login_id: "l1", action: "click", ref: `e${"1".repeat(40)}` },
+      {
+        login_id: "l1",
+        action: "fill_submit",
+        fills: [{ ref: "e4", selector: "#u", value: "{{username}}" }],
+        submit: { click: "#s" },
+      },
+      {
+        login_id: "l1",
+        action: "fill_submit",
+        fills: [{ value: "{{username}}" }],
+        submit: { click: "#s" },
+      },
+      {
+        login_id: "l1",
+        action: "fill_submit",
+        fills: [{ ref: "e4", value: "{{username}}" }],
+        submit: { click: { ref: "e9", selector: "#s" } },
+      },
+    ];
+    for (const candidate of invalid) {
+      expect(
+        loginStepParams.safeParse(candidate).success,
+        JSON.stringify(candidate),
+      ).toBe(false);
+    }
+  });
+
   test("rejects an unknown action", () => {
     expect(
       loginStepParams.safeParse({ login_id: "l1", action: "type" }).success,
@@ -720,6 +808,7 @@ describe("createServer tool listing", () => {
         ]),
       );
       expect(props.fills?.type).toBe("array");
+      expect(Object.keys(props)).toContain("ref");
       expect(props.submit?.anyOf).toHaveLength(2);
       for (const branch of props.submit?.anyOf ?? []) {
         expect(branch.type).toBe("object");
@@ -738,6 +827,7 @@ describe("createServer tool listing", () => {
     try {
       for (const args of [
         { login_id: "l1", action: "fill" },
+        { login_id: "l1", action: "click", ref: "e9", selector: "#a" },
         {
           login_id: "l1",
           action: "fill_submit",
@@ -763,6 +853,7 @@ describe("createServer tool listing", () => {
     const { client, server } = await connectClient();
     try {
       expect(client.getInstructions()).toContain("login_begin");
+      expect(client.getInstructions()).toContain("[ref=");
     } finally {
       await client.close();
       await server.close();

@@ -61,6 +61,7 @@ the public code format; arbitrary daemon text is normalised to `INTERNAL`.
 | `MFA_REQUIRED` | The login needs a TOTP code and the credential has no seed |
 | `SELECTOR_NOT_FOUND` | A login step's selector did not resolve within the step timeout |
 | `FILL_MISMATCH` | A secret fill was refused or rolled back: `{{password}}` targeted a non-password input, or the page changed another field / the value did not stick; explicit steps include `step` |
+| `FILL_TARGET_REFUSED` | A stepwise `fill` or `fill_submit` targeted an element in a frame whose origin differs from the main frame's; nothing was filled and the stepwise login ended |
 | `LOGIN_RESULT_TIMEOUT` | All login steps ran, but the executor could not tell within the wait window whether the login worked; no browser is handed back. Also returned by `authorize_device` when its login stage cannot be judged. |
 | `OAUTH_GRANT_FAILED` | The OAuth device-code grant behind an `open_api_proxy` failed: the device authorization or token endpoint refused, the grant was denied or expired, or polling ran out of time. |
 | `DEVICE_CODE_REJECTED` | The device authorization page rejected the user code |
@@ -354,19 +355,27 @@ and no snapshot involved.
 **Input** is flat: `{ "login_id", "action", ...the fields of that action }`.
 
 The tool's listed input schema is a single flat object (`login_id`, `action`,
-and the optional `selector`, `value`, `fills`, `submit`) so that MCP clients
+and the optional `ref`, `selector`, `value`, `fills`, `submit`) so that MCP clients
 see every field. Which fields each action accepts is still enforced by the
 broker, and fields that do not belong to the chosen action are dropped before
 the call reaches the daemon.
 
 | Action | Fields | Meaning |
 | --- | --- | --- |
-| `click` | `selector` | Click the element |
-| `wait_for` | `selector` | Wait for the element to become visible; same per-step timeout and `SELECTOR_NOT_FOUND` as `login` |
-| `fill` | `selector`, `value` | Fill one element. `value` must be `{{username}}` — a lone `fill` may not place `{{password}}` or `{{totp}}` |
-| `fill_submit` | `fills` (1–3 of `{selector, value}`), `submit` (`{"click": selector}` or `{"press_enter": selector}`) | Fill one to three elements and submit as one uninterruptible operation; `value` is `{{username}}`, `{{password}}`, or `{{totp}}` — this is the only action that may place a secret |
+| `click` | `ref` or `selector` | Click the element |
+| `wait_for` | `ref` or `selector` | Wait for the element to become visible; same per-step timeout and `SELECTOR_NOT_FOUND` as `login` |
+| `fill` | `ref` or `selector`, `value` | Fill one element. `value` must be `{{username}}` — a lone `fill` may not place `{{password}}` or `{{totp}}` |
+| `fill_submit` | `fills` (1–3 of `{ref, value}` or `{selector, value}`), `submit` (`{"click": {ref}}`, `{"click": {selector}}`, `{"press_enter": {ref}}`, or `{"press_enter": {selector}}`) | Fill one to three elements and submit as one uninterruptible operation; `value` is `{{username}}`, `{{password}}`, or `{{totp}}` — this is the only action that may place a secret |
 | `snapshot` | — | Take a fresh snapshot without acting on the page |
 | `abort` | — | Discard the browser and end the stepwise login |
+
+Wherever an action points at an element, it takes exactly one of `ref` and
+`selector`; sending both, or neither, is rejected as an invalid parameter
+(`Input validation error` through MCP) and the page is not touched. A `ref` is
+the `[ref=…]` marker of a line in the latest snapshot's `page` (for example
+`e9`, or `f1e3` inside an iframe). A `selector` is a CSS selector resolved in
+the main frame. For `submit`, a bare string — `{"click": "#next"}` or
+`{"press_enter": "#x"}` — remains as shorthand for a `selector`.
 
 **Output** is one of the two `login_begin` shapes (`pending` or `done`), plus
 `{ "state": "aborted" }` for `abort` — three shapes in all.
@@ -378,7 +387,11 @@ best-effort; the guarantee is the snapshot check below, which refuses any
 snapshot that still carries a secret. A
 `SELECTOR_NOT_FOUND` during `fill_submit` leaves the stepwise login open for
 another step; a `FILL_MISMATCH` ends it, the same way a suspected
-secret-misroute ends a `login`. While one `fill_submit` runs, other
+secret-misroute ends a `login`. So does `FILL_TARGET_REFUSED`: before any value
+is entered, every element a `fill` or `fill_submit` would fill must sit in a
+frame whose origin matches the main frame's, otherwise nothing is filled and
+the stepwise login ends (see [security.md](security.md#stepwise-login)).
+`click`, `wait_for`, and `snapshot` have no such restriction. While one `fill_submit` runs, other
 `login_step` calls on the same `login_id`, including `snapshot`, wait for it.
 
 Other than inside `fill_submit`, `{{password}}` and `{{totp}}` are rejected —
@@ -387,37 +400,38 @@ when called directly over the socket.
 
 ### The snapshot
 
-Built on the isolated side after every settle, from the main frame and any
-open shadow roots:
+Built on the isolated side after every settle:
 
 ```json
 {
   "url": "https://example.com/login/2fa",
   "title": "Verify it's you",
-  "text": "...",
-  "elements": [
-    {
-      "tag": "button", "role": "button", "disabled": false,
-      "text": "More options", "selector": "#more-options"
-    }
-  ],
+  "page": "- heading \"Verify it's you\" [level=1] [ref=e2]\n- textbox \"Code\" [ref=e4]\n- button \"More options\" [ref=e5]\n- button \"Verify\" [ref=e6]",
   "settled": true
 }
 ```
 
-`text` is `document.body.innerText`, truncated to 2000 characters. `elements`
-lists visible `button`, `a[href]`, `input`, `select`, `textarea`, and
-`[role=button]` / `[role=link]` elements, up to 200. Each entry carries `tag`,
-`disabled` (always a boolean), `text`, and a `selector` tegata generates (an
-`#id` if unique, else a `[name=...]` match, else a positional path) — the same
-selector the agent passes back in the next step — plus whichever of `type`,
-`id`, `name`, `role`, `placeholder`, `aria-label`, `autocomplete`, and `href`
-the element actually has; an attribute the element lacks is omitted from the
-entry rather than serialized as `null`. **No `value` property, `value`
-attribute, or `data-*` attribute of any element is ever included**, regardless
-of the element's type or visibility. The whole snapshot is capped at 64 KiB
-serialized; over that, `elements` is trimmed from the end and `truncated:
-true` is added.
+`page` is Playwright's AI aria snapshot of the page: one line per node, giving
+the node's role and accessible name, with a `[ref=…]` marker on each node that
+can be addressed. Names come from the browser's own accessible-name
+computation, so a button named only by an SVG title, an `aria-labelledby`, or
+an image `alt` appears under that name. The snapshot includes the contents of
+iframes; refs inside an iframe are written `f<n>e<m>`, where `f<n>` is
+Playwright's frame number, not the frame's position in the document. A ref is
+valid only while it appears in the most recent snapshot: each new snapshot
+replaces the set of valid refs, and a ref that is not in the latest `page`
+resolves to `SELECTOR_NOT_FOUND`.
+
+**No field value is ever included.** The value of an input, textarea, or
+combobox is removed from its line, and a field that had a non-empty value is
+marked `[filled]` instead, for example `textbox "Email" [ref=e3] [filled]`. A
+`select` keeps its `option` lines. Nothing in `page` comes from a `value`
+attribute or a `data-*` attribute. If the output has a shape tegata does not
+recognise, no snapshot is returned and the stepwise login ends.
+
+The whole snapshot is capped at 64 KiB serialized; over that, `page` is cut
+from the end, a whole line at a time, and `truncated: true` is added. Refs on
+the lines that were cut are not valid.
 
 `settled` reports whether the page reached a quiet DOM before the snapshot
 was taken: up to 10 seconds for `domcontentloaded` if the action navigated,
@@ -426,17 +440,21 @@ limit still returns a snapshot, marked `settled: false`, rather than an
 error; `networkidle` is not used, matching `login`'s own note about sites
 that long-poll continuously.
 
-The snapshot's username is always replaced with `[username]` — raw,
-HTML-escaped, and URL-encoded forms — before anything else happens to it.
-This is not an omission the agent can rely on for other values: it exists
+The snapshot's username is replaced with `[username]` in `url`, `title`, and
+`page`, on a best-effort basis: raw, HTML-escaped, URL-encoded, and the forms the
+browser displays after whitespace normalisation and quoting. A screen that shows
+the username as plain text, such as "Continue as ...", therefore reads
+`[username]`. This is not an omission the agent can rely on for other values: it exists
 because the daemon's own response leak scan would otherwise flag the
 credential's username and turn the whole response into `INTERNAL`.
 
 ### `SNAPSHOT_REJECTED`
 
-Before a snapshot is returned, its full serialization — text, attributes, and
-URL — is checked for an exact match, in raw, HTML-escaped, URL-encoded (both
-`encodeURIComponent` and full percent-encoding), base64, and hex form, of the
+Before a snapshot is returned, its full content — `url`, `title`, and `page`,
+before any truncation — is checked for an exact match, in raw, HTML-escaped,
+URL-encoded (both `encodeURIComponent` and full percent-encoding), base64, and
+hex form, as well as the forms the snapshot displays (whitespace-normalised, and
+JSON- or YAML-escaped), of the
 credential's password and of every TOTP code entered so far in that stepwise
 login. A single match ends the stepwise login, discards its browser, and
 returns `SNAPSHOT_REJECTED` instead of the snapshot; the same `login_id` then

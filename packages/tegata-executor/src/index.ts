@@ -1035,13 +1035,13 @@ function isRef(value: unknown): value is string {
   );
 }
 
-/** ref と selector のどちらか一方のみを受け付ける。null は指定が無いものとして扱う。 */
+/** ref と selector のどちらか一方のみを受け付ける。null は指定が無いものとして扱わず、不正とする。 */
 function parseElementTarget(
   value: Record<string, unknown>,
   id?: RequestId,
 ): ElementTarget {
-  const hasRef = !isAbsent(value.ref);
-  const hasSelector = !isAbsent(value.selector);
+  const hasRef = value.ref !== undefined;
+  const hasSelector = value.selector !== undefined;
   if (hasRef && !hasSelector && isRef(value.ref)) return { ref: value.ref };
   if (hasSelector && !hasRef && typeof value.selector === "string") {
     return { selector: value.selector };
@@ -1774,7 +1774,7 @@ async function fillHandle(
   passwordOnly: boolean,
   stepIndex?: number,
 ): Promise<void> {
-  const status = await onRefElement(
+  const status = await onResolvedElement(
     () => handle.evaluate(setValueInPage, { value, passwordOnly }),
     stepIndex,
   );
@@ -2602,7 +2602,7 @@ async function beginStepwise(
   return concludeStepwise(session, settled, restored > 0);
 }
 
-// ref で解決した要素が、解決の後に文書や frame ごと失われたことを表す Playwright のエラー。
+// 解決した要素が、解決の後に文書や frame ごと失われたことを表す Playwright のエラー。
 const STALE_ELEMENT_MESSAGES = [
   "Invalid frame in aria-ref selector",
   "Execution context was destroyed",
@@ -2616,8 +2616,8 @@ function isStaleElementError(error: unknown): boolean {
   );
 }
 
-/** ref で解決した要素への操作の、待機の超過と要素の喪失を SelectorNotFoundError とする。 */
-async function onRefElement<T>(
+/** 解決した要素への操作の、待機の超過と要素の喪失を SelectorNotFoundError とする。 */
+async function onResolvedElement<T>(
   operation: () => Promise<T>,
   stepIndex?: number,
 ): Promise<T> {
@@ -2641,7 +2641,7 @@ async function resolveRef(
   stepIndex?: number,
 ): Promise<ElementHandle> {
   if (!session.refs.has(ref)) throw new SelectorNotFoundError(stepIndex);
-  const handles = await onRefElement(
+  const handles = await onResolvedElement(
     () => session.page.locator(`aria-ref=${ref}`).elementHandles(),
     stepIndex,
   );
@@ -2685,55 +2685,58 @@ async function isSameOriginTarget(
 }
 
 /**
- * 値を入れる前に、ref の欄を解決し、全ての欄の frame の origin を確かめる。selector の欄は main frame で解決されるため、
- * main frame の origin が opaque でないことを確かめる。1 つでも一致しなければ、どの欄にも値を入れずに
- * FillTargetRefusedError とする。戻り値は fills と同じ順の ElementHandle（selector の欄は undefined）である。
+ * 値を入れずに欄を ElementHandle へ解決する。ref は待たずに 1 回だけ解決し、selector は従来どおり可視になるのを待って解決する。
+ * selector も aria-ref や frame を辿る形をとりうるため、以後の判定と入力はこの ElementHandle に対して行う。
+ */
+async function resolveFillTarget(
+  session: StepwiseSession,
+  target: ElementTarget,
+  stepIndex?: number,
+): Promise<ElementHandle> {
+  if ("ref" in target) return resolveRef(session, target.ref, stepIndex);
+  const locator = session.page.locator(target.selector).first();
+  await waitForVisible(locator, stepIndex);
+  let handle: ElementHandle | null;
+  try {
+    handle = await locator.elementHandle({ timeout: STEP_SELECTOR_TIMEOUT_MS });
+  } catch (error) {
+    if (isTimeoutError(error)) throw new SelectorNotFoundError(stepIndex);
+    throw error;
+  }
+  if (handle === null) throw new SelectorNotFoundError(stepIndex);
+  return handle;
+}
+
+/**
+ * 値を入れる前に全ての欄を解決し、全ての欄の frame の origin を確かめる。1 つでも一致しなければ、どの欄にも値を入れずに
+ * FillTargetRefusedError とする。戻り値は fills と同じ順の ElementHandle である。
  */
 async function prepareStepwiseFills(
   session: StepwiseSession,
   targets: readonly ElementTarget[],
   withStepIndex: boolean,
-): Promise<Array<ElementHandle | undefined>> {
-  const handles: Array<ElementHandle | undefined> = [];
+): Promise<ElementHandle[]> {
+  const handles: ElementHandle[] = [];
   try {
     for (const [index, target] of targets.entries()) {
       handles.push(
-        "ref" in target
-          ? await resolveRef(
-              session,
-              target.ref,
-              withStepIndex ? index : undefined,
-            )
-          : undefined,
+        await resolveFillTarget(
+          session,
+          target,
+          withStepIndex ? index : undefined,
+        ),
       );
     }
     for (const handle of handles) {
-      if (
-        handle !== undefined &&
-        !(await isSameOriginTarget(session.page, handle))
-      ) {
+      if (!(await isSameOriginTarget(session.page, handle))) {
         throw new FillTargetRefusedError();
       }
     }
-    if (
-      handles.includes(undefined) &&
-      mainFrameOrigin(session.page) === undefined
-    ) {
-      throw new FillTargetRefusedError();
-    }
   } catch (error) {
-    await disposeHandles(definedHandles(handles));
+    await disposeHandles(handles);
     throw error;
   }
   return handles;
-}
-
-function definedHandles(
-  handles: ReadonlyArray<ElementHandle | undefined>,
-): ElementHandle[] {
-  return handles.filter(
-    (handle): handle is ElementHandle => handle !== undefined,
-  );
 }
 
 /** 入力した欄を、失敗時の消去のために記録する。 */
@@ -2746,35 +2749,7 @@ function recordFilled(
   session.filled.push(handle);
 }
 
-/** 可視になった欄を記録してから #43 の fillLocator で値を入れる。 */
-async function fillStepwiseField(
-  session: StepwiseSession,
-  selector: string,
-  value: string,
-  passwordOnly: boolean,
-  filled: ElementHandle[],
-  stepIndex?: number,
-): Promise<void> {
-  const locator = session.page.locator(selector).first();
-  await waitForVisible(locator, stepIndex);
-  let handle: ElementHandle | null;
-  try {
-    handle = await locator.elementHandle({ timeout: STEP_SELECTOR_TIMEOUT_MS });
-  } catch (error) {
-    if (isTimeoutError(error)) throw new SelectorNotFoundError(stepIndex);
-    throw error;
-  }
-  if (handle !== null) {
-    if (!(await isSameOriginTarget(session.page, handle))) {
-      await handle.dispose().catch(() => undefined);
-      throw new FillTargetRefusedError();
-    }
-    recordFilled(session, handle, filled);
-  }
-  await fillLocator(locator, value, passwordOnly, stepIndex);
-}
-
-/** ref で解決した欄が可視になるのを待ち、記録してから #43 の検査つきで値を入れる。 */
+/** 解決した欄が可視になるのを待ち、記録してから #43 の検査つきで値を入れる。 */
 async function fillStepwiseHandle(
   session: StepwiseSession,
   handle: ElementHandle,
@@ -2783,7 +2758,7 @@ async function fillStepwiseHandle(
   filled: ElementHandle[],
   stepIndex?: number,
 ): Promise<void> {
-  await onRefElement(
+  await onResolvedElement(
     () =>
       handle.waitForElementState("visible", {
         timeout: STEP_SELECTOR_TIMEOUT_MS,
@@ -2794,7 +2769,7 @@ async function fillStepwiseHandle(
   await fillHandle(handle, value, passwordOnly, stepIndex);
 }
 
-/** prepareStepwiseFills で確かめた欄へ、順に値を入れる。 */
+/** prepareStepwiseFills で確かめた欄へ、同じ ElementHandle に対して順に値を入れる。 */
 async function fillStepwiseTargets(
   session: StepwiseSession,
   fills: ReadonlyArray<{
@@ -2811,34 +2786,19 @@ async function fillStepwiseTargets(
     withStepIndex,
   );
   try {
-    for (const [index, { target, value, passwordOnly }] of fills.entries()) {
-      const stepIndex = withStepIndex ? index : undefined;
-      const handle = handles[index];
-      if (handle !== undefined) {
-        await fillStepwiseHandle(
-          session,
-          handle,
-          value,
-          passwordOnly,
-          filled,
-          stepIndex,
-        );
-      } else if ("selector" in target) {
-        await fillStepwiseField(
-          session,
-          target.selector,
-          value,
-          passwordOnly,
-          filled,
-          stepIndex,
-        );
-      }
+    for (const [index, { value, passwordOnly }] of fills.entries()) {
+      await fillStepwiseHandle(
+        session,
+        handles[index],
+        value,
+        passwordOnly,
+        filled,
+        withStepIndex ? index : undefined,
+      );
     }
   } finally {
-    // 入力に至らなかった ref の欄の ElementHandle を解放する。
-    await disposeHandles(
-      definedHandles(handles).filter((handle) => !filled.includes(handle)),
-    );
+    // 入力に至らなかった欄の ElementHandle を解放する。
+    await disposeHandles(handles.filter((handle) => !filled.includes(handle)));
   }
 }
 
@@ -2851,7 +2811,7 @@ async function withRefElement(
 ): Promise<void> {
   const handle = await resolveRef(session, ref, stepIndex);
   try {
-    await onRefElement(() => operation(handle), stepIndex);
+    await onResolvedElement(() => operation(handle), stepIndex);
   } finally {
     await handle.dispose().catch(() => undefined);
   }

@@ -9,7 +9,6 @@ import {
 } from "playwright-core";
 import {
   clearFieldInPage,
-  collectExplicitRolesInPage,
   type RawAriaSnapshot,
   waitForDomQuietInPage,
 } from "./snapshot.js";
@@ -202,28 +201,36 @@ export async function disposeHandles(
   );
 }
 
-/** page から返った値のうち文字列だけを写す。page は組み込みオブジェクトを改変して任意の値を返しうる。 */
-function stringsOf(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string")
-    : [];
-}
+// 値を出力されうる、explicit role を持つ欄。
+const EXPLICIT_ROLE_FIELDS = "input[role], textarea[role]";
 
 /**
- * 全 frame の input[role]・textarea[role] の role 属性値を集める。集められなかった frame は無視する。
- * その frame の値が除去の対象から漏れても、password・TOTP は後段の検査で、username はマスクで扱われる。
+ * 1 つの frame の input[role]・textarea[role] の role 属性値を集める。要素の検索と属性の読み取りは Playwright の
+ * locator が page の JS から隔離された文脈で行うため、page が querySelectorAll や getAttribute を差し替えても結果は変わらない。
  */
-async function collectExplicitRoles(page: Page): Promise<string[]> {
+async function collectFrameRoles(frame: Frame): Promise<string[]> {
+  const fields = await frame.locator(EXPLICIT_ROLE_FIELDS).all();
+  const roles = await Promise.all(
+    fields.map((field) =>
+      field.getAttribute("role", { timeout: COLLECT_ROLES_TIMEOUT_MS }),
+    ),
+  );
+  return roles.filter((role): role is string => role !== null);
+}
+
+/** 全 frame の role 属性値を集める。1 つの frame でも失敗（例外・上限の超過）すれば undefined を返す。 */
+async function collectExplicitRoles(page: Page): Promise<string[] | undefined> {
   const perFrame = await Promise.all(
     page.frames().map((frame) =>
-      withTimeout(
-        frame.evaluate(collectExplicitRolesInPage).catch(() => []),
+      withTimeout<string[] | undefined>(
+        collectFrameRoles(frame).catch(() => undefined),
         COLLECT_ROLES_TIMEOUT_MS,
-        [],
+        undefined,
       ),
     ),
   );
-  return perFrame.flatMap(stringsOf);
+  if (perFrame.some((roles) => roles === undefined)) return undefined;
+  return perFrame.flatMap((roles) => roles ?? []);
 }
 
 /**
@@ -247,6 +254,10 @@ export async function captureAriaSnapshot(
     url: page.url(),
     title: typeof title === "string" ? title : "",
     aria,
-    roles: [...new Set([...before, ...after])],
+    // 前後のどちらかで集められなかった場合は、全ての役割を値の除去の対象とする。
+    roles:
+      before === undefined || after === undefined
+        ? "all"
+        : [...new Set([...before, ...after])],
   };
 }

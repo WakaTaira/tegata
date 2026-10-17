@@ -167,6 +167,64 @@ describe("value removal", () => {
   });
 });
 
+describe("roles that could not be collected", () => {
+  test("removes values from every role's heading line", () => {
+    const aria = lines(
+      "- generic [ref=e1]:",
+      "  - text: label text",
+      '  - button "Go" [ref=e2]: inline-value-marker',
+      "  - paragraph [ref=e3]:",
+      "    - text: direct-text-marker",
+      '  - link "Help" [ref=e4]:',
+      "    - /url: /help",
+      '  - heading "Sign in" [level=1] [ref=e5]',
+    );
+
+    expect(pageOf(aria, { roles: "all" })).toBe(
+      lines(
+        "- generic [ref=e1] [filled]:",
+        '  - button "Go" [ref=e2] [filled]',
+        "  - paragraph [ref=e3] [filled]:",
+        '  - link "Help" [ref=e4]:',
+        "    - /url: /help",
+        '  - heading "Sign in" [level=1] [ref=e5]',
+      ),
+    );
+  });
+
+  test("falls back to every role when a frame fails to answer", async () => {
+    const working = {
+      locator: () => ({
+        all: async () => [{ getAttribute: async () => "note" }],
+      }),
+    };
+    const failing = {
+      locator: () => ({
+        all: async () => {
+          throw new Error("Frame was detached");
+        },
+      }),
+    };
+    const fake = (frames: unknown[]) =>
+      ({
+        frames: () => frames,
+        ariaSnapshot: async () => '- button "Go" [ref=e1]: inline-value-marker',
+        title: async () => "Sign in",
+        url: () => URL,
+      }) as unknown as Page;
+
+    expect((await captureAriaSnapshot(fake([working]))).roles).toEqual([
+      "note",
+    ]);
+    const captured = await captureAriaSnapshot(fake([working, failing]));
+
+    expect(captured.roles).toBe("all");
+    expect(finalizeSnapshot(captured, true, secrets).snapshot.page).toBe(
+      '- button "Go" [ref=e1] [filled]',
+    );
+  });
+});
+
 describe("line grammar", () => {
   test("passes the known line kinds through unchanged", () => {
     const aria = lines(
@@ -646,6 +704,43 @@ describe("capture from a page", { timeout: 60_000 }, () => {
     // 台帳の ref は、取得の直後に aria-ref で解決できる。
     for (const ref of refs) {
       expect(await page.locator(`aria-ref=${ref}`).count(), ref).toBe(1);
+    }
+  });
+
+  test("collects explicit roles even when the page replaces the DOM built-ins", async () => {
+    const tamper = `
+      Element.prototype.querySelectorAll = function () { return []; };
+      Document.prototype.querySelectorAll = function () { return []; };
+      DocumentFragment.prototype.querySelectorAll = function () { return []; };
+      Element.prototype.querySelector = function () { return null; };
+      Element.prototype.getAttribute = function () { return null; };
+      Element.prototype.matches = function () { return false; };
+    `;
+    await page.setContent(`
+      <input role="note" aria-label="Explicit" value="explicit-role-marker">
+      <div id="host"></div>
+      <iframe srcdoc="<input role='menuitem' aria-label='Framed' value='framed-role-marker'><script>${tamper.replaceAll('"', "&quot;")}</script>"></iframe>
+      <script>
+        document.getElementById("host").attachShadow({ mode: "open" }).innerHTML =
+          '<textarea role="status" aria-label="Shadow">shadow-role-marker</textarea>';
+        ${tamper}
+      </script>
+    `);
+    await page.waitForFunction(() => window.frames.length === 1);
+    await page.frames()[1].waitForLoadState();
+
+    const captured = await captureAriaSnapshot(page);
+    const { snapshot } = finalizeSnapshot(captured, true, secrets);
+
+    expect(captured.roles).toEqual(
+      expect.arrayContaining(["note", "status", "menuitem"]),
+    );
+    for (const canary of [
+      "explicit-role-marker",
+      "framed-role-marker",
+      "shadow-role-marker",
+    ]) {
+      expect(snapshot.page).not.toContain(canary);
     }
   });
 

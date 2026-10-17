@@ -45,6 +45,7 @@ function framedForm(name: string): string {
 function framesPage(port: number): string {
   return `<!doctype html><html><head><title>Frames</title></head><body>${reportScript}
     <h1>Frames</h1>
+    <label>Main username <input id="main-user" type=text data-f=Main oninput=report(this.dataset.f,this.value)></label>
     <iframe src="/frame/form?name=Same"></iframe>
     <iframe src="http://localhost:${port}/frame/form?name=Cross"></iframe>
     <iframe srcdoc="<label>Srcdoc password <input type=password data-f=Srcdoc oninput=parent.report(this.dataset.f,this.value)></label>"></iframe>
@@ -236,6 +237,58 @@ describe("fill target origin", { timeout: 90_000 }, () => {
     expect(response).toEqual(refused);
     expect(reports).toEqual([]);
     await expectEnded();
+  });
+
+  test.each([
+    ["an aria-ref selector", (ref: string) => `aria-ref=${ref}`],
+    [
+      "a frame-entering selector",
+      () =>
+        'iframe[src^="http://localhost"] >> internal:control=enter-frame >> input[type=password]',
+    ],
+  ])(
+    "refuses %s into a cross-origin frame after a same-origin selector field",
+    async (_kind, selectorOf) => {
+      const begun = await begin();
+
+      const response = await step({
+        action: "fill_submit",
+        fills: [
+          { selector: "#main-user", value: "{{username}}" },
+          {
+            selector: selectorOf(refOf(begun, "textbox", "Cross password")),
+            value: "{{password}}",
+          },
+        ],
+        submit: { click: { ref: refOf(begun, "button", "Main go") } },
+      });
+
+      expect(response).toEqual(refused);
+      expect(reports).toEqual([]);
+      await expectEnded();
+    },
+  );
+
+  test("fills same-origin fields named by selectors", async () => {
+    const begun = await begin();
+
+    const submitted = await step({
+      action: "fill_submit",
+      fills: [
+        { selector: "#main-user", value: "{{username}}" },
+        {
+          selector: `aria-ref=${refOf(begun, "textbox", "Same password")}`,
+          value: "{{password}}",
+        },
+      ],
+      submit: { click: { ref: refOf(begun, "button", "Main go") } },
+    });
+
+    expect(submitted).toMatchObject({ ok: true, state: "pending" });
+    expect(reports.slice(0, 2)).toEqual([
+      { frame: "Main", length: USERNAME.length },
+      { frame: "Same", length: PASSWORD.length },
+    ]);
   });
 
   test("refuses a lone username fill into a cross-origin frame", async () => {

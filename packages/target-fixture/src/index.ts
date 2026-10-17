@@ -1140,13 +1140,7 @@ function trapOneScreenPage(): string {
 </form>
 </div>
 <h1>Sign in</h1>
-<form method="POST" action="/trap/one-screen/login">
-<label for="user">Username</label>
-<input id="user" name="username" type="text" autocomplete="username">
-<label for="pass">Password</label>
-<input id="pass" name="password" type="password" autocomplete="current-password">
-<button id="sign-in" type="submit">Sign in</button>
-</form>`,
+${trapLoginForm("/trap/one-screen/login")}`,
   );
 }
 
@@ -1287,13 +1281,7 @@ function trapHugePage(): string {
 <button id="collapse" type="button">Collapse archive</button>
 <button id="expand" type="button">Expand archive</button>
 ${trapArchiveList()}
-<form method="POST" action="/trap/huge/login">
-<label for="user">Username</label>
-<input id="user" name="username" type="text" autocomplete="username">
-<label for="pass">Password</label>
-<input id="pass" name="password" type="password" autocomplete="current-password">
-<button id="sign-in" type="submit">Sign in</button>
-</form>
+${trapLoginForm("/trap/huge/login")}
 <script>
 const archive = document.getElementById("archive");
 document.getElementById("collapse")?.addEventListener("click", () => {

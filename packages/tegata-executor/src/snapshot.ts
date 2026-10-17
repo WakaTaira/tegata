@@ -34,12 +34,15 @@ export type Snapshot = {
   truncated?: true;
 };
 
-/** page から受け取ったスナップショットの素材。roles は page から集めた input・textarea の role 属性値である。 */
+/**
+ * page から受け取ったスナップショットの素材。roles は page から集めた input・textarea の role 属性値であり、
+ * 集められなかった場合の "all" は全ての役割を値の除去の対象とすることを表す。
+ */
 export type RawAriaSnapshot = {
   url: string;
   title: string;
   aria: string;
-  roles: readonly string[];
+  roles: readonly string[] | "all";
 };
 
 /** 検査済みのスナップショットと、その page の見出し行が持つ ref の集合。 */
@@ -50,26 +53,6 @@ export type FinalizedSnapshot = {
 
 /** スナップショットが既知の secret を含むか、未知の形式であるために返せないことを表す。 */
 export class SnapshotRejectedError extends Error {}
-
-/**
- * page 内で、全ての文書（open shadow root を含む）の input[role]・textarea[role] の role 属性値を集める。
- * page へシリアライズされるため、外部の識別子を参照してはならない。
- */
-export function collectExplicitRolesInPage(): string[] {
-  const roles: string[] = [];
-  const walk = (root: Document | ShadowRoot): void => {
-    for (const element of Array.from(
-      root.querySelectorAll("input[role], textarea[role]"),
-    )) {
-      roles.push(element.getAttribute("role") ?? "");
-    }
-    for (const element of Array.from(root.querySelectorAll("*"))) {
-      if (element.shadowRoot !== null) walk(element.shadowRoot);
-    }
-  };
-  walk(document);
-  return roles;
-}
 
 /**
  * page 内で DOM の変更が `quietMs` 途切れるのを最大 `maxMs` 待つ。途切れた場合は true を返す。
@@ -324,10 +307,10 @@ function renderValueHeading(line: SnapshotLine, filled: boolean): string {
  */
 export function removeValues(
   lines: readonly SnapshotLine[],
-  roles: ReadonlySet<string>,
+  isValueRole: (role: string) => boolean,
 ): string[] {
   const isTarget = (line: SnapshotLine): boolean =>
-    !isPseudoLine(line) && roles.has(line.role);
+    !isPseudoLine(line) && isValueRole(line.role);
   const filled = new Set<number>();
   const dropped = new Set<number>();
   // 子を持つ祖先の行の添字を、インデントの浅い順に積む。
@@ -563,14 +546,18 @@ function fitSnapshot(snapshot: Snapshot): Snapshot {
   return fitted;
 }
 
-/** page から集めた role 属性値を、空白で区切られた個々の役割の名前に分ける。 */
-function valueRoles(roles: readonly string[]): Set<string> {
-  return new Set([
+/** 値の除去の対象となる役割かを返す判定を作る。role 属性値は空白で区切られた個々の役割の名前に分ける。 */
+function valueRoles(
+  roles: RawAriaSnapshot["roles"],
+): (role: string) => boolean {
+  if (roles === "all") return () => true;
+  const names = new Set([
     ...VALUE_ROLES,
     ...roles.flatMap((role) =>
       role.split(/\s+/u).filter((name) => name !== ""),
     ),
   ]);
+  return (role) => names.has(role);
 }
 
 /**

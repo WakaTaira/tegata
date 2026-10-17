@@ -74,10 +74,26 @@ const MAX_REF_LEN: usize = 32;
 /// executor へは持っている方だけを平坦に送る。
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 struct ElementRef {
-    #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "ref",
+        default,
+        deserialize_with = "present_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     element_ref: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     selector: Option<String>,
+}
+
+/// キーが存在する場合は文字列だけを受け付け、明示的な `null` を拒否する（キーの欠落は `default` で `None`）。
+fn present_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
 }
 
 impl ElementRef {
@@ -1439,6 +1455,44 @@ mod tests {
         assert!(fills(json!({ "selector": "#u", "value": "{{username}}" })).is_ok());
         assert!(fills(json!({ "ref": "e4", "selector": "#u", "value": "{{username}}" })).is_err());
         assert!(fills(json!({ "value": "{{username}}" })).is_err());
+    }
+
+    #[test]
+    fn explicit_null_targets_are_refused_but_absent_keys_are_not() {
+        for (key, other) in [("ref", ("selector", "#a")), ("selector", ("ref", "e1"))] {
+            for action in ["click", "wait_for"] {
+                let mut params = json!({ "login_id": "x", "action": action });
+                params[key] = Value::Null;
+                params[other.0] = json!(other.1);
+                assert!(step(params.clone()).is_err(), "{params}");
+            }
+            let mut fill = json!({ "login_id": "x", "action": "fill", "value": "{{username}}" });
+            fill[key] = Value::Null;
+            fill[other.0] = json!(other.1);
+            assert!(step(fill.clone()).is_err(), "{fill}");
+
+            let mut field = json!({ "value": "{{username}}" });
+            field[key] = Value::Null;
+            field[other.0] = json!(other.1);
+            let fills = json!({
+                "login_id": "x", "action": "fill_submit",
+                "fills": [field], "submit": { "click": "#go" },
+            });
+            assert!(step(fills.clone()).is_err(), "{fills}");
+
+            let mut target = json!({});
+            target[key] = Value::Null;
+            target[other.0] = json!(other.1);
+            for kind in ["click", "press_enter"] {
+                let submit = json!({
+                    "login_id": "x", "action": "fill_submit",
+                    "fills": [{ "selector": "#p", "value": "{{password}}" }],
+                    "submit": { kind: target.clone() },
+                });
+                assert!(step(submit.clone()).is_err(), "{submit}");
+            }
+        }
+        assert!(step(json!({ "login_id": "x", "action": "click", "ref": "e1" })).is_ok());
     }
 
     #[test]

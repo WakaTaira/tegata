@@ -393,13 +393,36 @@ describe("login_step parsing", () => {
       },
     ];
     for (const action of invalid) expect(parseStep(action)).toThrow();
+  });
+
+  test("refuses an explicit null ref or selector", () => {
+    const fills = [{ ref: "e1", value: "{{password}}" }];
+    const invalid = [
+      { action: "click", ref: null, selector: "#a" },
+      { action: "click", ref: "e1", selector: null },
+      { action: "wait_for", ref: null },
+      { action: "fill", selector: null, ref: "e2", value: "{{username}}" },
+      {
+        action: "fill_submit",
+        fills: [{ ref: null, selector: "#p", value: "{{password}}" }],
+        submit: { click: "#s" },
+      },
+      { action: "fill_submit", fills, submit: { click: null } },
+      { action: "fill_submit", fills, submit: { click: { ref: null } } },
+      {
+        action: "fill_submit",
+        fills,
+        submit: { press_enter: { selector: "#x", ref: null } },
+      },
+    ];
+    for (const action of invalid) expect(parseStep(action)).toThrow();
 
     expect(parseStep({ action: "click", ref: "f2e10" })()).toMatchObject({
       action: { action: "click", ref: "f2e10" },
     });
-    expect(
-      parseStep({ action: "wait_for", ref: null, selector: "#a" })(),
-    ).toMatchObject({ action: { action: "wait_for", selector: "#a" } });
+    expect(parseStep({ action: "wait_for", selector: "#a" })()).toMatchObject({
+      action: { action: "wait_for", selector: "#a" },
+    });
     for (const submit of [
       { click: { ref: "e9" } },
       { click: { selector: "#next" } },

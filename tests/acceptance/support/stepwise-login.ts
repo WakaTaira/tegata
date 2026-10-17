@@ -9,10 +9,10 @@
  *     `{login_id, action: "click", selector}`); their results are
  *     `{state: "pending", login_id, snapshot}`, `{state: "done", session_id,
  *     target_id, channel: {kind: "cdp", endpoint}}` or `{state: "aborted"}`
- *   - the snapshot shape `{url, title, text, elements: [{tag, type, id, name,
- *     role, placeholder, aria-label, autocomplete, href, disabled, text,
- *     selector}], settled, truncated?}` with the username masked as
- *     `[username]`
+ *   - the snapshot shape `{url, title, page, settled, truncated?}` (Issue #57;
+ *     `text` and `elements` are gone) where `page` is the value-free AI aria
+ *     snapshot with `[ref=…]` per line (see `aria-snapshot.ts`), with the
+ *     username masked as `[username]`
  *   - the top-level config keys `stepwise_idle_secs` / `stepwise_max_secs`
  *     (the rest of the config is the Phase 4 `[[listen]]` shape with the
  *     Issue #45 provider key `persist_cookies`)
@@ -28,6 +28,10 @@
  *     `{requests, posts, inputs, totp, sticky_reports}` with every field
  *     value masked (`<empty>`, `<username>`, `<password>`, `<totp>`, or
  *     `sha256:<hex>`)
+ *   - Issue #57: the credentials `trap-1` / `trap-2` (the fixture's account,
+ *     separate rate-limit keys for the `/trap/` pages) and `trap-quoted`
+ *     (the fixture's username with `StepwiseStack.quotedPassword`, a fake
+ *     password holding `'`, `"`, `\`, `: ` and a run of spaces)
  */
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -217,6 +221,36 @@ export function stepwiseEntries(c: CanarySet): MockEntry[] {
   ];
 }
 
+/**
+ * A fake password that the aria snapshot shows in a form none of the 8
+ * encodings matches: it holds `'`, `"`, `\`, `: ` and a run of spaces. The
+ * leak-guard canary inside it makes the guard catch any displayed copy too.
+ */
+export function quotedPasswordFor(canary: string): string {
+  return `${canary} it's "quoted" \\ a: b   c`;
+}
+
+/**
+ * Credentials of the aria snapshot suite (Issue #57): `trap-1` / `trap-2`
+ * are the fixture's account under separate rate-limit keys, `trap-quoted`
+ * carries the quoted password for the `/trap/echo/` page.
+ */
+export function trapEntries(c: CanarySet, quotedPassword: string): MockEntry[] {
+  const entry = (id: string, password: string): MockEntry => ({
+    id,
+    name: `Trap ${id}`,
+    uri: "http://127.0.0.1",
+    kind: "login",
+    username: c.username,
+    password,
+  });
+  return [
+    entry("trap-1", c.password),
+    entry("trap-2", c.password),
+    entry("trap-quoted", quotedPassword),
+  ];
+}
+
 export interface StepwiseStack {
   guard: LeakGuard;
   canaries: CanarySet;
@@ -224,6 +258,8 @@ export interface StepwiseStack {
   fixture: TargetFixture;
   mcp: McpSession;
   agentDir: string;
+  /** Password of the `trap-quoted` credential (`quotedPasswordFor`). */
+  quotedPassword: string;
   observe(label: string, value: unknown): void;
 }
 
@@ -251,6 +287,7 @@ export async function startStepwiseStack(
     totpSeed: guard.canary("totp_seed"),
     wrongPassword: guard.canary("wrong_password"),
   };
+  const quotedPassword = quotedPasswordFor(guard.canary("quoted_password"));
   const observe = (label: string, value: unknown) =>
     guard.observe(label, value);
   let daemon: StepwiseDaemon | undefined;
@@ -263,7 +300,10 @@ export async function startStepwiseStack(
         {
           type: "mock",
           namespace: "mock",
-          entries: stepwiseEntries(canaries),
+          entries: [
+            ...stepwiseEntries(canaries),
+            ...trapEntries(canaries, quotedPassword),
+          ],
           persistCookies: opts.persistCookies,
         },
       ],
@@ -275,7 +315,16 @@ export async function startStepwiseStack(
       totp_seed: canaries.totpSeed,
     });
     mcp = await connectMcp(daemon.socketPath, observe);
-    return { guard, canaries, daemon, fixture, mcp, agentDir, observe };
+    return {
+      guard,
+      canaries,
+      daemon,
+      fixture,
+      mcp,
+      agentDir,
+      quotedPassword,
+      observe,
+    };
   } catch (error) {
     await mcp?.close().catch(() => {});
     await fixture?.stop().catch(() => {});
@@ -316,23 +365,11 @@ export async function waitForBrowserCount(
   );
 }
 
-export interface SnapshotElement {
-  tag: string;
-  type?: string | null;
-  id?: string | null;
-  name?: string | null;
-  role?: string | null;
-  text?: string | null;
-  href?: string | null;
-  selector: string;
-  [key: string]: unknown;
-}
-
 export interface Snapshot {
   url: string;
   title: string;
-  text: string;
-  elements: SnapshotElement[];
+  /** The value-free AI aria snapshot, one node per line. */
+  page: string;
   settled: boolean;
   truncated?: boolean;
   [key: string]: unknown;

@@ -1,264 +1,74 @@
-/** 段階ログインのスナップショットを page 内で組み立て、secret の検査と上限の適用を行う。 */
+/** 段階ログインのスナップショット（値を除いた aria スナップショット）を組み立て、secret の検査と上限の適用を行う。 */
 
-/** スナップショットの text（document.body.innerText）の上限（文字数）。 */
-export const SNAPSHOT_TEXT_CHARS = 2000;
-/** 各要素の text の上限（文字数）。 */
-export const SNAPSHOT_ELEMENT_TEXT_CHARS = 200;
-/** 要素数の上限。 */
-export const SNAPSHOT_MAX_ELEMENTS = 200;
 /** 直列化したスナップショットの上限（バイト）。 */
 export const SNAPSHOT_MAX_BYTES = 64 * 1024;
-/**
- * page から切り詰めずに受け取る余白（文字数）。切り詰めの境界を跨いで現れた secret を検査で見落とさないよう、
- * 出力する範囲より長い文字列に対して検査を行う。
- */
-const INSPECTION_MARGIN_CHARS = 2048;
-// 要素をすべて削っても上限を超える場合に、title と url を切り詰める長さ（文字数）。
+// page をすべて削っても上限を超える場合に、title と url を切り詰める長さ（文字数）。
 const FALLBACK_TITLE_CHARS = 256;
 const FALLBACK_URL_CHARS = 2048;
 
 export const USERNAME_MASK = "[username]";
+/** 値を除いた欄の見出し行に付ける印。 */
+export const FILLED_MARK = " [filled]";
 
-/** page 内で収集した要素。selectors は一意に解決することを確認済みの候補を優先順に並べたものである。 */
-export type RawSnapshotElement = {
-  tag: string;
-  type?: string;
-  id?: string;
-  name?: string;
-  role?: string;
-  placeholder?: string;
-  "aria-label"?: string;
-  autocomplete?: string;
-  href?: string;
-  disabled: boolean;
-  text?: string;
-  selectors: string[];
-};
+/**
+ * 値を持つ役割。Playwright は input・textarea の値を explicit role によらず出力するため、page から集めた
+ * input・textarea の role 属性値と合わせて値の除去の対象とする。
+ */
+export const VALUE_ROLES: readonly string[] = [
+  "textbox",
+  "searchbox",
+  "spinbutton",
+  "slider",
+  "combobox",
+];
 
-export type RawSnapshot = {
-  title: string;
-  text: string;
-  elements: RawSnapshotElement[];
-};
-
-export type SnapshotElement = Omit<RawSnapshotElement, "selectors"> & {
-  selector: string;
-};
+/** ref の形式（`e<n>`、iframe 内は `f<n>e<n>`）。 */
+export const REF_PATTERN = /^(?:f\d+)?e\d+$/u;
+export const MAX_REF_LENGTH = 32;
 
 export type Snapshot = {
   url: string;
   title: string;
-  text: string;
-  elements: SnapshotElement[];
+  page: string;
   settled: boolean;
   truncated?: true;
 };
 
-export type SnapshotLimits = {
-  maxElements: number;
-  textChars: number;
-  elementTextChars: number;
+/** page から受け取ったスナップショットの素材。roles は page から集めた input・textarea の role 属性値である。 */
+export type RawAriaSnapshot = {
+  url: string;
+  title: string;
+  aria: string;
+  roles: readonly string[];
 };
 
-/** page 内で組み立てる際の上限。text は検査用の余白を含めて受け取る。 */
-export const PAGE_SNAPSHOT_LIMITS: SnapshotLimits = {
-  maxElements: SNAPSHOT_MAX_ELEMENTS,
-  textChars: SNAPSHOT_TEXT_CHARS + INSPECTION_MARGIN_CHARS,
-  elementTextChars: SNAPSHOT_ELEMENT_TEXT_CHARS + INSPECTION_MARGIN_CHARS,
+/** 検査済みのスナップショットと、その page の見出し行が持つ ref の集合。 */
+export type FinalizedSnapshot = {
+  snapshot: Snapshot;
+  refs: Set<string>;
 };
 
-/** スナップショットが既知の secret を含むために返せないことを表す。 */
+/** スナップショットが既知の secret を含むか、未知の形式であるために返せないことを表す。 */
 export class SnapshotRejectedError extends Error {}
 
 /**
- * page 内でスナップショットを組み立てる。page へシリアライズされるため、外部の識別子を参照してはならない。
- * input・textarea・select の値、value 属性、data-* 属性は読まない。許可リストの属性のみを読む。
- *
- * selector は Playwright の CSS の解決規則（open shadow root を貫通し、子結合子の親は shadow host とする）で
- * その要素 1 つにのみ一致するものだけを候補に入れる。一意な候補が無い要素は出力しない。
+ * page 内で、全ての文書（open shadow root を含む）の input[role]・textarea[role] の role 属性値を集める。
+ * page へシリアライズされるため、外部の識別子を参照してはならない。
  */
-export function buildSnapshotInPage(limits: SnapshotLimits): RawSnapshot {
-  const TARGET =
-    'button, a[href], input, select, textarea, [role="button"], [role="link"]';
-  const FORM_CONTROLS = "input, select, textarea";
-  const roots: Array<Document | ShadowRoot> = [];
-  const candidates: Element[] = [];
+export function collectExplicitRolesInPage(): string[] {
+  const roles: string[] = [];
   const walk = (root: Document | ShadowRoot): void => {
-    roots.push(root);
+    for (const element of Array.from(
+      root.querySelectorAll("input[role], textarea[role]"),
+    )) {
+      roles.push(element.getAttribute("role") ?? "");
+    }
     for (const element of Array.from(root.querySelectorAll("*"))) {
-      if (element.matches(TARGET)) candidates.push(element);
       if (element.shadowRoot !== null) walk(element.shadowRoot);
     }
   };
   walk(document);
-
-  const clean = (value: string, max: number): string =>
-    value.replace(/\s+/gu, " ").trim().slice(0, max);
-  const isVisible = (element: Element): boolean => {
-    const rect = element.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return false;
-    const style = getComputedStyle(element);
-    return style.visibility !== "hidden" && style.visibility !== "collapse";
-  };
-  const parentOrHost = (element: Element): Element | null => {
-    if (element.parentElement !== null) return element.parentElement;
-    const parent = element.parentNode;
-    return parent instanceof ShadowRoot ? parent.host : null;
-  };
-  const countSimple = (selector: string): number => {
-    let count = 0;
-    for (const root of roots) count += root.querySelectorAll(selector).length;
-    return count;
-  };
-  // 子結合子で連ねた経路を、親を shadow host まで辿る規則で数える。
-  const countPath = (steps: string[]): number => {
-    const last = steps[steps.length - 1];
-    let count = 0;
-    for (const root of roots) {
-      for (const element of Array.from(root.querySelectorAll(last))) {
-        let parent = parentOrHost(element);
-        let matched = true;
-        for (let index = steps.length - 2; index >= 0; index -= 1) {
-          if (parent === null || !parent.matches(steps[index])) {
-            matched = false;
-            break;
-          }
-          parent = parentOrHost(parent);
-        }
-        if (matched) count += 1;
-      }
-    }
-    return count;
-  };
-  const isUnique = (count: () => number): boolean => {
-    try {
-      return count() === 1;
-    } catch {
-      return false;
-    }
-  };
-  const idSelector = (element: Element): string | undefined => {
-    const id = element.getAttribute("id");
-    if (id === null || id === "") return undefined;
-    const selector = `#${CSS.escape(id)}`;
-    return isUnique(() => countSimple(selector)) ? selector : undefined;
-  };
-  const nthStep = (element: Element): string => {
-    let index = 1;
-    for (
-      let sibling = element.previousElementSibling;
-      sibling !== null;
-      sibling = sibling.previousElementSibling
-    ) {
-      if (sibling.localName === element.localName) index += 1;
-    }
-    return `${CSS.escape(element.localName)}:nth-of-type(${index})`;
-  };
-  // 一意な id を持つ最も近い祖先を起点とする経路と、文書の根を起点とする経路を返す。
-  const pathSelectors = (element: Element): string[] => {
-    const steps: string[] = [];
-    const selectors: string[] = [];
-    let anchored = false;
-    for (
-      let current: Element | null = element;
-      current !== null;
-      current = parentOrHost(current)
-    ) {
-      if (current !== element && !anchored) {
-        const anchor = idSelector(current);
-        if (anchor !== undefined) {
-          const anchoredSteps = [anchor, ...steps];
-          if (isUnique(() => countPath(anchoredSteps))) {
-            selectors.push(anchoredSteps.join(" > "));
-          }
-          anchored = true;
-        }
-      }
-      if (current === document.documentElement) {
-        steps.unshift("html");
-        break;
-      }
-      steps.unshift(nthStep(current));
-    }
-    if (steps[0] === "html" && isUnique(() => countPath(steps))) {
-      selectors.push(steps.join(" > "));
-    }
-    return selectors;
-  };
-  const selectorsOf = (element: Element): string[] => {
-    const selectors: string[] = [];
-    const byId = idSelector(element);
-    if (byId !== undefined) selectors.push(byId);
-    const name = element.getAttribute("name");
-    if (name !== null && name !== "") {
-      const byName = `${CSS.escape(element.localName)}[name="${CSS.escape(name)}"]`;
-      if (isUnique(() => countSimple(byName))) selectors.push(byName);
-    }
-    return [...selectors, ...pathSelectors(element)];
-  };
-  // label の中の欄の内容（textarea の既定値・select の選択肢）を含めないよう、欄を除いた複製の文字列を読む。
-  const labelText = (element: Element): string => {
-    const labels = (element as HTMLInputElement).labels;
-    if (labels === null || labels === undefined) return "";
-    return Array.from(labels)
-      .map((label) => {
-        const copy = label.cloneNode(true) as Element;
-        for (const control of Array.from(
-          copy.querySelectorAll(FORM_CONTROLS),
-        )) {
-          control.remove();
-        }
-        return copy.textContent ?? "";
-      })
-      .join(" ");
-  };
-  const textOf = (element: Element): string =>
-    element.matches(FORM_CONTROLS)
-      ? labelText(element)
-      : ((element as HTMLElement).innerText ?? "");
-  const typeOf = (element: Element): string | null =>
-    element instanceof HTMLInputElement || element instanceof HTMLButtonElement
-      ? element.type
-      : element.getAttribute("type");
-  const describe = (element: Element): RawSnapshotElement | undefined => {
-    const selectors = selectorsOf(element);
-    if (selectors.length === 0) return undefined;
-    const described: RawSnapshotElement = {
-      tag: element.localName,
-      disabled: element.matches(":disabled"),
-      selectors,
-    };
-    const optional: Array<[keyof RawSnapshotElement, string | null]> = [
-      ["type", typeOf(element)],
-      ["id", element.getAttribute("id")],
-      ["name", element.getAttribute("name")],
-      ["role", element.getAttribute("role")],
-      ["placeholder", element.getAttribute("placeholder")],
-      ["aria-label", element.getAttribute("aria-label")],
-      ["autocomplete", element.getAttribute("autocomplete")],
-      ["href", element instanceof HTMLAnchorElement ? element.href : null],
-      ["text", clean(textOf(element), limits.elementTextChars)],
-    ];
-    for (const [key, value] of optional) {
-      if (value !== null && value !== "") {
-        (described as Record<string, unknown>)[key] = value;
-      }
-    }
-    return described;
-  };
-
-  const elements: RawSnapshotElement[] = [];
-  for (const element of candidates) {
-    if (elements.length >= limits.maxElements) break;
-    if (!isVisible(element)) continue;
-    const described = describe(element);
-    if (described !== undefined) elements.push(described);
-  }
-  return {
-    title: document.title,
-    text: (document.body?.innerText ?? "").slice(0, limits.textChars),
-    elements,
-  };
+  return roles;
 }
 
 /**
@@ -329,6 +139,246 @@ export function clearFieldInPage(element: Element): void {
   }
 }
 
+/** aria スナップショットの 1 行。keyEnd は KEY の末尾（単引用符で包まれていれば閉じ `'` の位置）である。 */
+export type SnapshotLine = {
+  raw: string;
+  indent: number;
+  role: string;
+  name?: string;
+  attrs: string[];
+  quoted: boolean;
+  keyEnd: number;
+  value?: string;
+  opensChildren: boolean;
+};
+
+const LINE_PATTERN = /^( *)- ([\s\S]+)$/u;
+// KEY は role( NAME)?( [attr])* であり、NAME は JSON 文字列か、引用なしの /…/ である。
+const ROLE_PATTERN = /^\/?[a-z][a-z0-9-]*/u;
+const JSON_NAME_PATTERN = /^ ("(?:[^"\\]|\\[\s\S])*")/u;
+const ATTRS_PATTERN = /^(?: \[[a-z]+(?:=[A-Za-z0-9-]+)?\])*/u;
+const ATTR_PATTERN = /\[([^\]]*)\]/gu;
+
+type ParsedKey = { role: string; name?: string; attrs: string[] };
+type KeyMatch = ParsedKey & { length: number };
+
+/** KEY の後ろに続く部分が `: VALUE`・`:`・行末のいずれかであるかを返す。 */
+function isLineTail(tail: string): boolean {
+  return tail === "" || tail === ":" || /^: [\s\S]+$/u.test(tail);
+}
+
+/** 名前の後ろ（at 以降）の属性部を読み、その後ろが isTail を満たす場合に KEY を返す。 */
+function keyWithAttrs(
+  text: string,
+  role: string,
+  name: string | undefined,
+  at: number,
+  isTail: (tail: string) => boolean,
+): KeyMatch | undefined {
+  const attrsText = ATTRS_PATTERN.exec(text.slice(at))?.[0] ?? "";
+  const length = at + attrsText.length;
+  if (!isTail(text.slice(length))) return undefined;
+  const attrs = Array.from(attrsText.matchAll(ATTR_PATTERN), (attr) => attr[1]);
+  return { role, name, attrs, length };
+}
+
+/**
+ * 引用なしの /…/ の名前を持つ KEY を読む。名前の終端は、その後ろが属性部と isTail に合う最初の `/` とする。
+ * 引用なしの KEY では名前が `: ` を含まず（含めば KEY ごと単引用符で包まれる）、単引用符の KEY では後ろに何も続かないため、
+ * 名前の内側の `/` を終端とすると、名前の末尾の `/` が属性部か isTail に掛かって合わない。よってこの終端は一意である。
+ */
+function regexNameKey(
+  text: string,
+  role: string,
+  start: number,
+  isTail: (tail: string) => boolean,
+): KeyMatch | undefined {
+  for (
+    let end = text.indexOf("/", start);
+    end !== -1;
+    end = text.indexOf("/", end + 1)
+  ) {
+    const key = keyWithAttrs(
+      text,
+      role,
+      text.slice(start, end + 1),
+      end + 1,
+      isTail,
+    );
+    if (key !== undefined) return key;
+  }
+  return undefined;
+}
+
+/** KEY を先頭から読み、読んだ長さとともに返す。KEY の後ろが isTail を満たさなければ undefined を返す。 */
+function parseKeyPrefix(
+  text: string,
+  isTail: (tail: string) => boolean,
+): KeyMatch | undefined {
+  const role = ROLE_PATTERN.exec(text)?.[0];
+  if (role === undefined) return undefined;
+  const rest = text.slice(role.length);
+  const json = JSON_NAME_PATTERN.exec(rest);
+  if (json !== null) {
+    let name: string;
+    try {
+      name = JSON.parse(json[1]) as string;
+    } catch {
+      return undefined;
+    }
+    return keyWithAttrs(text, role, name, role.length + json[0].length, isTail);
+  }
+  if (rest.startsWith(" /")) {
+    return regexNameKey(text, role, role.length + 1, isTail);
+  }
+  return keyWithAttrs(text, role, undefined, role.length, isTail);
+}
+
+/** 単引用符で包まれた KEY の閉じ `'` の位置を返す。内側の `'` は `''` で表される。 */
+function closingQuoteIndex(body: string): number | undefined {
+  for (let index = 1; index < body.length; index += 1) {
+    if (body[index] !== "'") continue;
+    if (body[index + 1] === "'") {
+      index += 1;
+      continue;
+    }
+    return index;
+  }
+  return undefined;
+}
+
+/** `^(I)- KEY(: VALUE)?$` の形の行を読む。形に合わなければ undefined を返す。 */
+export function parseSnapshotLine(raw: string): SnapshotLine | undefined {
+  const match = LINE_PATTERN.exec(raw);
+  if (match === null) return undefined;
+  const indent = match[1].length;
+  const body = match[2];
+  const bodyStart = indent + 2;
+  let key: ParsedKey;
+  let tail: string;
+  let keyEnd: number;
+  const quoted = body.startsWith("'");
+  if (quoted) {
+    const close = closingQuoteIndex(body);
+    if (close === undefined) return undefined;
+    const inner = body.slice(1, close).replaceAll("''", "'");
+    const parsed = parseKeyPrefix(inner, (rest) => rest === "");
+    if (parsed === undefined) return undefined;
+    key = parsed;
+    tail = body.slice(close + 1);
+    keyEnd = bodyStart + close;
+  } else {
+    const parsed = parseKeyPrefix(body, isLineTail);
+    if (parsed === undefined) return undefined;
+    key = parsed;
+    tail = body.slice(parsed.length);
+    keyEnd = bodyStart + parsed.length;
+  }
+  if (!isLineTail(tail)) return undefined;
+  return {
+    raw,
+    indent,
+    ...key,
+    quoted,
+    keyEnd,
+    value: tail.startsWith(": ") ? tail.slice(2) : undefined,
+    opensChildren: tail === ":",
+  };
+}
+
+/** ariaSnapshot の出力を行に分ける。形に合わない行が 1 行でもあれば SnapshotRejectedError を送出する。 */
+export function parseSnapshotLines(aria: string): SnapshotLine[] {
+  if (aria === "") return [];
+  return aria.split("\n").map((raw) => {
+    const line = parseSnapshotLine(raw);
+    if (line === undefined) throw new SnapshotRejectedError();
+    return line;
+  });
+}
+
+/** ノードの見出し行ではない行（`- text:` と `- /url:` 等の属性行）かを返す。 */
+function isPseudoLine(line: SnapshotLine): boolean {
+  return line.role === "text" || line.role.startsWith("/");
+}
+
+function isTextLine(line: SnapshotLine): boolean {
+  return (
+    line.role === "text" &&
+    !line.quoted &&
+    line.name === undefined &&
+    line.attrs.length === 0 &&
+    line.value !== undefined
+  );
+}
+
+/** 値を除いた見出し行を書き戻す。inline の値は削り、filled なら KEY の末尾に印を付ける。 */
+function renderValueHeading(line: SnapshotLine, filled: boolean): string {
+  return `${line.raw.slice(0, line.keyEnd)}${filled ? FILLED_MARK : ""}${
+    line.quoted ? "'" : ""
+  }${line.opensChildren ? ":" : ""}`;
+}
+
+/**
+ * 対象役割の見出し行から値を除く。inline の値を削り、子を持つ行では直下（インデント +2）の `- text:` 行を削る。
+ * `- /…` の行・`- option` の行・それより深い行には触れない。空でない値を削った行に印を付ける。
+ */
+export function removeValues(
+  lines: readonly SnapshotLine[],
+  roles: ReadonlySet<string>,
+): string[] {
+  const isTarget = (line: SnapshotLine): boolean =>
+    !isPseudoLine(line) && roles.has(line.role);
+  const filled = new Set<number>();
+  const dropped = new Set<number>();
+  // 子を持つ祖先の行の添字を、インデントの浅い順に積む。
+  const ancestors: number[] = [];
+  lines.forEach((line, index) => {
+    while (
+      ancestors.length > 0 &&
+      lines[ancestors[ancestors.length - 1]].indent >= line.indent
+    ) {
+      ancestors.pop();
+    }
+    const parentIndex = ancestors[ancestors.length - 1];
+    const parent = parentIndex === undefined ? undefined : lines[parentIndex];
+    if (
+      parent !== undefined &&
+      isTarget(parent) &&
+      line.indent === parent.indent + 2 &&
+      isTextLine(line)
+    ) {
+      dropped.add(index);
+      filled.add(parentIndex);
+    }
+    if (isTarget(line) && line.value !== undefined && line.value !== '""') {
+      filled.add(index);
+    }
+    if (line.opensChildren) ancestors.push(index);
+  });
+  return lines.flatMap((line, index) => {
+    if (dropped.has(index)) return [];
+    return [
+      isTarget(line) ? renderValueHeading(line, filled.has(index)) : line.raw,
+    ];
+  });
+}
+
+/** page の見出し行の KEY の属性部にある ref を集める。名前・値・`- text:` の中の `[ref=…]` は数えない。 */
+export function collectRefs(page: string): Set<string> {
+  const refs = new Set<string>();
+  if (page === "") return refs;
+  for (const raw of page.split("\n")) {
+    const line = parseSnapshotLine(raw);
+    if (line === undefined || isPseudoLine(line)) continue;
+    for (const attr of line.attrs) {
+      if (!attr.startsWith("ref=")) continue;
+      const ref = attr.slice("ref=".length);
+      if (ref.length <= MAX_REF_LENGTH && REF_PATTERN.test(ref)) refs.add(ref);
+    }
+  }
+  return refs;
+}
+
 function escapeHtml(value: string): string {
   return value
     .replaceAll("&", "&amp;")
@@ -380,13 +430,73 @@ export function secretForms(value: string): string[] {
   ]);
 }
 
-/** username のマスク対象の形（生・HTML エスケープ・URL 符号化）を長い順に返す。 */
+/** Playwright の空白の正規化（U+200B・U+00AD の除去、前後の空白の除去、連続する空白の 1 個への置換）。 */
+function normalizeWhitespace(value: string): string {
+  return value
+    .replace(/[\u200b\u00ad]/gu, "")
+    .trim()
+    .replace(/\s+/gu, " ");
+}
+
+// Playwright の YAML 二重引用符のエスケープ。namedControls が偽なら、改行とタブ以外の制御文字を \xNN とする。
+function yamlEscape(value: string, namedControls: boolean): string {
+  const named: Record<string, string> = namedControls
+    ? { "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t" }
+    : { "\n": "\\n", "\t": "\\t" };
+  let escaped = "";
+  for (const character of value) {
+    const code = character.charCodeAt(0);
+    if (character === "\\") {
+      escaped += "\\\\";
+    } else if (character === '"') {
+      escaped += '\\"';
+    } else if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) {
+      escaped += named[character] ?? `\\x${code.toString(16).padStart(2, "0")}`;
+    } else {
+      escaped += character;
+    }
+  }
+  return escaped;
+}
+
+/**
+ * aria スナップショットに表示される形（表示形）。N は空白の正規化、J は名前の位置の JSON 文字列の内側、
+ * Y は値と `- text:` の位置の YAML 二重引用符の内側であり、それぞれの `'` を `''` にした単引用符キーの形を加える。
+ * Y は Playwright の実装（\b・\f・\r を名前付きで表す）と、制御文字を \xNN で表す形の両方を含める。
+ */
+export function displayForms(value: string): string[] {
+  const normalized = normalizeWhitespace(value);
+  if (normalized === "") return [];
+  const forms = [
+    normalized,
+    JSON.stringify(normalized).slice(1, -1),
+    yamlEscape(normalized, true),
+    yamlEscape(normalized, false),
+  ];
+  return nonEmptyUnique([
+    ...forms,
+    ...forms.map((form) => form.replaceAll("'", "''")),
+  ]);
+}
+
+/** 検査に用いる形。従来の 8 形を生の値と正規化した値の両方に適用し、表示形を加える。 */
+export function rejectionForms(value: string): string[] {
+  if (value === "") return [];
+  return nonEmptyUnique([
+    ...secretForms(value),
+    ...secretForms(normalizeWhitespace(value)),
+    ...displayForms(value),
+  ]);
+}
+
+/** username のマスク対象の形（生・HTML エスケープ・URL 符号化と表示形）を長い順に返す。 */
 function usernameForms(username: string): string[] {
   if (username === "") return [];
   return nonEmptyUnique([
     username,
     escapeHtml(username),
     tryEncodeURIComponent(username),
+    ...displayForms(username),
   ]).sort((left, right) => right.length - left.length);
 }
 
@@ -409,26 +519,8 @@ export function containsSecret(
   values: readonly string[],
   secrets: readonly string[],
 ): boolean {
-  const forms = secrets.flatMap(secretForms);
+  const forms = secrets.flatMap(rejectionForms);
   return values.some((value) => forms.some((form) => value.includes(form)));
-}
-
-function stringsOf(snapshot: {
-  url: string;
-  title: string;
-  text: string;
-  elements: ReadonlyArray<Record<string, unknown>>;
-}): string[] {
-  const elementStrings = snapshot.elements.flatMap((element) =>
-    Object.values(element).flatMap((value) =>
-      typeof value === "string"
-        ? [value]
-        : Array.isArray(value)
-          ? value.filter((item): item is string => typeof item === "string")
-          : [],
-    ),
-  );
-  return [snapshot.url, snapshot.title, snapshot.text, ...elementStrings];
 }
 
 function truncateChars(value: string, max: number): string {
@@ -436,56 +528,34 @@ function truncateChars(value: string, max: number): string {
   return characters.length <= max ? value : characters.slice(0, max).join("");
 }
 
-/** username を含まない候補を優先して selector を選ぶ。含む候補しか無い場合はマスクされた先頭の候補となる。 */
-function chooseSelector(selectors: string[], username: string): string {
-  return (
-    selectors.find(
-      (selector) => maskUsername(selector, username) === selector,
-    ) ?? selectors[0]
-  );
-}
-
-function toSnapshotElement(
-  element: RawSnapshotElement,
-  username: string,
-): SnapshotElement {
-  const { selectors, text, ...attributes } = element;
-  const masked: SnapshotElement = {
-    ...attributes,
-    selector: chooseSelector(selectors, username),
-  };
-  for (const [key, value] of Object.entries(masked)) {
-    if (typeof value === "string") {
-      (masked as Record<string, unknown>)[key] = maskUsername(value, username);
-    }
-  }
-  if (text !== undefined) {
-    masked.text = truncateChars(
-      maskUsername(text, username),
-      SNAPSHOT_ELEMENT_TEXT_CHARS,
-    );
-  }
-  return masked;
-}
-
 function serializedBytes(snapshot: Snapshot): number {
   return Buffer.byteLength(JSON.stringify(snapshot), "utf8");
 }
 
-/** 64 KiB の上限を超える分を elements の末尾から削る。それでも超える場合は title と url を切り詰める。 */
+/**
+ * 64 KiB の上限を超える場合に、truncated を付けたうえで上限に収まるまで page を末尾から行単位で削る。
+ * page をすべて削っても超える場合は title と url を切り詰める。
+ */
 function fitSnapshot(snapshot: Snapshot): Snapshot {
   if (serializedBytes(snapshot) <= SNAPSHOT_MAX_BYTES) return snapshot;
-  const fitted: Snapshot = {
+  const lines = snapshot.page === "" ? [] : snapshot.page.split("\n");
+  const keep = (count: number): Snapshot => ({
     ...snapshot,
-    elements: [...snapshot.elements],
+    page: lines.slice(0, count).join("\n"),
     truncated: true,
-  };
-  while (
-    fitted.elements.length > 0 &&
-    serializedBytes(fitted) > SNAPSHOT_MAX_BYTES
-  ) {
-    fitted.elements.pop();
+  });
+  // 行数に対して直列化の長さは単調に増えるため、収まる最大の行数を二分探索で求める。
+  let low = 0;
+  let high = lines.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (serializedBytes(keep(middle)) <= SNAPSHOT_MAX_BYTES) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
   }
+  const fitted = keep(low);
   if (serializedBytes(fitted) > SNAPSHOT_MAX_BYTES) {
     fitted.title = truncateChars(fitted.title, FALLBACK_TITLE_CHARS);
     fitted.url = truncateChars(fitted.url, FALLBACK_URL_CHARS);
@@ -493,34 +563,50 @@ function fitSnapshot(snapshot: Snapshot): Snapshot {
   return fitted;
 }
 
+/** page から集めた role 属性値を、空白で区切られた個々の役割の名前に分ける。 */
+function valueRoles(roles: readonly string[]): Set<string> {
+  return new Set([
+    ...VALUE_ROLES,
+    ...roles.flatMap((role) =>
+      role.split(/\s+/u).filter((name) => name !== ""),
+    ),
+  ]);
+}
+
 /**
- * page から受け取ったスナップショットを検査し、username をマスクして上限を適用する。
- * password または入力した TOTP コードのいずれかの形が、マスク前・マスク後・直列化結果のいずれかに完全一致で
- * 含まれる場合は SnapshotRejectedError を送出する。部分一致は判定しない。
+ * ariaSnapshot の出力から値を除き、username をマスクして上限を適用し、page の見出し行が持つ ref を集める。
+ * 形に合わない行がある場合と、password または入力した TOTP コードのいずれかの形が、マスク前・マスク後
+ * （いずれも切り詰め前の全文）・直列化結果のいずれかに完全一致で含まれる場合は SnapshotRejectedError を送出する。
+ * 部分一致は判定しない。
  */
 export function finalizeSnapshot(
-  raw: RawSnapshot,
-  url: string,
+  raw: RawAriaSnapshot,
   settled: boolean,
   secrets: SnapshotSecrets,
-): Snapshot {
+): FinalizedSnapshot {
+  const lines = parseSnapshotLines(raw.aria);
+  const page = removeValues(lines, valueRoles(raw.roles)).join("\n");
   const rejected = [secrets.password, ...secrets.totpCodes];
-  const rawStrings = stringsOf({ ...raw, url });
-  if (containsSecret(rawStrings, rejected)) throw new SnapshotRejectedError();
+  if (containsSecret([raw.url, raw.title, page], rejected)) {
+    throw new SnapshotRejectedError();
+  }
   const { username } = secrets;
-  const snapshot = fitSnapshot({
-    url: maskUsername(url, username),
+  const masked = {
+    url: maskUsername(raw.url, username),
     title: maskUsername(raw.title, username),
-    text: truncateChars(maskUsername(raw.text, username), SNAPSHOT_TEXT_CHARS),
-    elements: raw.elements.map((element) =>
-      toSnapshotElement(element, username),
-    ),
-    settled,
-  });
+    page: maskUsername(page, username),
+  };
+  if (containsSecret([masked.url, masked.title, masked.page], rejected)) {
+    throw new SnapshotRejectedError();
+  }
+  const snapshot = fitSnapshot({ ...masked, settled });
   if (
-    containsSecret([...stringsOf(snapshot), JSON.stringify(snapshot)], rejected)
+    containsSecret(
+      [snapshot.url, snapshot.title, snapshot.page, JSON.stringify(snapshot)],
+      rejected,
+    )
   ) {
     throw new SnapshotRejectedError();
   }
-  return snapshot;
+  return { snapshot, refs: collectRefs(snapshot.page) };
 }

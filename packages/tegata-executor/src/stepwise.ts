@@ -1,4 +1,4 @@
-/** 段階ログインの settle 判定と、入力した欄の消去を行う。 */
+/** 段階ログインの settle 判定、aria スナップショットの取得と、入力した欄の消去を行う。 */
 
 import {
   type ElementHandle,
@@ -9,9 +9,8 @@ import {
 } from "playwright-core";
 import {
   clearFieldInPage,
-  type RawSnapshot,
-  type RawSnapshotElement,
-  SNAPSHOT_MAX_ELEMENTS,
+  collectExplicitRolesInPage,
+  type RawAriaSnapshot,
   waitForDomQuietInPage,
 } from "./snapshot.js";
 
@@ -28,6 +27,10 @@ const SETTLE_MAX_ROUNDS = 3;
 const PAGE_EVALUATE_GRACE_MS = 1_000;
 // 1 つの欄の消去を待つ上限。
 const CLEAR_FIELD_TIMEOUT_MS = 5_000;
+/** ariaSnapshot の上限。 */
+export const ARIA_SNAPSHOT_TIMEOUT_MS = 10_000;
+// 1 つの frame から role 属性値を集めるのを待つ上限。
+const COLLECT_ROLES_TIMEOUT_MS = 5_000;
 
 /** main frame のナビゲーションを観測する。 */
 export type NavigationTracker = {
@@ -199,68 +202,51 @@ export async function disposeHandles(
   );
 }
 
-const OPTIONAL_ELEMENT_KEYS = [
-  "type",
-  "id",
-  "name",
-  "role",
-  "placeholder",
-  "aria-label",
-  "autocomplete",
-  "href",
-  "text",
-] as const;
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function toRawElement(value: unknown): RawSnapshotElement | undefined {
-  if (
-    !isObject(value) ||
-    typeof value.tag !== "string" ||
-    typeof value.disabled !== "boolean" ||
-    !Array.isArray(value.selectors)
-  ) {
-    return undefined;
-  }
-  const selectors = value.selectors.filter(
-    (selector): selector is string =>
-      typeof selector === "string" && selector !== "",
-  );
-  if (selectors.length === 0) return undefined;
-  const element: RawSnapshotElement = {
-    tag: value.tag,
-    disabled: value.disabled,
-    selectors,
-  };
-  for (const key of OPTIONAL_ELEMENT_KEYS) {
-    const field = value[key];
-    if (typeof field === "string" && field !== "") element[key] = field;
-  }
-  return element;
+/** page から返った値のうち文字列だけを写す。page は組み込みオブジェクトを改変して任意の値を返しうる。 */
+function stringsOf(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
 }
 
 /**
- * page から受け取った値を、許可リストの項目だけを写した形に整える。page は組み込みオブジェクトを改変して
- * 任意の値を返しうるため、形の不正な要素は捨て、許可リストにない項目（value 等）は写さない。
+ * 全 frame の input[role]・textarea[role] の role 属性値を集める。集められなかった frame は無視する。
+ * その frame の値が除去の対象から漏れても、password・TOTP は後段の検査で、username はマスクで扱われる。
  */
-export function sanitizeRawSnapshot(value: unknown): RawSnapshot {
-  if (
-    !isObject(value) ||
-    typeof value.title !== "string" ||
-    typeof value.text !== "string" ||
-    !Array.isArray(value.elements)
-  ) {
+async function collectExplicitRoles(page: Page): Promise<string[]> {
+  const perFrame = await Promise.all(
+    page.frames().map((frame) =>
+      withTimeout(
+        frame.evaluate(collectExplicitRolesInPage).catch(() => []),
+        COLLECT_ROLES_TIMEOUT_MS,
+        [],
+      ),
+    ),
+  );
+  return perFrame.flatMap(stringsOf);
+}
+
+/**
+ * ariaSnapshot（ai モード）を 1 回取り、その前後で集めた role 属性値とともに返す。
+ * aria-ref はこの呼び出しの結果に対して解決されるため、次の action を解決するまで ariaSnapshot を他の目的で呼んではならない。
+ */
+export async function captureAriaSnapshot(
+  page: Page,
+): Promise<RawAriaSnapshot> {
+  const before = await collectExplicitRoles(page);
+  const aria: unknown = await page.ariaSnapshot({
+    mode: "ai",
+    timeout: ARIA_SNAPSHOT_TIMEOUT_MS,
+  });
+  const after = await collectExplicitRoles(page);
+  const title: unknown = await page.title();
+  if (typeof aria !== "string") {
     throw new Error("the page returned a malformed snapshot");
   }
-  const elements = value.elements.flatMap((item) => {
-    const element = toRawElement(item);
-    return element === undefined ? [] : [element];
-  });
   return {
-    title: value.title,
-    text: value.text,
-    elements: elements.slice(0, SNAPSHOT_MAX_ELEMENTS),
+    url: page.url(),
+    title: typeof title === "string" ? title : "",
+    aria,
+    roles: [...new Set([...before, ...after])],
   };
 }

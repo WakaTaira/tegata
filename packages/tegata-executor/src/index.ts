@@ -12,6 +12,7 @@ import {
   type CDPSession,
   chromium,
   type ElementHandle,
+  type Frame,
   type Locator,
   type Page,
 } from "playwright-core";
@@ -43,16 +44,16 @@ import {
   tokenPollDeadline,
 } from "./oauth.js";
 import {
-  buildSnapshotInPage,
   finalizeSnapshot,
-  PAGE_SNAPSHOT_LIMITS,
+  MAX_REF_LENGTH,
+  REF_PATTERN,
   type Snapshot,
   SnapshotRejectedError,
 } from "./snapshot.js";
 import {
+  captureAriaSnapshot,
   clearFilledFields,
   disposeHandles,
-  sanitizeRawSnapshot,
   settlePage,
   trackNavigation,
 } from "./stepwise.js";
@@ -191,14 +192,16 @@ type LoginBeginRequest = {
   secret: { username: string; password: string };
 };
 
-type StepwiseFill = { selector: string; value: FillStep["value"] };
+/** 段階ログインで要素を指す形。ref は直前のスナップショットの見出し行の ref である。 */
+type ElementTarget = { ref: string } | { selector: string };
 
-type StepwiseSubmit = { click: string } | { press_enter: string };
+type StepwiseFill = ElementTarget & { value: FillStep["value"] };
+
+type StepwiseSubmit = { click: ElementTarget } | { press_enter: ElementTarget };
 
 type StepwiseAction =
-  | ClickStep
-  | WaitForStep
-  | { action: "fill"; selector: string; value: "{{username}}" }
+  | ({ action: "click" | "wait_for" } & ElementTarget)
+  | ({ action: "fill"; value: "{{username}}" } & ElementTarget)
   | { action: "fill_submit"; fills: StepwiseFill[]; submit: StepwiseSubmit }
   | { action: "snapshot" }
   | { action: "abort" };
@@ -238,6 +241,7 @@ type ErrorCode =
   | "LOGIN_RESULT_TIMEOUT"
   | "OAUTH_GRANT_FAILED"
   | "SNAPSHOT_REJECTED"
+  | "FILL_TARGET_REFUSED"
   | "INTERNAL";
 
 export class SelectorNotFoundError extends Error {
@@ -251,6 +255,9 @@ export class FillMismatchError extends Error {
     super();
   }
 }
+
+/** 値を入れる要素の frame の origin が main frame の origin と一致しないことを表す。 */
+export class FillTargetRefusedError extends Error {}
 
 export class InvalidCredentialError extends Error {}
 
@@ -412,7 +419,9 @@ export function classifyError(
             ? "LOGIN_RESULT_TIMEOUT"
             : error instanceof SnapshotRejectedError
               ? "SNAPSHOT_REJECTED"
-              : "INTERNAL";
+              : error instanceof FillTargetRefusedError
+                ? "FILL_TARGET_REFUSED"
+                : "INTERNAL";
 }
 
 type ClassifiedExecutionError = {
@@ -1011,15 +1020,40 @@ function parseStepwiseFills(value: unknown, id?: RequestId): StepwiseFill[] {
     throw new InvalidRequestError(id);
   }
   return value.map((fill): StepwiseFill => {
-    if (
-      !isRecord(fill) ||
-      typeof fill.selector !== "string" ||
-      !isSecretPlaceholder(fill.value)
-    ) {
+    if (!isRecord(fill) || !isSecretPlaceholder(fill.value)) {
       throw new InvalidRequestError(id);
     }
-    return { selector: fill.selector, value: fill.value };
+    return { ...parseElementTarget(fill, id), value: fill.value };
   });
+}
+
+function isRef(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= MAX_REF_LENGTH &&
+    REF_PATTERN.test(value)
+  );
+}
+
+/** ref と selector のどちらか一方のみを受け付ける。null は指定が無いものとして扱う。 */
+function parseElementTarget(
+  value: Record<string, unknown>,
+  id?: RequestId,
+): ElementTarget {
+  const hasRef = !isAbsent(value.ref);
+  const hasSelector = !isAbsent(value.selector);
+  if (hasRef && !hasSelector && isRef(value.ref)) return { ref: value.ref };
+  if (hasSelector && !hasRef && typeof value.selector === "string") {
+    return { selector: value.selector };
+  }
+  throw new InvalidRequestError(id);
+}
+
+/** submit の要素は、ref か selector を持つオブジェクトか、selector の省略形の文字列とする。 */
+function parseSubmitTarget(value: unknown, id?: RequestId): ElementTarget {
+  if (typeof value === "string") return { selector: value };
+  if (isRecord(value)) return parseElementTarget(value, id);
+  throw new InvalidRequestError(id);
 }
 
 /** click と press_enter のどちらか一方のみを受け付ける。 */
@@ -1027,11 +1061,11 @@ function parseStepwiseSubmit(value: unknown, id?: RequestId): StepwiseSubmit {
   if (!isRecord(value)) throw new InvalidRequestError(id);
   const hasClick = value.click !== undefined;
   const hasPressEnter = value.press_enter !== undefined;
-  if (hasClick && !hasPressEnter && typeof value.click === "string") {
-    return { click: value.click };
+  if (hasClick && !hasPressEnter) {
+    return { click: parseSubmitTarget(value.click, id) };
   }
-  if (hasPressEnter && !hasClick && typeof value.press_enter === "string") {
-    return { press_enter: value.press_enter };
+  if (hasPressEnter && !hasClick) {
+    return { press_enter: parseSubmitTarget(value.press_enter, id) };
   }
   throw new InvalidRequestError(id);
 }
@@ -1053,12 +1087,11 @@ function parseStepwiseAction(
       submit: parseStepwiseSubmit(value.submit, id),
     };
   }
-  if (typeof value.selector !== "string") throw new InvalidRequestError(id);
   if (action === "click" || action === "wait_for") {
-    return { action, selector: value.selector };
+    return { action, ...parseElementTarget(value, id) };
   }
   if (action === "fill" && value.value === "{{username}}") {
-    return { action, selector: value.selector, value: value.value };
+    return { action, ...parseElementTarget(value, id), value: value.value };
   }
   throw new InvalidRequestError(id);
 }
@@ -1734,6 +1767,20 @@ async function fillLocator(
   if (status !== "ok") throw new FillMismatchError(stepIndex);
 }
 
+/** ElementHandle の要素へ値を設定し、設定の検証に失敗した場合は FillMismatchError とする。 */
+async function fillHandle(
+  handle: ElementHandle,
+  value: string,
+  passwordOnly: boolean,
+  stepIndex?: number,
+): Promise<void> {
+  const status = await onRefElement(
+    () => handle.evaluate(setValueInPage, { value, passwordOnly }),
+    stepIndex,
+  );
+  if (status !== "ok") throw new FillMismatchError(stepIndex);
+}
+
 async function fill(
   page: Page,
   selector: string,
@@ -2389,6 +2436,8 @@ type StepwiseSession = {
   cookieValues: string[];
   totpCodes: string[];
   filled: ElementHandle[];
+  // 直前のスナップショットの見出し行が持つ ref。スナップショットを取るたびに置き換える。
+  refs: Set<string>;
   guardMonitored: boolean;
 };
 
@@ -2462,14 +2511,15 @@ async function takeStepwiseSnapshot(
   settled: boolean,
 ): Promise<Snapshot> {
   const { guard, page } = session;
-  const raw = await withGuard(guard, () =>
-    page.evaluate(buildSnapshotInPage, PAGE_SNAPSHOT_LIMITS),
-  );
-  return finalizeSnapshot(sanitizeRawSnapshot(raw), page.url(), settled, {
+  session.refs = new Set();
+  const raw = await withGuard(guard, () => captureAriaSnapshot(page));
+  const { snapshot, refs } = finalizeSnapshot(raw, settled, {
     username: session.secret.username,
     password: session.secret.password,
     totpCodes: session.totpCodes,
   });
+  session.refs = refs;
+  return snapshot;
 }
 
 /** 段階ログインを通常のブラウザセッションへ昇格させ、login の成功と同じ形の結果を返す。 */
@@ -2537,6 +2587,7 @@ async function beginStepwise(
     cookieValues: (request.cookies ?? []).map((cookie) => cookie.value),
     totpCodes: [],
     filled: [],
+    refs: new Set(),
     guardMonitored: false,
   };
   activeStepwise = session;
@@ -2549,6 +2600,150 @@ async function beginStepwise(
     page.goto(request.target_url, { waitUntil: "commit" }),
   );
   return concludeStepwise(session, settled, restored > 0);
+}
+
+// ref で解決した要素が、解決の後に文書や frame ごと失われたことを表す Playwright のエラー。
+const STALE_ELEMENT_MESSAGES = [
+  "Invalid frame in aria-ref selector",
+  "Execution context was destroyed",
+  "Element is not attached to the DOM",
+];
+
+function isStaleElementError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    STALE_ELEMENT_MESSAGES.some((message) => error.message.includes(message))
+  );
+}
+
+/** ref で解決した要素への操作の、待機の超過と要素の喪失を SelectorNotFoundError とする。 */
+async function onRefElement<T>(
+  operation: () => Promise<T>,
+  stepIndex?: number,
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (isTimeoutError(error) || isStaleElementError(error)) {
+      throw new SelectorNotFoundError(stepIndex);
+    }
+    throw error;
+  }
+}
+
+/**
+ * 直前のスナップショットにある ref を、待たずに 1 回だけ ElementHandle へ解決する。以後の判定と操作は
+ * この ElementHandle に対して行い、再解決しない（判定の後に frame が遷移しても、新しい文書へ入力しないため）。
+ */
+async function resolveRef(
+  session: StepwiseSession,
+  ref: string,
+  stepIndex?: number,
+): Promise<ElementHandle> {
+  if (!session.refs.has(ref)) throw new SelectorNotFoundError(stepIndex);
+  const handles = await onRefElement(
+    () => session.page.locator(`aria-ref=${ref}`).elementHandles(),
+    stepIndex,
+  );
+  const [handle, ...rest] = handles;
+  await disposeHandles(rest);
+  if (handle === undefined) throw new SelectorNotFoundError(stepIndex);
+  return handle;
+}
+
+/** URL の origin を返す。opaque な origin（about:blank・srcdoc・data: 等）と読めない URL は undefined とする。 */
+function tupleOrigin(url: string): string | undefined {
+  try {
+    const { origin } = new URL(url);
+    return origin === "null" ? undefined : origin;
+  } catch {
+    return undefined;
+  }
+}
+
+function mainFrameOrigin(page: Page): string | undefined {
+  return tupleOrigin(page.mainFrame().url());
+}
+
+/**
+ * 要素の frame の URL の origin が、その時点の main frame の URL の origin と一致するかを返す。
+ * frame の URL は CDP の frame tree に由来し、page の JS からは偽装できない。判定できない場合は一致しないとする。
+ */
+async function isSameOriginTarget(
+  page: Page,
+  handle: ElementHandle,
+): Promise<boolean> {
+  let frame: Frame | null;
+  try {
+    frame = await handle.ownerFrame();
+  } catch {
+    return false;
+  }
+  if (frame === null) return false;
+  const origin = tupleOrigin(frame.url());
+  return origin !== undefined && origin === mainFrameOrigin(page);
+}
+
+/**
+ * 値を入れる前に、ref の欄を解決し、全ての欄の frame の origin を確かめる。selector の欄は main frame で解決されるため、
+ * main frame の origin が opaque でないことを確かめる。1 つでも一致しなければ、どの欄にも値を入れずに
+ * FillTargetRefusedError とする。戻り値は fills と同じ順の ElementHandle（selector の欄は undefined）である。
+ */
+async function prepareStepwiseFills(
+  session: StepwiseSession,
+  targets: readonly ElementTarget[],
+  withStepIndex: boolean,
+): Promise<Array<ElementHandle | undefined>> {
+  const handles: Array<ElementHandle | undefined> = [];
+  try {
+    for (const [index, target] of targets.entries()) {
+      handles.push(
+        "ref" in target
+          ? await resolveRef(
+              session,
+              target.ref,
+              withStepIndex ? index : undefined,
+            )
+          : undefined,
+      );
+    }
+    for (const handle of handles) {
+      if (
+        handle !== undefined &&
+        !(await isSameOriginTarget(session.page, handle))
+      ) {
+        throw new FillTargetRefusedError();
+      }
+    }
+    if (
+      handles.includes(undefined) &&
+      mainFrameOrigin(session.page) === undefined
+    ) {
+      throw new FillTargetRefusedError();
+    }
+  } catch (error) {
+    await disposeHandles(definedHandles(handles));
+    throw error;
+  }
+  return handles;
+}
+
+function definedHandles(
+  handles: ReadonlyArray<ElementHandle | undefined>,
+): ElementHandle[] {
+  return handles.filter(
+    (handle): handle is ElementHandle => handle !== undefined,
+  );
+}
+
+/** 入力した欄を、失敗時の消去のために記録する。 */
+function recordFilled(
+  session: StepwiseSession,
+  handle: ElementHandle,
+  filled: ElementHandle[],
+): void {
+  filled.push(handle);
+  session.filled.push(handle);
 }
 
 /** 可視になった欄を記録してから #43 の fillLocator で値を入れる。 */
@@ -2570,26 +2765,155 @@ async function fillStepwiseField(
     throw error;
   }
   if (handle !== null) {
-    filled.push(handle);
-    session.filled.push(handle);
+    if (!(await isSameOriginTarget(session.page, handle))) {
+      await handle.dispose().catch(() => undefined);
+      throw new FillTargetRefusedError();
+    }
+    recordFilled(session, handle, filled);
   }
   await fillLocator(locator, value, passwordOnly, stepIndex);
 }
 
-async function submitStepwise(
-  page: Page,
-  submit: StepwiseSubmit,
+/** ref で解決した欄が可視になるのを待ち、記録してから #43 の検査つきで値を入れる。 */
+async function fillStepwiseHandle(
+  session: StepwiseSession,
+  handle: ElementHandle,
+  value: string,
+  passwordOnly: boolean,
+  filled: ElementHandle[],
+  stepIndex?: number,
+): Promise<void> {
+  await onRefElement(
+    () =>
+      handle.waitForElementState("visible", {
+        timeout: STEP_SELECTOR_TIMEOUT_MS,
+      }),
+    stepIndex,
+  );
+  recordFilled(session, handle, filled);
+  await fillHandle(handle, value, passwordOnly, stepIndex);
+}
+
+/** prepareStepwiseFills で確かめた欄へ、順に値を入れる。 */
+async function fillStepwiseTargets(
+  session: StepwiseSession,
+  fills: ReadonlyArray<{
+    target: ElementTarget;
+    value: string;
+    passwordOnly: boolean;
+  }>,
+  filled: ElementHandle[],
+  withStepIndex: boolean,
+): Promise<void> {
+  const handles = await prepareStepwiseFills(
+    session,
+    fills.map((fill) => fill.target),
+    withStepIndex,
+  );
+  try {
+    for (const [index, { target, value, passwordOnly }] of fills.entries()) {
+      const stepIndex = withStepIndex ? index : undefined;
+      const handle = handles[index];
+      if (handle !== undefined) {
+        await fillStepwiseHandle(
+          session,
+          handle,
+          value,
+          passwordOnly,
+          filled,
+          stepIndex,
+        );
+      } else if ("selector" in target) {
+        await fillStepwiseField(
+          session,
+          target.selector,
+          value,
+          passwordOnly,
+          filled,
+          stepIndex,
+        );
+      }
+    }
+  } finally {
+    // 入力に至らなかった ref の欄の ElementHandle を解放する。
+    await disposeHandles(
+      definedHandles(handles).filter((handle) => !filled.includes(handle)),
+    );
+  }
+}
+
+/** ref で解決した要素に対して操作を行い、その ElementHandle を解放する。 */
+async function withRefElement(
+  session: StepwiseSession,
+  ref: string,
+  stepIndex: number | undefined,
+  operation: (handle: ElementHandle) => Promise<unknown>,
+): Promise<void> {
+  const handle = await resolveRef(session, ref, stepIndex);
+  try {
+    await onRefElement(() => operation(handle), stepIndex);
+  } finally {
+    await handle.dispose().catch(() => undefined);
+  }
+}
+
+async function clickStepwise(
+  session: StepwiseSession,
+  target: ElementTarget,
+  stepIndex?: number,
+): Promise<void> {
+  if ("selector" in target) {
+    return click(session.page, target.selector, stepIndex);
+  }
+  await withRefElement(session, target.ref, stepIndex, (handle) =>
+    handle.click({ timeout: STEP_SELECTOR_TIMEOUT_MS }),
+  );
+}
+
+async function waitForStepwise(
+  session: StepwiseSession,
+  target: ElementTarget,
+): Promise<void> {
+  if ("selector" in target) {
+    return waitForVisible(session.page.locator(target.selector).first());
+  }
+  await withRefElement(session, target.ref, undefined, (handle) =>
+    handle.waitForElementState("visible", {
+      timeout: STEP_SELECTOR_TIMEOUT_MS,
+    }),
+  );
+}
+
+async function pressEnterStepwise(
+  session: StepwiseSession,
+  target: ElementTarget,
   stepIndex: number,
 ): Promise<void> {
-  if ("click" in submit) return click(page, submit.click, stepIndex);
+  if ("ref" in target) {
+    await withRefElement(session, target.ref, stepIndex, (handle) =>
+      handle.press("Enter", { timeout: STEP_SELECTOR_TIMEOUT_MS }),
+    );
+    return;
+  }
   try {
-    await page.press(submit.press_enter, "Enter", {
+    await session.page.press(target.selector, "Enter", {
       timeout: STEP_SELECTOR_TIMEOUT_MS,
     });
   } catch (error) {
     if (isTimeoutError(error)) throw new SelectorNotFoundError(stepIndex);
     throw error;
   }
+}
+
+async function submitStepwise(
+  session: StepwiseSession,
+  submit: StepwiseSubmit,
+  stepIndex: number,
+): Promise<void> {
+  if ("click" in submit) {
+    return clickStepwise(session, submit.click, stepIndex);
+  }
+  return pressEnterStepwise(session, submit.press_enter, stepIndex);
 }
 
 /**
@@ -2611,17 +2935,17 @@ async function fillAndSubmit(
   const filled: ElementHandle[] = [];
   try {
     return await runWithSettle(session, async () => {
-      for (const [index, fill] of action.fills.entries()) {
-        await fillStepwiseField(
-          session,
-          fill.selector,
-          substituteSecrets(fill.value, secret),
-          fill.value === "{{password}}",
-          filled,
-          index,
-        );
-      }
-      await submitStepwise(session.page, action.submit, action.fills.length);
+      await fillStepwiseTargets(
+        session,
+        action.fills.map((fill) => ({
+          target: fill,
+          value: substituteSecrets(fill.value, secret),
+          passwordOnly: fill.value === "{{password}}",
+        })),
+        filled,
+        true,
+      );
+      await submitStepwise(session, action.submit, action.fills.length);
     });
   } finally {
     await clearFilledFields(filled);
@@ -2634,22 +2958,24 @@ async function performStepwiseAction(
   request: LoginStepRequest,
 ): Promise<boolean> {
   const { action } = request;
-  const { page } = session;
   if (action.action === "fill_submit") {
     return fillAndSubmit(session, action, request.totp);
   }
   return runWithSettle(session, async () => {
-    if (action.action === "click") return click(page, action.selector);
-    if (action.action === "wait_for") {
-      return waitForVisible(page.locator(action.selector).first());
-    }
+    if (action.action === "click") return clickStepwise(session, action);
+    if (action.action === "wait_for") return waitForStepwise(session, action);
     if (action.action === "fill") {
-      return fillStepwiseField(
+      return fillStepwiseTargets(
         session,
-        action.selector,
-        session.secret.username,
-        false,
+        [
+          {
+            target: action,
+            value: session.secret.username,
+            passwordOnly: false,
+          },
+        ],
         [],
+        false,
       );
     }
   });

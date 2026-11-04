@@ -38,7 +38,6 @@ use tegata_core::wire::{
     ExecutorServiceStopRequest, LoginParams, OpenApiProxyParams, OpenMcpServerParams, RpcError,
     RpcRequest, RpcResponse,
 };
-#[cfg(unix)]
 use tegata_core::wire::{ExecutorHelloRequest, ExecutorHelloResponse};
 use tegata_core::{Secret, totp};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -1196,6 +1195,7 @@ async fn run_daemon(
         eprintln!("executor: socket {path} (uid {uid})");
     } else {
         eprintln!("executor: spawned by the daemon (browser is not isolated)");
+        validate_spawned_executor(&config).await?;
     }
     #[cfg(unix)]
     secure_fs::ensure_private_dir(Path::new(&config.state_dir))?;
@@ -1242,6 +1242,8 @@ async fn run_daemon(
     }
     #[cfg(windows)]
     eprintln!("executor: spawned by the daemon (browser is not isolated)");
+    #[cfg(windows)]
+    validate_spawned_executor(&config).await?;
     #[cfg(windows)]
     let (token_hash_path, _sealed_blob_path) = resolve_windows_paths(&config);
     #[cfg(unix)]
@@ -1337,7 +1339,7 @@ async fn validate_executor_socket(path: &str) -> Result<u32, io::Error> {
     let response: ExecutorHelloResponse =
         serde_json::from_str(&response_line).map_err(|error| executor_socket_error(path, error))?;
     if !response.ok {
-        return Err(executor_socket_error(path, "executor reported ok=false"));
+        return Err(executor_socket_error(path, executor_refusal(&response)));
     }
     if response.uid == Some(0) {
         return Err(io::Error::other("executor must not run as root"));
@@ -1353,6 +1355,70 @@ async fn validate_executor_socket(path: &str) -> Result<u32, io::Error> {
         ));
     }
     Ok(uid)
+}
+
+/// executor が hello を拒否したときの説明文を返す。executor が理由を添えていれば、それをそのまま含める。
+fn executor_refusal(response: &ExecutorHelloResponse) -> String {
+    match response.reason.as_deref() {
+        Some(reason) => format!("executor reported ok=false: {reason}"),
+        None => "executor reported ok=false".to_owned(),
+    }
+}
+
+/// spawn モードの executor を、リース時と同じ起動方法で 1 回起動し、起動前提を確かめる。
+///
+/// 完全版 Chromium の欠如などの前提不備は、リースのたびではなく起動時に止めるため、listen の前に行う。
+/// 応答の成否にかかわらず、executor は `shutdown` で終了させる。
+async fn validate_spawned_executor(config: &Config) -> Result<(), io::Error> {
+    let entry = resolve_executor_entry(config);
+    let node_path = resolve_node_path(config);
+    let browsers_path = resolve_browsers_path(config);
+    let mut executor = connect_executor(&entry, None, &node_path, browsers_path.as_deref())
+        .await
+        .map_err(|error| {
+            spawned_executor_error(
+                &entry,
+                format!(
+                    "the executor could not be started with node \"{}\": {error}",
+                    node_path.display()
+                ),
+            )
+        })?;
+    let response = request_executor_hello(&mut executor).await;
+    shutdown_executor_handle(&mut executor, 1).await;
+    let response = response.map_err(|error| spawned_executor_error(&entry, error))?;
+    if !response.ok {
+        return Err(spawned_executor_error(&entry, executor_refusal(&response)));
+    }
+    Ok(())
+}
+
+/// 起動済みの executor へ `hello` を 1 行送り、応答を解釈する。応答が無いまま終了した場合は失敗とする。
+async fn request_executor_hello(
+    executor: &mut ExecutorHandle,
+) -> Result<ExecutorHelloResponse, String> {
+    let mut request = serde_json::to_vec(&ExecutorHelloRequest { op: "hello" })
+        .map_err(|error| error.to_string())?;
+    request.push(b'\n');
+    executor
+        .write_line(&request)
+        .await
+        .map_err(|error| error.to_string())?;
+    let response_line = timeout(EXECUTOR_TIMEOUT, executor.read_line())
+        .await
+        .map_err(|_| "no response to hello".to_owned())?
+        .map_err(|error| error.to_string())?;
+    if response_line.is_empty() {
+        return Err("the executor exited without answering hello".to_owned());
+    }
+    serde_json::from_str(&response_line).map_err(|error| error.to_string())
+}
+
+fn spawned_executor_error(entry: &Path, error: impl fmt::Display) -> io::Error {
+    io::Error::other(format!(
+        "executor \"{}\" failed the startup check: {error}",
+        entry.display()
+    ))
 }
 
 async fn remove_legacy_password_dir(state_dir: &Path) {
@@ -4264,7 +4330,7 @@ async fn connect_executor(
     executor_socket: Option<&Path>,
     node_path: &Path,
     browsers_path: Option<&Path>,
-) -> Result<ExecutorHandle, ErrorCode> {
+) -> Result<ExecutorHandle, io::Error> {
     #[cfg(not(windows))]
     let _ = browsers_path;
     #[cfg(windows)]
@@ -4284,21 +4350,20 @@ async fn connect_executor(
     if let Some(socket) = executor_socket {
         let stream = timeout(EXECUTOR_TIMEOUT, tokio::net::UnixStream::connect(socket))
             .await
-            .map_err(|_| ErrorCode::Internal)?
-            .map_err(|_| ErrorCode::Internal)?;
+            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
         let (reader, writer) = stream.into_split();
         Ok(ExecutorHandle::Socket {
             reader: Arc::new(Mutex::new(reader)),
             writer,
         })
     } else {
-        let mut child = command.spawn().map_err(|_| ErrorCode::Internal)?;
+        let mut child = command.spawn()?;
         forward_executor_stderr(&mut child);
         Ok(ExecutorHandle::Spawned(child))
     }
     #[cfg(windows)]
     {
-        let mut child = command.spawn().map_err(|_| ErrorCode::Internal)?;
+        let mut child = command.spawn()?;
         forward_executor_stderr(&mut child);
         Ok(ExecutorHandle::Spawned(child))
     }
@@ -4379,7 +4444,9 @@ where
     T: Serialize,
     E: From<ErrorCode>,
 {
-    let mut executor = connect_executor(entry, executor_socket, node_path, browsers_path).await?;
+    let mut executor = connect_executor(entry, executor_socket, node_path, browsers_path)
+        .await
+        .map_err(|_| ErrorCode::Internal)?;
     let result = async {
         let response_line = exchange_first_request(&mut executor, build_request()).await?;
         parse_response(&response_line)
@@ -4541,7 +4608,9 @@ async fn authorize_device_with_executor(
     browsers_path: Option<&Path>,
     build_request: impl FnOnce() -> ExecutorAuthorizeDeviceRequest,
 ) -> Result<ReturnedCookies, ExecutorFailure> {
-    let mut executor = connect_executor(entry, executor_socket, node_path, browsers_path).await?;
+    let mut executor = connect_executor(entry, executor_socket, node_path, browsers_path)
+        .await
+        .map_err(|_| ErrorCode::Internal)?;
     let result = async {
         let response_line = exchange_first_request(&mut executor, build_request()).await?;
         let response: ExecutorResponse =

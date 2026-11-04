@@ -214,10 +214,12 @@ pkgs.testers.runNixOSTest {
         # Given: the AC-18 session is still within the daemon's TTL window
         # When: the Chromium process owner is inspected
         # Then: it is owned by the executor user, never by the daemon's own user
-        # Playwright's headless launch runs chrome-headless-shell, whose comm
-        # is truncated to 15 chars, so match on the full command line with -f.
-        machine.succeed("pgrep -u tegata-browser -f chrome-headless-shell")
-        machine.fail("pgrep -u tegata -f chrome-headless-shell")
+        # ログイン用ブラウザは完全版 Chromium（新ヘッドレス）である。nix の
+        # chrome は bash ラッパで、プロセスの cmdline は
+        # `.../chrome-linux64/.chrome-wrapped --headless ...` となる。comm は
+        # 15 文字で切り詰められるため、-f で cmdline 全体を照合する。
+        machine.succeed("pgrep -u tegata-browser -f 'chrome-linux64/'")
+        machine.fail("pgrep -u tegata -f 'chrome-linux64/'")
 
     with subtest("AC-52d: the daemon process holds no capabilities"):
         # Given: the same AC-18 session
@@ -230,5 +232,18 @@ pkgs.testers.runNixOSTest {
         assert "0000000000000000" in cap_eff, (
             f"expected CapEff 0000000000000000, got: {cap_eff!r}"
         )
+
+    with subtest("AC-205: the full Chromium build runs as the browser worker"):
+        # Traceability: docs/secret/briefs/tegata-issue60-browser-not-announcing.md AC-205.
+        # Given: services.tegata が有効な NixOS VM
+        # When: login を 1 回行う（AC-18 の login。そのセッションは TTL 内で生きている）
+        # Then: chrome-linux64/ を含むプロセスが tegata-browser の uid で動き、tegata の uid
+        # では動いていない。chrome-headless-shell のプロセスはどの uid でも動いていない。
+        # nix の chrome はラッパのためプロセス名は .chrome-wrapped になるので、-f で
+        # コマンドライン中のパスを照合する。uid を絞らない検査は、検査コマンド自身を
+        # 含む親プロセスの argv に一致しないよう、文字クラスで表記する。
+        machine.succeed("pgrep -u tegata-browser -f 'chrome-linux64/'")
+        machine.fail("pgrep -u tegata -f 'chrome-linux64/'")
+        machine.fail("pgrep -f 'chrome-headless-shel[l]'")
   '';
 }

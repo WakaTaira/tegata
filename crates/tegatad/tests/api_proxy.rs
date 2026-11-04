@@ -32,6 +32,7 @@ const event = (path, status) =>
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   log(request);
   if (request.op === "api_proxy_start") {
     process.stdout.write(JSON.stringify({ id: request.id, ok: true, port: 38998, secret: "fake-path-secret_A1" }) + "\n");
@@ -57,6 +58,7 @@ const event = (path, status) =>
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   if (request.op === "api_proxy_start") {
     process.stdout.write(JSON.stringify({ id: request.id, ok: true, port: 38998, secret: "fake-path-secret_A1" }) + "\n");
     event("/Ax7fQ2mN9pL3kR8sT1vW0y/api/whoami", 401);
@@ -74,6 +76,7 @@ const readline = require("node:readline");
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   if (request.op === "api_proxy_start") {
     process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: "INTERNAL" }) + "\n");
   }
@@ -89,6 +92,7 @@ const event = (action) =>
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   log(request);
   if (request.op === "api_proxy_start") {
     process.stdout.write(JSON.stringify({ id: request.id, ok: true, port: 38998, secret: "fake-path-secret_A1" }) + "\n");
@@ -110,6 +114,7 @@ const readline = require("node:readline");
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   if (request.op === "api_proxy_start") {
     process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: "OAUTH_GRANT_FAILED" }) + "\n");
   }
@@ -127,6 +132,7 @@ const event = (action) =>
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   log(request);
   if (request.op === "api_proxy_start") {
     process.stdout.write(JSON.stringify({ id: request.id, ok: true, port: 38998, secret: "fake-path-secret_A1" }) + "\n");
@@ -199,7 +205,11 @@ impl Layout {
         let socket_path = directory.join("tegatad.sock");
         let config_path = directory.join("config.toml");
         let executor_path = directory.join("executor.js");
-        std::fs::write(&executor_path, options.executor).expect("write executor script");
+        std::fs::write(
+            &executor_path,
+            common::fake_executor_source(options.executor),
+        )
+        .expect("write executor script");
         let mut top = format!(
             "socket_path = {:?}\nstate_dir = {:?}\naudit_log_path = {:?}\nallowed_uids = [{}]\nexecutor_entry = {:?}\n",
             socket_path,

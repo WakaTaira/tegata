@@ -1,14 +1,13 @@
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
 
 use uuid::Uuid;
+
+mod common;
+use common::wait_for_status;
 
 fn test_directory(label: &str) -> PathBuf {
     let directory =
@@ -21,12 +20,14 @@ fn write_config(directory: &Path, state_dir: &Path) -> PathBuf {
     let config_path = directory.join("config.toml");
     let socket_path = directory.join("tegatad.sock");
     let uid = unsafe { libc::geteuid() };
+    let executor = common::write_probe_only_executor(directory);
     let config = format!(
-        "state_dir = {:?}\naudit_log_path = {:?}\nsocket_path = {:?}\nallowed_uids = [{}]\n",
+        "state_dir = {:?}\naudit_log_path = {:?}\nsocket_path = {:?}\nallowed_uids = [{}]\nexecutor_entry = {:?}\n",
         state_dir,
         state_dir.join("audit.log"),
         socket_path,
         uid,
+        executor,
     );
     std::fs::write(&config_path, config).expect("write test config");
     config_path
@@ -108,23 +109,4 @@ fn creates_missing_state_dir_with_private_mode() {
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&directory);
-}
-
-fn wait_for_status(socket_path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if let Ok(mut stream) = UnixStream::connect(socket_path) {
-            let request = r#"{"jsonrpc":"2.0","id":1,"method":"status","params":{}}"#;
-            if writeln!(stream, "{request}").is_ok() {
-                let mut response = String::new();
-                if BufReader::new(stream).read_line(&mut response).is_ok()
-                    && response.contains("\"result\"")
-                {
-                    return;
-                }
-            }
-        }
-        sleep(Duration::from_millis(25));
-    }
-    panic!("tegatad did not become ready");
 }

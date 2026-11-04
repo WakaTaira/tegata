@@ -22,14 +22,16 @@ fn assert_refused_on_unix(approve_operator: bool) {
     create_private_dir(&state_dir);
     let config_path = directory.join("config.toml");
     let uid = unsafe { libc::geteuid() };
+    let executor = common::write_probe_only_executor(&directory);
     std::fs::write(
         &config_path,
         format!(
-            "state_dir = {:?}\naudit_log_path = {:?}\nsocket_path = {:?}\nallowed_uids = [{}]\napprove_operator = {}\n",
+            "state_dir = {:?}\naudit_log_path = {:?}\nsocket_path = {:?}\nallowed_uids = [{}]\nexecutor_entry = {:?}\napprove_operator = {}\n",
             state_dir,
             state_dir.join("audit.log"),
             directory.join("tegatad.sock"),
             uid,
+            executor,
             approve_operator,
         ),
     )

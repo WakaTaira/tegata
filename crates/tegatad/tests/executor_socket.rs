@@ -98,6 +98,37 @@ fn refuses_executor_socket_that_reports_not_ok() {
     assert!(stderr.contains("executor socket \"") && stderr.contains("executor reported ok=false"));
 }
 
+/// Given: ソケットの executor が hello に `ok: false` と拒否理由を返す
+/// When: デーモンを起動する
+/// Then: 起動を中止し、標準エラーに拒否理由をそのまま含める
+#[test]
+fn refuses_executor_socket_and_reports_its_reason() {
+    let reason = "Full Chromium is required; a browser installed with --only-shell cannot be used (PLAYWRIGHT_BROWSERS_PATH=/nowhere)";
+    let directory = test_directory();
+    let executor_socket = directory.join("executor.sock");
+    let listener = UnixListener::bind(&executor_socket).expect("bind executor socket");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept executor connection");
+        let mut request = String::new();
+        BufReader::new(stream.try_clone().expect("clone executor stream"))
+            .read_line(&mut request)
+            .expect("read hello request");
+        assert_eq!(request, "{\"op\":\"hello\"}\n");
+        let response = serde_json::json!({ "ok": false, "uid": null, "pid": 1, "reason": reason });
+        writeln!(stream, "{response}").expect("write hello response");
+    });
+    let config_path = write_config(&directory, &executor_socket);
+
+    let output = run_daemon(&config_path);
+    server.join().expect("join executor server");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let _ = std::fs::remove_dir_all(&directory);
+
+    assert!(!output.status.success());
+    assert!(stderr.contains("executor reported ok=false"), "{stderr}");
+    assert!(stderr.contains(reason), "{stderr}");
+}
+
 #[test]
 fn refuses_executor_socket_running_as_root() {
     let directory = test_directory();

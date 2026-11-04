@@ -50,10 +50,12 @@ fn start_daemon(max_pending_connections: Option<usize>) -> Daemon {
     let max_pending = max_pending_connections
         .map(|value| format!("max_pending_connections = {value}\n"))
         .unwrap_or_default();
+    let executor = common::write_probe_only_executor(&directory);
     let config = format!(
-        "state_dir = {:?}\naudit_log_path = {:?}\n{}\n[[listen]]\nkind = \"unix\"\npath = {:?}\nallowed_uids = [{}]\noperator_uids = [{}]\n\n[[listen]]\nkind = \"tcp\"\nbind = \"127.0.0.1\"\nport = {}\n",
+        "state_dir = {:?}\naudit_log_path = {:?}\nexecutor_entry = {:?}\n{}\n[[listen]]\nkind = \"unix\"\npath = {:?}\nallowed_uids = [{}]\noperator_uids = [{}]\n\n[[listen]]\nkind = \"tcp\"\nbind = \"127.0.0.1\"\nport = {}\n",
         state_dir,
         state_dir.join("audit.log"),
+        executor,
         max_pending,
         socket_path,
         unsafe { libc::geteuid() },
@@ -202,13 +204,15 @@ fn listen_and_legacy_socket_key_are_mutually_exclusive() {
 fn unspecified_tcp_bind_is_rejected() {
     let directory = std::env::temp_dir().join(format!("tegatad-listen-invalid-{}", Uuid::new_v4()));
     std::fs::create_dir(&directory).expect("create test directory");
+    let executor = common::write_probe_only_executor(&directory);
     let config_path = directory.join("config.toml");
     std::fs::write(
         &config_path,
         format!(
-            "state_dir = {:?}\naudit_log_path = {:?}\n\n[[listen]]\nkind = \"tcp\"\nbind = \"0.0.0.0\"\nport = 1\n",
+            "state_dir = {:?}\naudit_log_path = {:?}\nexecutor_entry = {:?}\n\n[[listen]]\nkind = \"tcp\"\nbind = \"0.0.0.0\"\nport = 1\n",
             directory.join("state"),
             directory.join("audit.log"),
+            executor,
         ),
     )
     .expect("write invalid config");

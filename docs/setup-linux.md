@@ -121,6 +121,13 @@ sudo install -d -o root -g root -m 0755 /opt/tegata/browsers
 sudo env PLAYWRIGHT_BROWSERS_PATH=/opt/tegata/browsers npx playwright-core@1.61.1 install chromium
 ```
 
+tegata needs the full Chromium build, not only the headless shell: an install
+with `--only-shell` does not work, and without the full build the daemon refuses
+to start. The `install chromium` command above is sufficient, because it installs
+both the full build and the headless shell. Each browser uses more memory than the
+headless shell did: on Linux, about 430 MiB PSS with example.com open, up from
+about 210 MiB.
+
 Run the daemon as a dedicated user with a systemd unit of your own:
 
 ```ini

@@ -30,6 +30,7 @@ fs.writeFileSync(__filename + ".pid", String(process.pid));
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   if (request.op === "login") {
     process.stdout.write(
       JSON.stringify({ id: request.id, ok: true, endpoint: "ws://127.0.0.1:38999/devtools/browser/test", target_id: "test-target" }) + "\n",
@@ -54,6 +55,7 @@ fs.writeFileSync(__filename + ".pid", String(process.pid));
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   if (request.op === "login") {
     process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: "INVALID_CREDENTIAL" }) + "\n");
   } else if (request.op === "shutdown") {
@@ -69,6 +71,7 @@ const readline = require("node:readline");
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   if (request.op === "login") {
     process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: "SELECTOR_NOT_FOUND", step: 1 }) + "\n");
   } else if (request.op === "shutdown") {
@@ -83,6 +86,7 @@ const readline = require("node:readline");
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   if (request.op === "authorize_device") {
     process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: "SELECTOR_NOT_FOUND", step: 0 }) + "\n");
   } else if (request.op === "shutdown") {
@@ -97,6 +101,7 @@ const readline = require("node:readline");
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   if (request.op === "login") {
     process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: "SELECTOR_NOT_FOUND", step: -1 }) + "\n");
   } else if (request.op === "shutdown") {
@@ -111,6 +116,7 @@ const readline = require("node:readline");
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   if (request.op === "authorize_device") {
     process.stdout.write(JSON.stringify({ id: request.id, ok: true, endpoint: "ws://127.0.0.1:38999/devtools/browser/test" }) + "\n");
   } else if (request.op === "shutdown") {
@@ -125,6 +131,7 @@ const readline = require("node:readline");
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   if (request.op === "authorize_device") {
     process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: "DEVICE_CODE_REJECTED" }) + "\n");
   } else if (request.op === "shutdown") {
@@ -183,13 +190,16 @@ impl Daemon {
         let socket_path = directory.join("tegatad.sock");
         let config_path = directory.join("config.toml");
         let uid = unsafe { libc::geteuid() };
-        let executor_line = executor_script
-            .map(|script| {
+        let script_path = match executor_script {
+            Some(script) => {
                 let script_path = directory.join("executor.js");
-                std::fs::write(&script_path, script).expect("write executor script");
-                format!("executor_entry = {script_path:?}\n")
-            })
-            .unwrap_or_default();
+                std::fs::write(&script_path, common::fake_executor_source(script))
+                    .expect("write executor script");
+                script_path
+            }
+            None => common::write_probe_only_executor(&directory),
+        };
+        let executor_line = format!("executor_entry = {script_path:?}\n");
         let approval_line = approve_cmd
             .map(|approve_cmd| format!("approve_cmd = {:?}\n", approve_cmd(&directory)))
             .unwrap_or_default();

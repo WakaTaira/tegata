@@ -82,6 +82,19 @@ const stepwiseInputs: StepwiseInput[] = [];
 const stepwiseTotp: Array<{ code: string; valid: boolean }> = [];
 const stepwiseStickyReports: StepwiseStickyReport[] = [];
 
+// State of the /fingerprint/ site (Issue #60). Every document request's
+// identifying headers and every page-side observation are recorded in order.
+interface FingerprintRequest {
+  seq: number;
+  nonce: string;
+  logged_in: boolean;
+  user_agent: string | null;
+  sec_ch_ua: string | null;
+  sec_fetch_dest: string | null;
+}
+const fingerprintRequests: FingerprintRequest[] = [];
+const fingerprintObservations: Array<Record<string, unknown>> = [];
+
 function usageError(message: string): never {
   throw new Error(message);
 }
@@ -1893,6 +1906,157 @@ function handleDeviceCookieRequest(
   return true;
 }
 
+/**
+ * /fingerprint/ の文書応答。ページの JS は読み込み完了後に観測値を記録 API へ送る。
+ * 観測値は応答ごとの nonce で、サーバが記録した文書リクエストのヘッダと対応づける。
+ */
+function fingerprintPage(
+  nonce: string,
+  loggedIn: boolean,
+  error: boolean,
+): string {
+  const content = loggedIn
+    ? '<div id="welcome">login-ok</div>'
+    : `${error ? '<div id="login-error">invalid credentials</div>' : ""}
+<form method="POST" action="/fingerprint/login">
+<input id="username" name="username">
+<input id="password" name="password" type="password">
+<button id="submit" type="submit">Log in</button>
+</form>`;
+  return `<!doctype html>
+<html lang="en">
+<body>
+${content}
+<script>
+const observeFingerprint = () => {
+  const uaData = navigator.userAgentData;
+  const observation = {
+    nonce: ${JSON.stringify(nonce)},
+    logged_in: ${loggedIn},
+    webdriver: navigator.webdriver,
+    plugins_length: navigator.plugins.length,
+    chrome_type: typeof window.chrome,
+    user_agent: navigator.userAgent,
+    brands: uaData === undefined
+      ? null
+      : uaData.brands.map((entry) => ({ brand: entry.brand, version: entry.version })),
+    screen_width: screen.width,
+    screen_height: screen.height,
+    outer_width: window.outerWidth,
+    outer_height: window.outerHeight,
+    inner_width: window.innerWidth,
+    inner_height: window.innerHeight
+  };
+  fetch("/fingerprint/observations", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(observation)
+  }).catch(() => {});
+};
+if (document.readyState === "complete") observeFingerprint();
+else window.addEventListener("load", observeFingerprint);
+</script>
+</body>
+</html>`;
+}
+
+function headerValue(value: string | string[] | undefined): string | null {
+  if (value === undefined) return null;
+  return Array.isArray(value) ? value.join(", ") : value;
+}
+
+/** /fingerprint/ への文書リクエストを記録し、対応づけ用の nonce を返す。 */
+function recordFingerprintRequest(
+  request: IncomingMessage,
+  loggedIn: boolean,
+): string {
+  const nonce = randomBytes(16).toString("hex");
+  fingerprintRequests.push({
+    seq: fingerprintRequests.length,
+    nonce,
+    logged_in: loggedIn,
+    user_agent: headerValue(request.headers["user-agent"]),
+    sec_ch_ua: headerValue(request.headers["sec-ch-ua"]),
+    sec_fetch_dest: headerValue(request.headers["sec-fetch-dest"]),
+  });
+  return nonce;
+}
+
+function handleFingerprintLogin(
+  request: IncomingMessage,
+  response: ServerResponse,
+  credentials: Credentials,
+): void {
+  readRequestBody(request, (body) => {
+    const form = new URLSearchParams(body);
+    if (
+      form.get("username") === credentials.username &&
+      form.get("password") === credentials.password
+    ) {
+      const session = randomBytes(32).toString("hex");
+      sessions.set(session, true);
+      response.writeHead(303, {
+        Location: "/fingerprint/",
+        "Set-Cookie": `session=${session}; HttpOnly; Path=/; SameSite=Lax`,
+      });
+      response.end();
+      return;
+    }
+    const nonce = recordFingerprintRequest(request, false);
+    writePage(response, fingerprintPage(nonce, false, true));
+  });
+}
+
+function handleFingerprintObservation(
+  request: IncomingMessage,
+  response: ServerResponse,
+): void {
+  readRequestBody(request, (body) => {
+    try {
+      const value: unknown = JSON.parse(body);
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        writeJson(response, 400, { error: "invalid_observation" });
+        return;
+      }
+      fingerprintObservations.push(value as Record<string, unknown>);
+      writeJson(response, 200, { ok: true });
+    } catch {
+      writeJson(response, 400, { error: "invalid_observation" });
+    }
+  });
+}
+
+/**
+ * ブラウザの名乗りを観測する経路（Issue #60）を処理する。該当しない要求には false を返す。
+ * 未ログインでもログインフォームとともに観測スクリプトを返すため、どの context で
+ * 開かれたタブでも観測値が記録される。
+ */
+function handleFingerprintRequest(
+  request: IncomingMessage,
+  response: ServerResponse,
+  credentials: Credentials,
+): boolean {
+  const route = `${request.method} ${request.url}`;
+  if (route === "GET /fingerprint/") {
+    const session = sessionFrom(request);
+    const loggedIn = session !== undefined && sessions.has(session);
+    const nonce = recordFingerprintRequest(request, loggedIn);
+    writePage(response, fingerprintPage(nonce, loggedIn, false));
+  } else if (route === "POST /fingerprint/login") {
+    handleFingerprintLogin(request, response, credentials);
+  } else if (route === "POST /fingerprint/observations") {
+    handleFingerprintObservation(request, response);
+  } else if (route === "GET /fingerprint/state") {
+    writeJson(response, 200, {
+      requests: fingerprintRequests,
+      observations: fingerprintObservations,
+    });
+  } else {
+    return false;
+  }
+  return true;
+}
+
 /** OAuth 認可サーバーと保護 API の経路を処理する。該当しない要求には false を返す。 */
 function handleOAuthRequest(
   request: IncomingMessage,
@@ -2103,6 +2267,8 @@ function handleRequest(
   if (handleStepwiseRequest(request, response, credentials)) return;
 
   if (handleTrapRequest(request, response, credentials)) return;
+
+  if (handleFingerprintRequest(request, response, credentials)) return;
 
   if (request.method === "POST" && request.url === "/device/issue") {
     const userCode = newDeviceCode();

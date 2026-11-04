@@ -62,6 +62,12 @@ launcher is elevated and the gate is open; fix the launcher first.
   npx playwright-core@1.61.1 install chromium
   ```
 
+  tegata needs the full Chromium build, not only the headless shell: an install
+  with `--only-shell` does not work, and without the full build the daemon
+  refuses to start. The command above installs both. Each browser uses more
+  memory than the headless shell did (on Linux, about 430 MiB PSS with
+  example.com open, up from about 210 MiB).
+
 The service account needs read access to the browser directory. `service install`
 sets that up for the configured path; if you install the browsers afterwards,
 grant the ACL yourself.

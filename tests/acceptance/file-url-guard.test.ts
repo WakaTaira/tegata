@@ -104,20 +104,29 @@ async function navigateAndInspect(
   client: CdpClient,
   sessionId: string,
   url: string,
-): Promise<{ errorText: unknown; innerText: unknown }> {
+): Promise<{ errorText: unknown; innerText: unknown; href: unknown }> {
   const navResult = await client.send("Page.navigate", { url }, sessionId);
   // ガードによる遮断は非同期に効くことがあるため、少し待ってから DOM を読む。
   await new Promise((r) => setTimeout(r, 1_500));
   const evalResult = await client.send(
     "Runtime.evaluate",
     {
-      expression: "document.body ? document.body.innerText : ''",
+      expression:
+        "JSON.stringify({ href: location.href, text: document.body ? document.body.innerText : '' })",
       returnByValue: true,
     },
     sessionId,
   );
-  const result = evalResult.result as { value?: unknown };
-  return { errorText: navResult.errorText, innerText: result?.value };
+  const result = evalResult.result as { value?: string };
+  const page = JSON.parse(result?.value ?? "{}") as {
+    href?: unknown;
+    text?: unknown;
+  };
+  return {
+    errorText: navResult.errorText,
+    innerText: page.text,
+    href: page.href,
+  };
 }
 
 test("AC-53a: navigating to a local file:// URL is denied and yields no page content", async () => {
@@ -136,15 +145,15 @@ test("AC-53a: navigating to a local file:// URL is denied and yields no page con
     const { sessionId } = await openPageSession(client);
 
     // When: そのファイルの file:// URL へ遷移する
-    const { errorText, innerText } = await navigateAndInspect(
+    const { errorText, innerText, href } = await navigateAndInspect(
       client,
       sessionId,
       `file://${canaryPath}`,
     );
 
-    // Then: 遷移結果は net::ERR_ACCESS_DENIED、ページ本文は空でカナリアを含まない
+    // Then: 遷移結果は net::ERR_ACCESS_DENIED、ページはブラウザのエラーページで、本文はカナリアを含まない
     expect(errorText).toBe("net::ERR_ACCESS_DENIED");
-    expect(innerText).toBe("");
+    expect(String(href).startsWith("chrome-error://")).toBe(true);
     expect(String(innerText)).not.toContain(canary);
   } finally {
     client?.close();
@@ -163,15 +172,18 @@ test("AC-53b: navigating to file:///proc/ is denied and yields no directory list
     const { sessionId } = await openPageSession(client);
 
     // When: file:///proc/ へ遷移する
-    const { errorText, innerText } = await navigateAndInspect(
+    const { errorText, innerText, href } = await navigateAndInspect(
       client,
       sessionId,
       "file:///proc/",
     );
 
-    // Then: 遷移結果は net::ERR_ACCESS_DENIED、ページ本文は空
+    // Then: 遷移結果は net::ERR_ACCESS_DENIED、ページはブラウザのエラーページで、本文はディレクトリ一覧（cpuinfo・meminfo・self）を含まない
     expect(errorText).toBe("net::ERR_ACCESS_DENIED");
-    expect(innerText).toBe("");
+    expect(String(href).startsWith("chrome-error://")).toBe(true);
+    for (const entry of ["cpuinfo", "meminfo", "self"]) {
+      expect(String(innerText)).not.toContain(entry);
+    }
   } finally {
     client?.close();
     await stopStack(stack);

@@ -38,7 +38,6 @@ use tegata_core::wire::{
     ExecutorServiceStopRequest, LoginParams, OpenApiProxyParams, OpenMcpServerParams, RpcError,
     RpcRequest, RpcResponse,
 };
-#[cfg(unix)]
 use tegata_core::wire::{ExecutorHelloRequest, ExecutorHelloResponse};
 use tegata_core::{Secret, totp};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};

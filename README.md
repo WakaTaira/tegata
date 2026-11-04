@@ -291,6 +291,11 @@ instructions point agents to, and which a Claude Code `tegata-login` subagent in
 returning only the outcome
 ([#54](https://github.com/WakaTaira/tegata/issues/54),
 [#55](https://github.com/WakaTaira/tegata/issues/55));
+a login browser that does not announce itself as automated
+([#60](https://github.com/WakaTaira/tegata/issues/60)) — tegata launches full
+Chromium in its new headless mode instead of the headless shell, so
+`navigator.webdriver` is false and the browser looks like an ordinary one; this
+requires a full Chromium install, and the daemon refuses to start without it;
 and prebuilt release binaries and bundles for non-Nix deployments,
 published from tags on the
 [releases page](https://github.com/WakaTaira/tegata/releases).

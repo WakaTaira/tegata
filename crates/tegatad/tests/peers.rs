@@ -64,10 +64,12 @@ fn start_daemon_with_existing_legacy(legacy_token: &str, existing_legacy: bool) 
     let tcp_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve TCP port");
     let tcp_port = tcp_listener.local_addr().expect("read TCP port").port();
     drop(tcp_listener);
+    let executor = common::write_probe_only_executor(&directory);
     let config = format!(
-        "state_dir = {:?}\naudit_log_path = {:?}\n\n[[listen]]\nkind = \"unix\"\npath = {:?}\nallowed_uids = [{}]\noperator_uids = [{}]\n\n[[listen]]\nkind = \"tcp\"\nbind = \"127.0.0.1\"\nport = {}\n",
+        "state_dir = {:?}\naudit_log_path = {:?}\nexecutor_entry = {:?}\n\n[[listen]]\nkind = \"unix\"\npath = {:?}\nallowed_uids = [{}]\noperator_uids = [{}]\n\n[[listen]]\nkind = \"tcp\"\nbind = \"127.0.0.1\"\nport = {}\n",
         state_dir,
         state_dir.join("audit.log"),
+        executor,
         socket_path,
         unsafe { libc::geteuid() },
         unsafe { libc::geteuid() },
@@ -138,10 +140,12 @@ fn start_daemon_with_unix_permissions(allowed_uids: &[u32], operator_uids: &[u32
         .map(u32::to_string)
         .collect::<Vec<_>>()
         .join(", ");
+    let executor = common::write_probe_only_executor(&directory);
     let config = format!(
-        "state_dir = {:?}\naudit_log_path = {:?}\n\n[[listen]]\nkind = \"unix\"\npath = {:?}\nallowed_uids = [{}]\noperator_uids = [{}]\n",
+        "state_dir = {:?}\naudit_log_path = {:?}\nexecutor_entry = {:?}\n\n[[listen]]\nkind = \"unix\"\npath = {:?}\nallowed_uids = [{}]\noperator_uids = [{}]\n",
         state_dir,
         state_dir.join("audit.log"),
+        executor,
         socket_path,
         allowed_uids,
         operator_uids,

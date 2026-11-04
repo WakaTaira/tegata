@@ -47,6 +47,7 @@ const rl = readline.createInterface({ input: process.stdin });
 rl.on("close", () => process.exit(0));
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   fs.appendFileSync(log, JSON.stringify({
     op: request.op,
     pid: process.pid,
@@ -109,7 +110,8 @@ impl Daemon {
         let state_dir = directory.join("state");
         create_private_dir(&state_dir);
         let executor = directory.join("executor.js");
-        std::fs::write(&executor, STEPWISE_EXECUTOR).expect("write executor script");
+        std::fs::write(&executor, common::fake_executor_source(STEPWISE_EXECUTOR))
+            .expect("write executor script");
         let tcp_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve TCP port");
         let tcp_port = tcp_listener.local_addr().expect("read TCP port").port();
         drop(tcp_listener);

@@ -123,12 +123,14 @@ impl TestStack {
         let socket_path = directory.join("tegatad.sock");
         let config_path = directory.join("config.toml");
         let uid = unsafe { libc::geteuid() };
+        let executor = common::write_probe_only_executor(&directory);
         let config = format!(
-            "socket_path = {:?}\nstate_dir = {:?}\naudit_log_path = {:?}\nallowed_uids = [{}]\n\n[[providers]]\nnamespace = \"vw\"\ntype = \"bitwarden-cli\"\nserver_url = \"{server_url}\"\nemail = \"{email}\"\naskpass_cmd = \"cat {}\"\ntotp_exposable = [\"Canary TOTP\"]\n",
+            "socket_path = {:?}\nstate_dir = {:?}\naudit_log_path = {:?}\nallowed_uids = [{}]\nexecutor_entry = {:?}\n\n[[providers]]\nnamespace = \"vw\"\ntype = \"bitwarden-cli\"\nserver_url = \"{server_url}\"\nemail = \"{email}\"\naskpass_cmd = \"cat {}\"\ntotp_exposable = [\"Canary TOTP\"]\n",
             socket_path,
             state_dir,
             state_dir.join("audit.log"),
             uid,
+            executor,
             askpass_path.display(),
         );
         std::fs::write(&config_path, config).expect("write daemon config");

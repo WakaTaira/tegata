@@ -24,6 +24,7 @@ const readline = require("node:readline");
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   if (request.op === "login") {
     process.stdout.write(
       JSON.stringify({ id: request.id, ok: true, endpoint: "ws://127.0.0.1:38999/devtools/browser/test", target_id: "test-target" }) + "\n",
@@ -60,7 +61,8 @@ impl Daemon {
         let socket_path = directory.join("tegatad.sock");
         let config_path = directory.join("config.toml");
         let script_path = directory.join("executor.js");
-        std::fs::write(&script_path, EXECUTOR).expect("write executor script");
+        std::fs::write(&script_path, common::fake_executor_source(EXECUTOR))
+            .expect("write executor script");
         let hook = format!(
             "echo \"$TEGATA_APPROVAL_CODE $TEGATA_APPROVAL_GRANT_TTL_SECS $TEGATA_CRED_ID $TEGATA_METHOD\" >> {:?}; env >> {:?}; while test -e {:?}; do sleep 0.05; done; test ! -e {:?}",
             directory.join("hook.log"),

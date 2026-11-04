@@ -159,11 +159,15 @@ beforeAll(async () => {
       }
       return;
     }
-    site.requests.push({
-      method: request.method ?? "",
-      path: request.url ?? "",
-      cookieNames: [...requestCookies(request).keys()].sort(),
-    });
+    // 完全版 Chromium はページ読み込み後に favicon を自動で取得するため、
+    // 遷移の順序を検査する記録から除外します。
+    if (route !== "GET /favicon.ico") {
+      site.requests.push({
+        method: request.method ?? "",
+        path: request.url ?? "",
+        cookieNames: [...requestCookies(request).keys()].sort(),
+      });
+    }
     if (route === "GET /login") {
       page(loginForm);
       return;

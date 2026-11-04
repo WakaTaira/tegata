@@ -30,6 +30,7 @@ const reply = (id, body) => process.stdout.write(JSON.stringify({ id, ...body })
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   fs.appendFileSync(log, JSON.stringify({ op: request.op, cookies: request.cookies === undefined ? "absent" : request.cookies }) + "\n");
   if (request.op === "login") {
     reply(request.id, { ok: true, endpoint: "ws://127.0.0.1:38999/devtools/browser/test", target_id: "test-target", cookies: jar("login"), steps_skipped: Array.isArray(request.cookies) });
@@ -53,6 +54,7 @@ const reply = (id, body) => process.stdout.write(JSON.stringify({ id, ...body })
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   if (request.op === "login") {
     reply(request.id, { ok: true, endpoint: "ws://127.0.0.1:38999/devtools/browser/test", target_id: "test-target" });
   } else if (request.op === "release") {
@@ -86,6 +88,7 @@ const restoredOf = (request) => {
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   const restored = restoredOf(request);
   fs.appendFileSync(log, JSON.stringify({ op: request.op, cookies: restored === undefined ? "absent" : restored }) + "\n");
   const skipped = Array.isArray(restored);
@@ -154,7 +157,11 @@ impl Daemon {
         std::fs::create_dir(&directory).expect("create test directory");
         let state_dir = directory.join("state");
         create_private_dir(&state_dir);
-        std::fs::write(directory.join("executor.js"), executor).expect("write executor script");
+        std::fs::write(
+            directory.join("executor.js"),
+            common::fake_executor_source(executor),
+        )
+        .expect("write executor script");
         let tcp_listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve TCP port");
         let tcp_port = tcp_listener.local_addr().expect("read TCP port").port();
         drop(tcp_listener);

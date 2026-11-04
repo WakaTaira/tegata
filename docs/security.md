@@ -655,6 +655,23 @@ not scanned at all. The real control is choosing which servers get a
 accidental leak, not protection against a server that tries to exfiltrate the
 value on purpose.
 
+**The login browser is not hidden, only not announcing.** tegata launches full
+Chromium in its new headless mode and does not let it announce automation:
+`navigator.webdriver` is false, plugins are present, `window.chrome` exists,
+the screen and the window differ in size, and neither the user agent nor the
+client hints contain `Headless`. It does not inject JavaScript into pages to forge
+a fingerprint, and it does not defeat CAPTCHAs. What remains visible:
+
+- Input events keep `isTrusted: false`, so a site that watches keystrokes can
+  still tell the input is automated.
+- The browser profile is discarded every time, so the browser does not look like
+  an ordinary one with a history.
+- The WebGL renderer is SwiftShader (software rendering). Reporting a real GPU
+  name would require the browser's sandbox to reach the GPU device, which tegata
+  does not allow today.
+- `navigator.languages` differs between tegata's browser context and the default
+  context.
+
 ## Operator checklist
 
 The guarantees above assume the deployment is set up correctly. Verify each of

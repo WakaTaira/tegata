@@ -70,6 +70,9 @@ pub struct ExecutorHelloResponse {
     pub ok: bool,
     pub uid: Option<u32>,
     pub pid: u32,
+    /// `ok` が偽のときに executor が示す、人が読むための拒否理由。古い executor は送らない。
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// Login request written as one JSON line to the executor sidecar.

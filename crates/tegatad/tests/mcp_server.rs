@@ -33,6 +33,7 @@ const event = (action, extra) =>
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   log(request);
   if (request.op === "mcp_server_start") {
     process.stdout.write(JSON.stringify({ id: request.id, ok: true, port: 38999, stream_secret: "fake-stream-secret_A1" }) + "\n");
@@ -54,6 +55,7 @@ const readline = require("node:readline");
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const request = JSON.parse(line);
+  if (answerStartupProbe(request)) return;
   if (request.op === "mcp_server_start") {
     process.stdout.write(JSON.stringify({ id: request.id, ok: false, error: "INTERNAL" }) + "\n");
   } else {
@@ -131,7 +133,11 @@ impl Layout {
         let socket_path = directory.join("tegatad.sock");
         let config_path = directory.join("config.toml");
         let executor_path = directory.join("executor.js");
-        std::fs::write(&executor_path, &options.executor).expect("write executor script");
+        std::fs::write(
+            &executor_path,
+            common::fake_executor_source(&options.executor),
+        )
+        .expect("write executor script");
         let mut top = format!(
             "socket_path = {:?}\nstate_dir = {:?}\naudit_log_path = {:?}\nallowed_uids = [{}]\nexecutor_entry = {:?}\n",
             socket_path,

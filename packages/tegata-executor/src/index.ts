@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
+import fs from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -721,14 +723,26 @@ function fallbackPlatform(): string {
   throw new Error(`unsupported browser platform: ${process.platform}`);
 }
 
-function fallbackUserAgentMetadata(product: string): UserAgentMetadata {
+// 実 Chromium が brands に必ず含める GREASE ブランドです。fallback でも落とさないことで、
+// brands が Chromium 1 件だけという実ブラウザに存在しない組み合わせを避けます。
+const greaseBrand = "Not)A;Brand";
+const greaseMajorVersion = "24";
+const greaseFullVersion = `${greaseMajorVersion}.0.0.0`;
+
+export function fallbackUserAgentMetadata(product: string): UserAgentMetadata {
   const version = product.match(/\/(\d+(?:\.\d+)*)/)?.[1];
   if (version === undefined) {
     throw new Error("browser product version was not returned");
   }
   return {
-    brands: [{ brand: "Chromium", version: version.split(".")[0] }],
-    fullVersionList: [{ brand: "Chromium", version }],
+    brands: [
+      { brand: "Chromium", version: version.split(".")[0] },
+      { brand: greaseBrand, version: greaseMajorVersion },
+    ],
+    fullVersionList: [
+      { brand: "Chromium", version },
+      { brand: greaseBrand, version: greaseFullVersion },
+    ],
     platform: fallbackPlatform(),
     platformVersion: "",
     architecture: "",
@@ -2186,14 +2200,139 @@ async function executeDeviceFlow(
   );
 }
 
+const playwrightRequire = createRequire(import.meta.url);
+
+/** browsers.json の内容から、完全版 Chromium の browserVersion を取り出します。 */
+export function chromiumVersionFromManifest(manifest: unknown): string {
+  const browsers = isRecord(manifest) ? manifest.browsers : undefined;
+  const entry = Array.isArray(browsers)
+    ? browsers.find((item) => isRecord(item) && item.name === "chromium")
+    : undefined;
+  if (!isRecord(entry) || typeof entry.browserVersion !== "string") {
+    throw new Error("chromium browserVersion was not found in browsers.json");
+  }
+  return entry.browserVersion;
+}
+
+function bundledChromiumVersion(): string {
+  const packageJsonPath = playwrightRequire.resolve(
+    "playwright-core/package.json",
+  );
+  const manifestPath = path.join(
+    path.dirname(packageJsonPath),
+    "browsers.json",
+  );
+  return chromiumVersionFromManifest(
+    JSON.parse(fs.readFileSync(manifestPath, "utf8")),
+  );
+}
+
+function userAgentPlatform(platform: NodeJS.Platform): string {
+  if (platform === "linux") return "X11; Linux x86_64";
+  if (platform === "win32") return "Windows NT 10.0; Win64; x64";
+  throw new Error(`unsupported browser platform: ${platform}`);
+}
+
+/**
+ * 起動引数 --user-agent に渡す UA を組み立てます。実ブラウザの UA 縮減に合わせ、
+ * 版はメジャー番号のみを残して残りを 0 にします。
+ */
+export function browserUserAgent(
+  browserVersion: string,
+  platform: NodeJS.Platform,
+): string {
+  const major = browserVersion.match(/^(\d+)(?:\.|$)/)?.[1];
+  if (major === undefined) {
+    throw new Error(`invalid chromium browserVersion: ${browserVersion}`);
+  }
+  return `Mozilla/5.0 (${userAgentPlatform(platform)}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
+}
+
+export type FullChromiumCheck = { ok: true } | { ok: false; reason: string };
+
+function isExecutableFile(executablePath: string): boolean {
+  if (!fs.existsSync(executablePath)) return false;
+  try {
+    // 検索権限のあるディレクトリは X_OK を満たすため、通常ファイルであることも確認します。
+    if (!fs.statSync(executablePath).isFile()) return false;
+    fs.accessSync(executablePath, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function fullChromiumMissingReason(
+  detail: string,
+  browsersPath: string | undefined,
+): string {
+  return [
+    `The full Chromium browser is required, but ${detail}.`,
+    "A browser installation made with --only-shell (Chromium headless shell only) does not work; install chromium without --only-shell.",
+    `PLAYWRIGHT_BROWSERS_PATH=${browsersPath ?? "(unset)"}`,
+  ].join(" ");
+}
+
+/**
+ * channel: "chromium" で起動する完全版 Chromium が実行可能かを確かめます。
+ * chromium.executablePath() は存在しないパスでも返すため、実ファイルを検査します。
+ */
+export function checkFullChromium(
+  executablePath: () => string,
+  browsersPath: string | undefined,
+): FullChromiumCheck {
+  let resolved: string;
+  try {
+    resolved = executablePath();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      reason: fullChromiumMissingReason(
+        `its executable path could not be resolved (${message})`,
+        browsersPath,
+      ),
+    };
+  }
+  if (isExecutableFile(resolved)) return { ok: true };
+  return {
+    ok: false,
+    reason: fullChromiumMissingReason(
+      `no executable was found at ${resolved}`,
+      browsersPath,
+    ),
+  };
+}
+
+/** hello への応答です。完全版 Chromium が無ければ理由を添えて ok: false を返します。 */
+export function helloResponse(check: FullChromiumCheck): unknown {
+  const identity = { uid: process.getuid?.() ?? null, pid: process.pid };
+  if (check.ok) return { ok: true, ...identity };
+  return { ok: false, ...identity, reason: check.reason };
+}
+
 async function openBrowserPage() {
   const port = await reservePort();
+  // 完全版 Chromium では URL 付きで作られたタブの初回リクエストがガードより先に出るため、
+  // 起動引数でも Headless を含まない UA を与えます。
+  const launchUserAgent = browserUserAgent(
+    bundledChromiumVersion(),
+    process.platform,
+  );
   const dir = await mkdtemp(path.join(os.tmpdir(), "tegata-browser-"));
   activeTempDir = dir;
   // ブラウザが参照する設定・キャッシュを executor の作業領域から隔離します。
   const browser = await chromium.launch({
     headless: true,
-    args: [`--remote-debugging-port=${port}`],
+    channel: "chromium",
+    args: [
+      `--remote-debugging-port=${port}`,
+      "--disable-blink-features=AutomationControlled",
+      // 画面とウィンドウの大きさを分け、後から CDP で作られるページにも同じ値を適用します。
+      "--screen-info={1920x1080}",
+      "--window-size=1280,807",
+      `--user-agent=${launchUserAgent}`,
+    ],
     env: {
       ...process.env,
       HOME: dir,
@@ -2210,7 +2349,10 @@ async function openBrowserPage() {
     browser.newBrowserCDPSession(),
   );
   try {
-    const page = await withGuard(guard, () => browser.newPage());
+    // viewport を固定せず、起動引数のウィンドウと画面の大きさをそのまま使います。
+    const page = await withGuard(guard, () =>
+      browser.newPage({ viewport: null }),
+    );
     const pageSession = await withGuard(guard, () =>
       page.context().newCDPSession(page),
     );
@@ -3881,11 +4023,12 @@ async function main(): Promise<void> {
       const request = parseRequest(line);
       if (request.op === "hello") {
         writeResponse(
-          {
-            ok: true,
-            uid: process.getuid?.() ?? null,
-            pid: process.pid,
-          },
+          helloResponse(
+            checkFullChromium(
+              () => chromium.executablePath(),
+              process.env.PLAYWRIGHT_BROWSERS_PATH,
+            ),
+          ),
           request.id,
         );
         continue;

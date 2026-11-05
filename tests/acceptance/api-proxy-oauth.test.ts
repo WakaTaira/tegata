@@ -225,7 +225,7 @@ test("AC-129: Given an OAuth proxy for the fixture / When open_api_proxy serves 
   } finally {
     if (sessionId !== undefined)
       await stack.mcp
-        .callTool("logout", { session_id: sessionId })
+        .callTool("disconnect", { session_id: sessionId })
         .catch(() => {});
     await stopOAuthStack(stack);
   }
@@ -260,7 +260,7 @@ test("AC-130: Given a four-second OAuth token lifetime / When the proxy is open 
   } finally {
     if (sessionId !== undefined)
       await stack.mcp
-        .callTool("logout", { session_id: sessionId })
+        .callTool("disconnect", { session_id: sessionId })
         .catch(() => {});
     await stopOAuthStack(stack);
   }
@@ -275,10 +275,10 @@ test("AC-131: Given an open OAuth proxy / When its session is logged out / Then 
   try {
     const opened = await openProxy(stack);
     const before = await oauthState(stack.fixture);
-    const logout = await stack.mcp.callTool("logout", {
+    const disconnect = await stack.mcp.callTool("disconnect", {
       session_id: opened.session.session_id,
     });
-    expect(logout.isError, logout.text).toBe(false);
+    expect(disconnect.isError, disconnect.text).toBe(false);
 
     await waitUntil(
       "OAuth token revocation",
@@ -342,10 +342,10 @@ test("AC-133: Given the OAuth proxy flows / When MCP output, audit, stderr, and 
     await sleep(7_000);
     const second = await fetchText(`${opened.session.base_url}/api/me`);
     expect(second.status).toBe(200);
-    const logout = await stack.mcp.callTool("logout", {
+    const disconnect = await stack.mcp.callTool("disconnect", {
       session_id: opened.session.session_id,
     });
-    mcpOutput.push(logout);
+    mcpOutput.push(disconnect);
 
     const state = await oauthState(stack.fixture);
     expect(state.access_tokens.length).toBeGreaterThan(0);

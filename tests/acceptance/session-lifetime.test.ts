@@ -17,14 +17,17 @@ import {
   unixLogin,
 } from "./support/phase4.js";
 
-async function logout(stack: Phase4Stack, sessionId: string): Promise<void> {
-  const res = await rawRpc(stack.daemon.socketPath, "logout", {
+async function disconnect(
+  stack: Phase4Stack,
+  sessionId: string,
+): Promise<void> {
+  const res = await rawRpc(stack.daemon.socketPath, "disconnect", {
     session_id: sessionId,
   });
-  stack.observe("rpc:logout", res);
+  stack.observe("rpc:disconnect", res);
   expect(
     res.error,
-    `logout failed: ${JSON.stringify(res.error)}`,
+    `disconnect failed: ${JSON.stringify(res.error)}`,
   ).toBeUndefined();
 }
 
@@ -103,7 +106,7 @@ test("AC-114: login after the browser deadline starts a new browser", async () =
   }
 });
 
-test("AC-115: a session cookie remains valid after logout closes the browser", async () => {
+test("AC-115: a session cookie remains valid after disconnect closes the browser", async () => {
   // Given: the default Phase 4 stack and a logged-in fixture page
   const stack = await startPhase4Stack();
   let client: CdpClient | undefined;
@@ -135,9 +138,9 @@ test("AC-115: a session cookie remains valid after logout closes the browser", a
     }
     client.close();
     client = undefined;
-    await logout(stack, login.session_id);
+    await disconnect(stack, login.session_id);
     await waitUntil(
-      "the browser to shut down after logout",
+      "the browser to shut down after disconnect",
       () => countExecutors(stack.daemon.pid) === 0,
       5_000,
     );

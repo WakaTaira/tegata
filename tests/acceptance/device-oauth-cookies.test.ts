@@ -130,13 +130,13 @@ async function openProxy(
   return { mcp, session };
 }
 
-/** Close a proxy session with logout and wait until its lease is gone. */
+/** Close a proxy session with disconnect and wait until its lease is gone. */
 async function closeProxy(
   stack: DeviceCookieStack,
   sessionId: string,
 ): Promise<McpResult> {
-  const res = await stack.mcp.callTool("logout", { session_id: sessionId });
-  expect(res.isError, `logout failed: ${res.text}`).toBe(false);
+  const res = await stack.mcp.callTool("disconnect", { session_id: sessionId });
+  expect(res.isError, `disconnect failed: ${res.text}`).toBe(false);
   await waitUntil(
     "the proxy lease to be released",
     async () => {
@@ -161,18 +161,18 @@ async function oauthState(stack: DeviceCookieStack): Promise<OAuthState> {
   return (await res.json()) as OAuthState;
 }
 
-/** Logout of a login session over the UNIX socket. */
-async function logout(
+/** Disconnect of a login session over the UNIX socket. */
+async function disconnect(
   stack: DeviceCookieStack,
   sessionId: string,
 ): Promise<RpcResponse> {
-  const res = await rawRpc(stack.daemon.socketPath, "logout", {
+  const res = await rawRpc(stack.daemon.socketPath, "disconnect", {
     session_id: sessionId,
   });
-  stack.observe("rpc:logout", res);
+  stack.observe("rpc:disconnect", res);
   expect(
     res.error,
-    `logout failed: ${JSON.stringify(res.error)}`,
+    `disconnect failed: ${JSON.stringify(res.error)}`,
   ).toBeUndefined();
   return res;
 }
@@ -310,9 +310,9 @@ test("AC-175: login and authorize_device share the stored cookies", async () => 
   // Given: persist_cookies = ["*"]
   const stack = await startDeviceCookieStack({ persistCookies: ["*"] });
   try {
-    // When: login -> logout -> authorize_device on credential A
+    // When: login -> disconnect -> authorize_device on credential A
     const aLogin = await login(stack, "mock:site");
-    await logout(stack, aLogin.session_id);
+    await disconnect(stack, aLogin.session_id);
     await waitForStoredFiles(stack, 1);
     const aDevice = await during(stack, () =>
       authorizeDeviceOk(stack, { credId: "mock:site" }),
@@ -375,7 +375,7 @@ test("AC-176: the OAuth proxy login restores the stored cookies", async () => {
   } finally {
     if (openSession !== undefined)
       await stack.mcp
-        .callTool("logout", { session_id: openSession })
+        .callTool("disconnect", { session_id: openSession })
         .catch(() => {});
     await stopDeviceCookieStack(stack);
   }
@@ -611,7 +611,7 @@ test("AC-182: cookie values never reach responses, audit, or stderr", async () =
     const first = await openProxy(proxy);
     surfaces.push({ label: "mcp:open_api_proxy", text: JSON.stringify(first) });
     const closed = await closeProxy(proxy, first.session.session_id);
-    surfaces.push({ label: "mcp:logout", text: JSON.stringify(closed) });
+    surfaces.push({ label: "mcp:disconnect", text: JSON.stringify(closed) });
     const second = await openProxy(proxy);
     surfaces.push({
       label: "mcp:open_api_proxy",
@@ -620,7 +620,7 @@ test("AC-182: cookie values never reach responses, audit, or stderr", async () =
     const records = await okRecords(proxy, "open_api_proxy", 2);
     expect(records[1].cookies).toBe("restored");
     const last = await closeProxy(proxy, second.session.session_id);
-    surfaces.push({ label: "mcp:logout", text: JSON.stringify(last) });
+    surfaces.push({ label: "mcp:disconnect", text: JSON.stringify(last) });
 
     // When: the responses, the audit log, and the daemon stderr are scanned
     proxyHits = await cookieValueHits(proxy, surfaces);

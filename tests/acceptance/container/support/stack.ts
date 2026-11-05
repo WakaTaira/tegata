@@ -286,14 +286,14 @@ export async function hostLogin(
   return res.result as LoginResult;
 }
 
-/** Logout over the host's UNIX socket; returns the raw reply. */
-export async function hostLogout(
+/** Disconnect over the host's UNIX socket; returns the raw reply. */
+export async function hostDisconnect(
   stack: ContainerStack,
   sessionId: string,
 ): Promise<{ result?: unknown; error?: { code: number; message?: string } }> {
-  const res = await rawRpc(stack.daemon.socketPath, "logout", {
+  const res = await rawRpc(stack.daemon.socketPath, "disconnect", {
     session_id: sessionId,
   });
-  stack.observe("rpc:logout", res);
+  stack.observe("rpc:disconnect", res);
   return res;
 }

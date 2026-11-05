@@ -1,13 +1,18 @@
 // AC-206, AC-207, AC-208 — rename `logout` to `disconnect`.
 // The old name reads as if it signed out of the site, but it only closes the tegata
 // browser session; the site-side session and the stored cookies remain.
-// `logout` remains as a deprecated alias.
+// The old name is gone from both the daemon and the MCP broker.
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { chromium } from "playwright-core";
 import { expect, test } from "vitest";
-import { bins, defaultEntries, fixtureSteps } from "./support/harness.js";
+import {
+  bins,
+  defaultEntries,
+  fixtureSteps,
+  rawRpc,
+} from "./support/harness.js";
 import {
   readAuditRecords,
   startPhase3Stack,
@@ -129,31 +134,30 @@ test("AC-207: the disconnect description says it does not sign out and that cook
   expect(description).toMatch(/cookie/i);
 });
 
-test("AC-208: the deprecated logout alias still ends the session and its description points to disconnect", async () => {
+test("AC-208: the removed logout name is refused and no longer listed, and leaves the session open", async () => {
   // Given: a logged-in session
   const stack = await startStack();
   try {
     const login = await loginFixture(stack);
 
-    // When: the deprecated alias logout is called with the session_id
-    const first = await stack.mcp.callTool("logout", {
+    // When: the daemon is called with the old method name
+    const response = await rawRpc(stack.daemon.socketPath, "logout", {
       session_id: login.session_id,
     });
+    stack.guard.observe("rpc:logout", response);
 
-    // Then: the result is { ok: true } and the session has ended
-    expect(first.isError, first.text).toBe(false);
-    expect(first.json).toEqual({ ok: true });
-    const second = await stack.mcp.callTool("logout", {
+    // Then: it answers method not found, and the session stays open
+    expect(response.error?.code).toBe(-32601);
+    const closed = await stack.mcp.callTool("disconnect", {
       session_id: login.session_id,
     });
-    expect(second.isError).toBe(true);
-    expect(second.text).toBe("NOT_FOUND");
+    expect(closed.isError, closed.text).toBe(false);
+    expect(closed.json).toEqual({ ok: true });
 
-    // Then: the listed logout description says deprecated and names disconnect
-    const description = (await listToolDescriptions()).get("logout");
-    expect(description, "logout must remain listed").toBeDefined();
-    expect(description).toMatch(/deprecated/i);
-    expect(description).toContain("disconnect");
+    // Then: the MCP broker lists disconnect and not logout
+    const tools = await listToolDescriptions();
+    expect(tools.has("logout")).toBe(false);
+    expect(tools.has("disconnect")).toBe(true);
   } finally {
     await stopPhase3Stack(stack);
   }

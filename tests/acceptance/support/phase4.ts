@@ -19,7 +19,7 @@
  *     answered by `{"ok":true}` or `{"ok":false,"error":"<code>"}`). A
  *     tunnel to a session the caller does not own answers `NOT_FOUND`.
  *   - the `login` result gains `target_id`; `login` accepts `exclusive`;
- *     `logout` of a session the caller does not own answers `NOT_FOUND`
+ *     `disconnect` of a session the caller does not own answers `NOT_FOUND`
  *   - `status` -> `{ok: true, browsers: n, leases: n}`
  *   - audit peer fields: `principal` ("uid:<n>" / "peer:<peer_id>"),
  *     `peer_id` + `peer_label` for named tokens, and `shared` on login

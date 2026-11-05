@@ -35,7 +35,7 @@ describe.skipIf(!dockerAvailable())("AC-72 / AC-73 (docker)", () => {
   afterAll(async () => {
     if (stack?.mcp !== undefined && login !== undefined) {
       await stack.mcp
-        .callTool("logout", { session_id: login.session_id })
+        .callTool("disconnect", { session_id: login.session_id })
         .catch(() => {});
     }
     if (stack !== undefined) await stopContainerStack(stack);

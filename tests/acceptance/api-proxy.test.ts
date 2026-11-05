@@ -150,7 +150,7 @@ test("AC-98: open_api_proxy injects cred X for the fixture whoami request", asyn
   } finally {
     if (sessionId !== undefined)
       await stack.mcp
-        .callTool("logout", { session_id: sessionId })
+        .callTool("disconnect", { session_id: sessionId })
         .catch(() => {});
     await stopApiProxyStack(stack);
   }
@@ -177,7 +177,7 @@ test("AC-99: api-proxy paths without the issued secret never reach upstream", as
   } finally {
     if (sessionId !== undefined)
       await stack.mcp
-        .callTool("logout", { session_id: sessionId })
+        .callTool("disconnect", { session_id: sessionId })
         .catch(() => {});
     await stopApiProxyStack(stack);
   }
@@ -209,14 +209,14 @@ test("AC-100: caller authorization is replaced and the credential stays out of o
   } finally {
     if (sessionId !== undefined)
       await stack.mcp
-        .callTool("logout", { session_id: sessionId })
+        .callTool("disconnect", { session_id: sessionId })
         .catch(() => {});
     await stopApiProxyStack(stack);
   }
 });
 
 // Given: proxy s1
-// When: logout {session_id: s1}
+// When: disconnect {session_id: s1}
 // Then: within 2 seconds, GET to base_url is refused or returns HTTP 404
 // Given: proxy s2
 // When: lock_vault
@@ -225,17 +225,17 @@ test("AC-100: caller authorization is replaced and the credential stays out of o
 // When: wait 4 seconds
 // Then: within 2 seconds, GET to base_url is refused or returns HTTP 404, and the audit log
 // contains session_expired for s3
-test("AC-101: logout, lock_vault, and proxy TTL terminate their sessions", async () => {
-  const logoutStack = await singleProxyStack();
+test("AC-101: disconnect, lock_vault, and proxy TTL terminate their sessions", async () => {
+  const disconnectStack = await singleProxyStack();
   try {
-    const opened = await openProxy(logoutStack, "fx");
-    const logout = await logoutStack.mcp.callTool("logout", {
+    const opened = await openProxy(disconnectStack, "fx");
+    const disconnect = await disconnectStack.mcp.callTool("disconnect", {
       session_id: opened.session.session_id,
     });
-    expect(logout.isError, logout.text).toBe(false);
+    expect(disconnect.isError, disconnect.text).toBe(false);
     await expectProxyUnavailable(opened.session.base_url);
   } finally {
-    await stopApiProxyStack(logoutStack);
+    await stopApiProxyStack(disconnectStack);
   }
 
   const lockStack = await singleProxyStack();
@@ -360,7 +360,7 @@ test("AC-103: api-proxy audit records describe the request without secret materi
   } finally {
     if (sessionId !== undefined)
       await stack.mcp
-        .callTool("logout", { session_id: sessionId })
+        .callTool("disconnect", { session_id: sessionId })
         .catch(() => {});
     await stopApiProxyStack(stack);
   }

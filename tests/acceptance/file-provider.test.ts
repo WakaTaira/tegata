@@ -79,10 +79,10 @@ test("AC-41: an age-file credential logs in end to end without leaking", async (
     } finally {
       await browser.close();
     }
-    const logout = await stack.mcp.callTool("logout", {
+    const disconnect = await stack.mcp.callTool("disconnect", {
       session_id: result.session_id,
     });
-    expect(logout.isError, logout.text).toBe(false);
+    expect(disconnect.isError, disconnect.text).toBe(false);
   } finally {
     await stopPhase3Stack(stack);
   }

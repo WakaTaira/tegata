@@ -26,7 +26,7 @@ export type SignalSource = {
 };
 
 /**
- * The signals that, when received, trigger logout and exit, and the exit code in that case (128 +
+ * The signals that, when received, trigger disconnect and exit, and the exit code in that case (128 +
  * signal number).
  */
 const TERMINATION_SIGNALS = [
@@ -108,11 +108,9 @@ function parseOpenMcpServerResult(result: unknown): OpenMcpServerResult {
  * Closes the session. A best-effort cleanup that contains neither the stream secret nor any server
  * output.
  */
-async function logout(sessionId: string): Promise<void> {
+async function disconnect(sessionId: string): Promise<void> {
   try {
-    // Call logout until the alias is retired, so that the session is reliably closed even with an
-    // older daemon.
-    await callDaemon("logout", { session_id: sessionId });
+    await callDaemon("disconnect", { session_id: sessionId });
   } catch {
     // A failure here, such as the daemon having already revoked the session, does not prevent the
     // relay itself from ending.
@@ -121,7 +119,7 @@ async function logout(sessionId: string): Promise<void> {
 
 /**
  * Connects to the port, sends the stream secret first, and then relays stdin / stdout as is.
- * Sends logout and exits on any of stdin EOF, connection loss, or a termination signal.
+ * Sends disconnect and exits on any of stdin EOF, connection loss, or a termination signal.
  */
 async function connectAndRelay(
   port: number,
@@ -138,7 +136,7 @@ async function connectAndRelay(
       if (finished) return;
       finished = true;
       socket.destroy();
-      void logout(sessionId).finally(() => resolve(exitCode));
+      void disconnect(sessionId).finally(() => resolve(exitCode));
     };
 
     socket.once("error", () => finish(1));
@@ -163,14 +161,14 @@ async function relaySession(
   if (process.env.TEGATA_BRIDGE === "1") {
     const tunnel = await openBridgeTunnel(opened.sessionId, opened.port);
     if ("failure" in tunnel) {
-      await logout(opened.sessionId);
+      await disconnect(opened.sessionId);
       return fail(streams, tunnel.failure.content[0]?.text ?? "INTERNAL");
     }
     localPort = tunnel.localPort;
   }
   const signalled = signals.received();
   if (signalled !== undefined) {
-    await logout(opened.sessionId);
+    await disconnect(opened.sessionId);
     return signalled;
   }
   return connectAndRelay(
@@ -209,14 +207,14 @@ async function openAndRelay(
     opened = parseOpenMcpServerResult(response.result);
   } catch {
     const sessionId = sessionIdOf(response.result);
-    if (sessionId !== undefined) await logout(sessionId);
+    if (sessionId !== undefined) await disconnect(sessionId);
     return fail(streams, "INTERNAL");
   }
 
   try {
     return await relaySession(opened, streams, signals);
   } catch {
-    await logout(opened.sessionId);
+    await disconnect(opened.sessionId);
     return fail(streams, "INTERNAL");
   }
 }

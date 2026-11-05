@@ -67,7 +67,7 @@ function fakeStreams() {
 const DROP = Symbol("drop");
 
 /**
- * A fake daemon that answers open_mcp_server (and logout / bridge_open_tunnel if specified).
+ * A fake daemon that answers open_mcp_server (and disconnect / bridge_open_tunnel if specified).
  * For a method for which extra returned DROP, it closes the connection without responding.
  */
 async function startFakeDaemon(
@@ -224,7 +224,7 @@ describe("run", () => {
       expect(exitCode).toBe(0);
       expect(daemon.calls).toEqual([
         { method: "open_mcp_server", params: { name: "fake" } },
-        { method: "logout", params: { session_id: "s1" } },
+        { method: "disconnect", params: { session_id: "s1" } },
       ]);
     } finally {
       await daemon.stop();
@@ -279,7 +279,7 @@ describe("run", () => {
           method: "bridge_open_tunnel",
           params: { session_id: "s2", port: 9999 },
         },
-        { method: "logout", params: { session_id: "s2" } },
+        { method: "disconnect", params: { session_id: "s2" } },
       ]);
     } finally {
       await daemon.stop();
@@ -304,7 +304,7 @@ describe("run", () => {
           method: "bridge_open_tunnel",
           params: { session_id: "s3", port: 9999 },
         },
-        { method: "logout", params: { session_id: "s3" } },
+        { method: "disconnect", params: { session_id: "s3" } },
       ]);
     } finally {
       await daemon.stop();
@@ -320,7 +320,7 @@ describe("run", () => {
       expect(fake.stderrText).toBe("INTERNAL\n");
       expect(daemon.calls).toEqual([
         { method: "open_mcp_server", params: { name: "fake" } },
-        { method: "logout", params: { session_id: "s4" } },
+        { method: "disconnect", params: { session_id: "s4" } },
       ]);
     } finally {
       await daemon.stop();
@@ -345,7 +345,7 @@ describe("run", () => {
       expect(fake.stderrText).toBe("");
       expect(daemon.calls).toEqual([
         { method: "open_mcp_server", params: { name: "fake" } },
-        { method: "logout", params: { session_id: "s5" } },
+        { method: "disconnect", params: { session_id: "s5" } },
       ]);
       expect(signals.listenerCount("SIGTERM")).toBe(0);
       expect(signals.listenerCount("SIGINT")).toBe(0);
@@ -372,7 +372,7 @@ describe("run", () => {
       expect(target.firstLine()).toBe("");
       expect(daemon.calls).toEqual([
         { method: "open_mcp_server", params: { name: "fake" } },
-        { method: "logout", params: { session_id: "s6" } },
+        { method: "disconnect", params: { session_id: "s6" } },
       ]);
     } finally {
       await daemon.stop();

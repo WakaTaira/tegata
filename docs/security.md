@@ -120,7 +120,7 @@ to container peers as well: sessions owned by another principal return
 
 Eleven methods exist: `status`, `list_credentials`, `login`, `login_begin`,
 `login_step`, `authorize_device`, `open_api_proxy`, `open_mcp_server`,
-`disconnect` (with its deprecated alias `logout`), `get_totp`, `lock_vault`, plus the administrative
+`disconnect`, `get_totp`, `lock_vault`, plus the administrative
 methods `admin_peer_issue`, `admin_peer_revoke`, `admin_peer_list`, and
 `admin_token_issue`, and on Windows `admin_seal`, `admin_approval_list`, and
 `admin_approval_decide`. Anything else is answered with a JSON-RPC method-not-found

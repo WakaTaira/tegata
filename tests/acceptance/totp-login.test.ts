@@ -65,10 +65,10 @@ test("AC-48: a {{totp}} step logs in against a TOTP-validating site", async () =
     expect(login.isError, `login failed: ${login.text}`).toBe(false);
     const result = login.json as { session_id: string };
     expect(result.session_id).toBeTruthy();
-    const logout = await mcp.callTool("logout", {
+    const disconnect = await mcp.callTool("disconnect", {
       session_id: result.session_id,
     });
-    expect(logout.isError, logout.text).toBe(false);
+    expect(disconnect.isError, disconnect.text).toBe(false);
   } finally {
     await mcp.close().catch(() => {});
     await fixture.stop().catch(() => {});

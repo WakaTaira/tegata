@@ -54,7 +54,7 @@ describe("AC-105 (docker)", () => {
     } finally {
       if (sessionId !== undefined)
         await stack.mcp
-          .callTool("logout", { session_id: sessionId })
+          .callTool("disconnect", { session_id: sessionId })
           .catch(() => {});
       await stopApiProxyContainerStack(stack);
     }

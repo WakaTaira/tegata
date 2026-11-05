@@ -635,16 +635,6 @@ export function createServer(): McpServer {
   );
 
   server.registerTool(
-    "logout",
-    {
-      description:
-        "Deprecated alias of disconnect, removed in the next minor release. Use disconnect.",
-      inputSchema: { session_id: z.string() },
-    },
-    (args) => forward("logout", args),
-  );
-
-  server.registerTool(
     "get_totp",
     { inputSchema: { cred_id: z.string() } },
     (args) => forward("get_totp", args),

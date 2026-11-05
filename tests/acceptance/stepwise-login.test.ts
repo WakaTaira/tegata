@@ -61,16 +61,16 @@ async function begin(
   return { outcome, pending: expectPending(outcome, "login_begin") };
 }
 
-/** Logout over the UNIX socket and wait until that browser is gone. */
-async function logout(stack: StepwiseStack, sessionId: string) {
+/** Disconnect over the UNIX socket and wait until that browser is gone. */
+async function disconnect(stack: StepwiseStack, sessionId: string) {
   const browsers = browserCount(stack);
-  const res = await rawRpc(stack.daemon.socketPath, "logout", {
+  const res = await rawRpc(stack.daemon.socketPath, "disconnect", {
     session_id: sessionId,
   });
-  stack.observe("rpc:logout", res);
+  stack.observe("rpc:disconnect", res);
   expect(
     res.error,
-    `logout failed: ${JSON.stringify(res.error)}`,
+    `disconnect failed: ${JSON.stringify(res.error)}`,
   ).toBeUndefined();
   await waitForBrowserCount(stack, browsers - 1);
   return res;
@@ -501,7 +501,7 @@ test("AC-166: a stepwise login counts once against the rate limit", async () => 
 
     // When: (after that session ends, so nothing is shared) login_begin
     // twice more, then a fourth login_begin
-    await logout(stack, done.session_id);
+    await disconnect(stack, done.session_id);
     await begin(call, beginParams(stack.fixture));
     await begin(call, beginParams(stack.fixture));
     const fourth = await call("login_begin", beginParams(stack.fixture));
@@ -637,7 +637,7 @@ test("AC-170: restored cookies finish login_begin without a snapshot", async () 
       first.pending.snapshot,
     );
     const firstDone = expectDone(flow.last, "fill_submit the TOTP");
-    await logout(stack, firstDone.session_id);
+    await disconnect(stack, firstDone.session_id);
     await waitUntil(
       "the cookies to be stored",
       () => cookieStoreFiles(stack.daemon.stateDir).length > 0,
@@ -714,8 +714,8 @@ test("AC-172: no secret or raw username reaches any surface of the flow", async 
     );
     record("mcp", [viaMcp.outcome, ...mcpFlow.outcomes]);
     const mcpDone = expectDone(mcpFlow.last, "MCP fill_submit the TOTP");
-    const loggedOut = await logout(stack, mcpDone.session_id);
-    answers.push({ label: "rpc:logout", text: JSON.stringify(loggedOut) });
+    const loggedOut = await disconnect(stack, mcpDone.session_id);
+    answers.push({ label: "rpc:disconnect", text: JSON.stringify(loggedOut) });
 
     const rpc = rpcCaller(stack);
     const viaRpc = await begin(rpc, beginParams(stack.fixture));

@@ -611,15 +611,29 @@ export function createServer(): McpServer {
     "open_api_proxy",
     {
       description:
-        "Open a configured API proxy that injects a stored credential into requests to its fixed upstream. Send requests to base_url followed by the upstream path; close it with logout.",
+        "Open a configured API proxy that injects a stored credential into requests to its fixed upstream. Send requests to base_url followed by the upstream path; close it with disconnect.",
       inputSchema: { name: z.string() },
     },
     (args) => openApiProxyHandler(args),
   );
 
   server.registerTool(
+    "disconnect",
+    {
+      description:
+        "End a tegata session and close its browser when it was the last lease, or close an API proxy. This does not sign out of the site: the site-side session stays valid, and for a credential in persist_cookies the saved cookies stay and are restored at the next login.",
+      inputSchema: { session_id: z.string() },
+    },
+    (args) => forward("disconnect", args),
+  );
+
+  server.registerTool(
     "logout",
-    { inputSchema: { session_id: z.string() } },
+    {
+      description:
+        "Deprecated alias of disconnect, removed in the next minor release. Use disconnect.",
+      inputSchema: { session_id: z.string() },
+    },
     (args) => forward("logout", args),
   );
 

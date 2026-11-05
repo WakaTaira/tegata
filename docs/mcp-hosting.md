@@ -97,16 +97,16 @@ or `open_api_proxy` call for the same credential, also covers
 
 ## Lifetime
 
-The server is a lease like a browser or an API proxy: it ends at `logout`,
+The server is a lease like a browser or an API proxy: it ends at `disconnect`,
 `lock_vault` for its namespace, its session TTL, or the deployment's
-`browser_max_lifetime_secs`, whichever comes first. The runner itself calls
-`logout` as soon as its own stdin closes, the relay connection drops, or it
+`browser_max_lifetime_secs`, whichever comes first. The runner itself ends
+the lease as soon as its own stdin closes, the relay connection drops, or it
 receives SIGTERM or SIGINT — the way an MCP client usually stops a stdio
 server. Independently of the runner, the executor stops the server as soon as
 the relay connection closes, since that connection is never re-established, so
 closing the agent's MCP client tears down the server too, even one that
-ignores the end of its stdin and even if the runner dies before it can log
-out. When the server exits on its own, or is stopped because its connection
+ignores the end of its stdin and even if the runner dies before it can end
+the lease. When the server exits on its own, or is stopped because its connection
 closed, the executor reports the exit and the daemon ends the lease. Stopping the server always means SIGTERM, then SIGKILL two seconds later
 if it has not exited (Windows: a plain kill).
 

@@ -373,8 +373,8 @@ function mutatingFillForm(): string {
 <script>
 const password = document.getElementById("password");
 const nickname = document.getElementById("nickname");
-// 同期要求で報告する。FILL_MISMATCH 後のブラウザ破棄で最後の報告が失われないよう、
-// executor の検査が戻る前に fixture へ状態を届けるためである。
+// Report with a synchronous request, so the state reaches the fixture before the executor's
+// check returns and the last report is not lost when the browser is discarded after FILL_MISMATCH.
 const reportState = () => {
   const request = new XMLHttpRequest();
   request.open("POST", "/mutating-fill-state", false);
@@ -597,8 +597,8 @@ function maskStepwiseValue(value: string, credentials: Credentials): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
-// input イベントを同期要求で報告する。executor の fill が戻る前に、欄へ入った値を fixture に
-// 届けるためである。値は fixture 側で伏せて記録する。
+// Report input events with a synchronous request, so the entered value reaches the fixture before
+// the executor's fill returns. The fixture redacts the value when it records it.
 const STEPWISE_INPUT_REPORTER = `<script>
 document.addEventListener("input", (event) => {
   const target = event.target;
@@ -721,8 +721,8 @@ function stepwiseStickyPage(): string {
 <div id="status"></div>
 <script>
 const stickyPassword = document.getElementById("password");
-// 同期要求で報告する。クリックの処理が進む前に、その時点の password 欄の値の長さを
-// fixture に届けるためである。
+// Report with a synchronous request, so the length of the password field's value at that moment
+// reaches the fixture before the click handling continues.
 const reportSticky = (when, target) => {
   const request = new XMLHttpRequest();
   request.open("POST", "/stepwise/sticky/report", false);
@@ -748,7 +748,7 @@ document.getElementById("sticky-form")?.addEventListener("submit", async (event)
     status.innerHTML = '<div id="welcome">Signed in</div>';
     return;
   }
-  // 誤った password の欄の値はそのまま残し、エラー表示だけを描き直す。
+  // Keep the wrong password in the field and redraw only the error message.
   status.innerHTML = '<div id="login-error">Incorrect password</div>';
   reportSticky("rerender", "status");
 });
@@ -1071,8 +1071,9 @@ const TRAP_VALUE_CANARIES = {
 /** Number of archive links that push the /trap/huge/ pages past 64 KiB. */
 const TRAP_HUGE_ARTICLES = 1200;
 
-// input イベントを同期要求で報告する。iframe の中（別 origin・srcdoc を含む）にも同じ処理を置き、
-// どの文書のどの欄に値が入ったかを fixture へ届ける。値は fixture 側で伏せて記録する。
+// Report input events with a synchronous request. The same handler runs inside iframes (including
+// cross-origin and srcdoc ones), so the fixture learns which field of which document received a
+// value. The fixture redacts the value when it records it.
 const TRAP_INPUT_REPORTER_SOURCE = `document.addEventListener("input", (event) => {
   const target = event.target;
   if (!(target instanceof HTMLInputElement) && !(target instanceof HTMLTextAreaElement)) return;
@@ -1214,7 +1215,7 @@ function trapFramesCrossPage(): string {
   );
 }
 
-// ownerDocument を差し替え、page の JS から見える文書の origin を main frame の origin と偽る。
+// Replace ownerDocument, so page JS sees a document origin that falsely matches the main frame's.
 function trapFramesSpoofPage(port: string): string {
   const claimed = JSON.stringify(`http://127.0.0.1:${port}`);
   return trapPage(

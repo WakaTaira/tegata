@@ -99,7 +99,7 @@ describe("focus-independent fill", () => {
     await page.setContent(`
       <input id="user" type="text">
       <script>
-        // React は value の代入を追跡し、追跡値と一致する input イベントを無視する。
+        // React tracks value assignments and ignores input events that match the tracked value.
         const input = document.getElementById("user");
         const native = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value");
         let tracked = "";

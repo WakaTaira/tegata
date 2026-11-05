@@ -34,7 +34,7 @@ test("AC-95: approve_operator is rejected on Linux because it is Windows-only", 
     expect(exit.code).not.toBeNull();
     expect(exit.code).not.toBe(0);
     expect(exit.stderr).toMatch(/approve_operator/);
-    expect(exit.stderr).toMatch(/Windows.*only|only.*Windows|Windows.*専用/i);
+    expect(exit.stderr).toMatch(/Windows.*only|only.*Windows/i);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

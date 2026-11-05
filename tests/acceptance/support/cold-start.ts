@@ -64,7 +64,7 @@ if [ "\${1:-}" = "login" ] && [ "\${2:-}" = "--check" ]; then
 fi
 
 if [ "\${1:-}" = "login" ] || [ "\${1:-}" = "unlock" ]; then
-  # 診断行のマスク経路を通すため、email・master password・払い出す session key を stderr に混ぜる。
+  # Mix the email, master password, and issued session key into stderr to exercise the diagnostic line's masking.
   printf 'debug: %s %s %s\\n' "$FAKE_BW_EMAIL" "\${BW_PASSWORD:-}" "$FAKE_BW_SESSION" >&2
   printf '%s\\n' "$FAKE_BW_SESSION"
   exit 0

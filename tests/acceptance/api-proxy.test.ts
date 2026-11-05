@@ -107,7 +107,7 @@ async function fetchWithTimeout(
 /** Verifies within 2 seconds that the terminated proxy refuses connections or returns 404. */
 async function expectProxyUnavailable(baseUrl: string): Promise<void> {
   const deadline = Date.now() + 2_000;
-  let lastStatus = "接続結果なし";
+  let lastStatus = "no connection result";
   while (Date.now() < deadline) {
     try {
       const response = await fetchWithTimeout(

@@ -3509,7 +3509,7 @@ function monitorGuardFailure(guard: CdpGuard): void {
 function killBrowserProcess(browserPid: number | undefined): void {
   if (browserPid === undefined) {
     process.stderr.write(
-      "ブラウザプロセスの PID を取得できないため、強制終了を実行できません。\n",
+      "Cannot force-kill the browser because its process ID is unavailable.\n",
     );
     return;
   }

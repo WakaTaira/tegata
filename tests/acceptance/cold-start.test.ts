@@ -28,7 +28,7 @@ function daemonOptions(mode: FakeBwMode, canaries: ColdStartCanaries) {
   };
 }
 
-test("AC-87: Given 偽 bw の最初の `list items` が exit 1、2 回目は正常な JSON / When デーモン起動直後に `list_credentials` / Then 成功し item が返る、`list items` の記録は 2 回、応答まで 2 s 以上", async () => {
+test("AC-87: Given the fake bw's first `list items` exits 1 and the second returns valid JSON / When `list_credentials` runs right after daemon startup / Then it succeeds and returns the item, `list items` is recorded twice, and the response takes at least 2 s", async () => {
   // Given: the first `list items` of the fake bw exits 1, and the second returns valid JSON
   const canaries = scenarioCanaries();
   const daemon = await startColdStartDaemon(
@@ -58,7 +58,7 @@ test("AC-87: Given 偽 bw の最初の `list items` が exit 1、2 回目は正�
   }
 });
 
-test("AC-88: Given 偽 bw の `list items` が常に exit 1 / When 起動直後に `list_credentials` / Then エラーコード `PROVIDER_UNAVAILABLE`、`list items` の記録は 2 回", async () => {
+test("AC-88: Given the fake bw's `list items` always exits 1 / When `list_credentials` runs right after startup / Then the error code is `PROVIDER_UNAVAILABLE` and `list items` is recorded twice", async () => {
   // Given: `list items` of the fake bw always exits 1
   const canaries = scenarioCanaries();
   const daemon = await startColdStartDaemon(
@@ -76,7 +76,7 @@ test("AC-88: Given 偽 bw の `list items` が常に exit 1 / When 起動直後�
   }
 });
 
-test("AC-89: Given 偽 bw の `list items` が不正な JSON を返す / When 起動直後に `list_credentials` / Then `INTERNAL`、`list items` の記録は 1 回（再試行しない）", async () => {
+test("AC-89: Given the fake bw's `list items` returns invalid JSON / When `list_credentials` runs right after startup / Then the error is `INTERNAL` and `list items` is recorded once (no retry)", async () => {
   // Given: `list items` of the fake bw returns invalid JSON
   const canaries = scenarioCanaries();
   const daemon = await startColdStartDaemon(
@@ -94,7 +94,7 @@ test("AC-89: Given 偽 bw の `list items` が不正な JSON を返す / When �
   }
 });
 
-test("AC-90: Given 1 回目の `list_credentials` が成功して catalog が埋まった後、`list items` が常に exit 1 になる / When 2 回目の `list_credentials` / Then `PROVIDER_UNAVAILABLE`、2 回目の呼び出しで増えた `list items` の記録は 1 回（warm は再試行しない）", async () => {
+test("AC-90: Given `list items` always exits 1 after a first `list_credentials` succeeded and filled the catalog / When a second `list_credentials` runs / Then the error is `PROVIDER_UNAVAILABLE` and the second call adds one `list items` record (a warm call does not retry)", async () => {
   // Given: after the first `list_credentials` succeeds and fills the catalog, `list items` always
   // exits 1
   const canaries = scenarioCanaries();
@@ -117,7 +117,7 @@ test("AC-90: Given 1 回目の `list_credentials` が成功して catalog が埋
   }
 });
 
-test('AC-91: Given AC-87 の実行 / When デーモンの stderr を読む / Then `tegatad: bw_version` 行が 1 行、`tegatad: bw_diag {JSON}` 行が bw 呼び出し回数と同数あり、失敗した `list_items` の行に `attempt: 1`・`cold_start: true`・`failure: "exit"`・`exit_code: 1`、再試行の行に `attempt: 2`、全 bw_diag 行に `rpc_id`・`namespace`・`elapsed_ms` がある。stderr にカナリア（email・master password・session key・item 名）が 0 件。', async () => {
+test('AC-91: Given the AC-87 run / When the daemon stderr is read / Then there is one `tegatad: bw_version` line and as many `tegatad: bw_diag {JSON}` lines as bw calls, the failed `list_items` line has `attempt: 1`, `cold_start: true`, `failure: "exit"`, and `exit_code: 1`, the retry line has `attempt: 2`, every bw_diag line has `rpc_id`, `namespace`, and `elapsed_ms`, and stderr contains no canary (email, master password, session key, item name)', async () => {
   // Given: the AC-87 run
   const canaries = scenarioCanaries();
   const daemon = await startColdStartDaemon(
@@ -184,7 +184,7 @@ test('AC-91: Given AC-87 の実行 / When デーモンの stderr を読む / The
   }
 });
 
-test("AC-92: Given AC-88 の状態のデーモンに MCP broker を接続 / When MCP の `list_credentials` / Then ツール結果のエラーコードが `PROVIDER_UNAVAILABLE`（`INTERNAL` に正規化されない）", async () => {
+test("AC-92: Given an MCP broker connected to a daemon in the AC-88 state / When MCP `list_credentials` runs / Then the tool result's error code is `PROVIDER_UNAVAILABLE` (not normalized to `INTERNAL`)", async () => {
   // Given: an MCP broker connected to a daemon in the AC-88 state
   const canaries = scenarioCanaries();
   const daemon = await startColdStartDaemon(

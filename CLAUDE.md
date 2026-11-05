@@ -34,4 +34,4 @@ The relevant integration test is `crates/tegatad/tests/bw_integration.rs`.
 
 Do not casually modify `tests/acceptance/`; it defines the acceptance contract for the system. Never use real authentication credentials, including a real vault password, in tests or development.
 
-All public artifacts must be written in English, including `README.md`, `CLAUDE.md`, CI definitions, and commit messages.
+All public artifacts must be written in English, including `README.md`, `CLAUDE.md`, code comments, test names, CI definitions, and commit messages. This overrides any personal default for comment language.

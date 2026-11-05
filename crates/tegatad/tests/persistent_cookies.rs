@@ -362,10 +362,10 @@ impl Daemon {
         (response, session_id)
     }
 
-    fn logout(&self, session_id: &str) -> Value {
+    fn disconnect(&self, session_id: &str) -> Value {
         let response = rpc(
             &self.socket_path,
-            "logout",
+            "disconnect",
             json!({ "session_id": session_id }),
         );
         assert_eq!(response["result"], json!({ "ok": true }), "{response}");
@@ -421,8 +421,8 @@ fn a_persisted_credential_restores_only_persistent_cookies_on_the_next_login() {
         "the login cookies are stored"
     );
 
-    let logout_response = daemon.logout(&first);
-    let end = daemon.record("logout", &first);
+    let disconnect_response = daemon.disconnect(&first);
+    let end = daemon.record("disconnect", &first);
     assert_eq!(end["cookies_saved"], true);
     let ops = daemon
         .executor_requests()
@@ -459,7 +459,7 @@ fn a_persisted_credential_restores_only_persistent_cookies_on_the_next_login() {
     let stderr = std::fs::read_to_string(daemon.directory.join("stderr.log")).unwrap_or_default();
     for surface in [
         first_response.to_string(),
-        logout_response.to_string(),
+        disconnect_response.to_string(),
         second_response.to_string(),
         audit,
         stderr,
@@ -480,12 +480,12 @@ fn a_credential_outside_persist_cookies_behaves_as_before() {
     let daemon = Daemon::start(&["site-b"], COOKIE_EXECUTOR);
 
     let (_, session) = daemon.login("mock:site");
-    daemon.logout(&session);
+    daemon.disconnect(&session);
     let (_, again) = daemon.login("mock:site");
 
     for record in [
         daemon.record("login", &session),
-        daemon.record("logout", &session),
+        daemon.record("disconnect", &session),
         daemon.record("login", &again),
     ] {
         assert!(record.get("cookies").is_none(), "{record}");
@@ -516,8 +516,11 @@ fn an_executor_without_cookie_support_still_logs_in_and_stores_nothing() {
     assert_eq!(record["cookies"], "none");
     assert_eq!(record["steps_skipped"], false);
 
-    daemon.logout(&session);
-    assert_eq!(daemon.record("logout", &session)["cookies_saved"], false);
+    daemon.disconnect(&session);
+    assert_eq!(
+        daemon.record("disconnect", &session)["cookies_saved"],
+        false
+    );
     assert!(daemon.store_files().is_empty());
 }
 
@@ -525,7 +528,7 @@ fn an_executor_without_cookie_support_still_logs_in_and_stores_nothing() {
 fn a_corrupt_store_file_is_discarded_and_replaced() {
     let daemon = Daemon::start(&["site"], COOKIE_EXECUTOR);
     let (_, first) = daemon.login("mock:site");
-    daemon.logout(&first);
+    daemon.disconnect(&first);
     let files = daemon.store_files();
     assert_eq!(files.len(), 1);
     std::fs::write(&files[0], "{ this is not json").expect("corrupt the store file");
@@ -544,7 +547,7 @@ fn operators_forget_cookies_and_other_peers_are_refused() {
     let daemon = Daemon::start(&["*"], COOKIE_EXECUTOR);
     for cred_id in ["mock:site", "mock:site-b"] {
         let (_, session) = daemon.login(cred_id);
-        daemon.logout(&session);
+        daemon.disconnect(&session);
     }
     assert_eq!(daemon.store_files().len(), 2);
 
@@ -610,7 +613,7 @@ fn startup_removes_files_of_credentials_no_longer_persisted() {
     let mut daemon = Daemon::start(&["*"], COOKIE_EXECUTOR);
     for cred_id in ["mock:site", "mock:site-b"] {
         let (_, session) = daemon.login(cred_id);
-        daemon.logout(&session);
+        daemon.disconnect(&session);
     }
     assert_eq!(daemon.store_files().len(), 2);
 
@@ -749,7 +752,7 @@ fn login_and_authorize_device_share_one_store() {
     let daemon = Daemon::start(&["*"], DEVICE_EXECUTOR);
 
     let (_, session) = daemon.login("mock:site");
-    daemon.logout(&session);
+    daemon.disconnect(&session);
     daemon.authorize_device("mock:site", "device-code");
     let after_login = &daemon.records_of("authorize_device")[0];
     assert_eq!(after_login["cookies"], "restored");
@@ -812,7 +815,7 @@ fn an_oauth_api_proxy_restores_and_saves_cookies_but_a_static_proxy_does_not() {
         1,
         "the OAuth login cookies are stored"
     );
-    let logout_response = daemon.logout(&first);
+    let disconnect_response = daemon.disconnect(&first);
 
     let (second_response, second) = daemon.open_api_proxy("fx");
     let second_record = daemon.record("open_api_proxy", &second);
@@ -854,7 +857,7 @@ fn an_oauth_api_proxy_restores_and_saves_cookies_but_a_static_proxy_does_not() {
     );
     daemon.assert_no_cookie_values(&[
         &first_response,
-        &logout_response,
+        &disconnect_response,
         &second_response,
         &static_response,
     ]);

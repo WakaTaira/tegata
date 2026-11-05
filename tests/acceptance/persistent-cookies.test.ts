@@ -66,21 +66,21 @@ async function login(
 }
 
 /**
- * Logout of a session that holds its own browser, over the UNIX socket, and
+ * Disconnect of a session that holds its own browser, over the UNIX socket, and
  * wait until that browser is gone (the session end has completed).
  */
-async function logout(
+async function disconnect(
   stack: CookieStack,
   sessionId: string,
 ): Promise<Awaited<ReturnType<typeof rawRpc>>> {
   const browsers = browserCount(stack);
-  const res = await rawRpc(stack.daemon.socketPath, "logout", {
+  const res = await rawRpc(stack.daemon.socketPath, "disconnect", {
     session_id: sessionId,
   });
-  stack.observe("rpc:logout", res);
+  stack.observe("rpc:disconnect", res);
   expect(
     res.error,
-    `logout failed: ${JSON.stringify(res.error)}`,
+    `disconnect failed: ${JSON.stringify(res.error)}`,
   ).toBeUndefined();
   await waitForBrowserCount(stack, browsers - 1);
   return res;
@@ -96,14 +96,14 @@ interface Cycle {
   secondRequestCookies: string[][];
 }
 
-/** login -> logout -> login on one credential, measured at the fixture. */
-async function loginLogoutLogin(
+/** login -> disconnect -> login on one credential, measured at the fixture. */
+async function loginDisconnectLogin(
   stack: CookieStack,
   credId = "mock:site",
 ): Promise<Cycle> {
   const start = await cookieFixtureState(stack.fixture);
   const first = await login(stack, credId);
-  await logout(stack, first.session_id);
+  await disconnect(stack, first.session_id);
   const middle = await cookieFixtureState(stack.fixture);
   const second = await login(stack, credId);
   const end = await cookieFixtureState(stack.fixture);
@@ -139,8 +139,8 @@ test("AC-147: without persist_cookies nothing is stored or restored", async () =
   // Given: persist_cookies is not set
   const stack = await startCookieStack({ providers: mockProvider() });
   try {
-    // When: login -> logout -> login on the same credential
-    const cycle = await loginLogoutLogin(stack);
+    // When: login -> disconnect -> login on the same credential
+    const cycle = await loginDisconnectLogin(stack);
 
     // Then: the second login posts the form too (two in total), the cookie
     // store holds no file, and no login record carries cookies/steps_skipped
@@ -161,8 +161,8 @@ test("AC-148: a persisted credential's second login skips the form", async () =>
   // Given: persist_cookies = ["site"]
   const stack = await startCookieStack({ providers: mockProvider(["site"]) });
   try {
-    // When: login -> logout -> login
-    const cycle = await loginLogoutLogin(stack);
+    // When: login -> disconnect -> login
+    const cycle = await loginDisconnectLogin(stack);
 
     // Then: the second login succeeds with no further form POST (one in
     // total) and its first request carries `device`
@@ -196,8 +196,8 @@ test("AC-149: session cookies are not carried over", async () => {
   // Given: the AC-148 configuration (persist_cookies = ["site"])
   const stack = await startCookieStack({ providers: mockProvider(["site"]) });
   try {
-    // When: login -> logout -> login
-    const cycle = await loginLogoutLogin(stack);
+    // When: login -> disconnect -> login
+    const cycle = await loginDisconnectLogin(stack);
 
     // Then: the second login's first request does not carry `sid` (the
     // `device` check confirms the Given: cookies are carried at all)
@@ -213,9 +213,9 @@ test("AC-150: '*' persists every credential, a list only the listed ones", async
   // Given: credentials A and B of one provider, persist_cookies = ["*"]
   const all = await startCookieStack({ providers: mockProvider(["*"]) });
   try {
-    // When: login -> logout -> login on each credential
-    const a = await loginLogoutLogin(all, "mock:site");
-    const b = await loginLogoutLogin(all, "mock:site-b");
+    // When: login -> disconnect -> login on each credential
+    const a = await loginDisconnectLogin(all, "mock:site");
+    const b = await loginDisconnectLogin(all, "mock:site-b");
 
     // Then: both second logins are restored
     expect(loginRecord(all, a.second.session_id)?.cookies).toBe("restored");
@@ -227,9 +227,9 @@ test("AC-150: '*' persists every credential, a list only the listed ones", async
   // Given: the same credentials, persist_cookies = ["site"] (A only)
   const listed = await startCookieStack({ providers: mockProvider(["site"]) });
   try {
-    // When: login -> logout -> login on each credential
-    const a = await loginLogoutLogin(listed, "mock:site");
-    const b = await loginLogoutLogin(listed, "mock:site-b");
+    // When: login -> disconnect -> login on each credential
+    const a = await loginDisconnectLogin(listed, "mock:site");
+    const b = await loginDisconnectLogin(listed, "mock:site-b");
 
     // Then: only A is restored; B posts the form twice
     expect(loginRecord(listed, a.second.session_id)?.cookies).toBe("restored");
@@ -251,7 +251,7 @@ test("AC-151: cookies are not shared across principals", async () => {
   });
   try {
     const p1 = await login(stack, "mock:site");
-    await logout(stack, p1.session_id);
+    await disconnect(stack, p1.session_id);
     expect(cookieStoreFiles(stack.daemon.stateDir).length).toBe(1);
     const p2 = await issuePeer(stack.daemon.socketPath, "p2");
 
@@ -277,10 +277,10 @@ test("AC-151: cookies are not shared across principals", async () => {
 });
 
 test("AC-152: the cookie store is private and holds no credential secret", async () => {
-  // Given: the AC-148 run (persist_cookies = ["site"], login -> logout -> login)
+  // Given: the AC-148 run (persist_cookies = ["site"], login -> disconnect -> login)
   const stack = await startCookieStack({ providers: mockProvider(["site"]) });
   try {
-    await loginLogoutLogin(stack);
+    await loginDisconnectLogin(stack);
 
     // When: <state_dir>/cookies/ is inspected
     const dir = cookieStoreDir(stack.daemon.stateDir);
@@ -311,7 +311,7 @@ test("AC-152: the cookie store is private and holds no credential secret", async
 
 test("AC-153: lock_vault keeps the store; the next login restores", async () => {
   // Given: an age-file provider (unlocked again by its ceremony) with
-  // persist_cookies = ["site"], after the first login and logout
+  // persist_cookies = ["site"], after the first login and disconnect
   const stack = await startCookieStack({
     providers: (canaries, materialsDir) => {
       const { identityPath, recipient } = ageKeygen(materialsDir);
@@ -340,7 +340,7 @@ test("AC-153: lock_vault keeps the store; the next login restores", async () => 
   });
   try {
     const first = await login(stack, "age:site");
-    await logout(stack, first.session_id);
+    await disconnect(stack, first.session_id);
 
     // When: lock_vault -> the implicit unlock ceremony -> login
     const locked = await stack.mcp.callTool("lock_vault", {
@@ -367,9 +367,9 @@ test("AC-154: an operator forgets one credential or all; others are refused", as
   });
   try {
     const a0 = await login(stack, "mock:site");
-    await logout(stack, a0.session_id);
+    await disconnect(stack, a0.session_id);
     const b0 = await login(stack, "mock:site-b");
-    await logout(stack, b0.session_id);
+    await disconnect(stack, b0.session_id);
     expect(cookieStoreFiles(stack.daemon.stateDir).length).toBe(2);
 
     // When: the operator forgets A, then A and B log in
@@ -393,8 +393,8 @@ test("AC-154: an operator forgets one credential or all; others are refused", as
     expect(loginRecord(stack, b1.value.session_id)?.cookies).toBe("restored");
 
     // When: both sessions end, then `tegatad cookies forget --all`, then B
-    await logout(stack, a1.value.session_id);
-    await logout(stack, b1.value.session_id);
+    await disconnect(stack, a1.value.session_id);
+    await disconnect(stack, b1.value.session_id);
     const forgetAll = cookiesForgetCli(stack.daemon.socketPath, { all: true });
     expect(forgetAll.status, forgetAll.stderr).toBe(0);
     const b2 = await postsDuring(stack, () => login(stack, "mock:site-b"));
@@ -434,7 +434,7 @@ test("AC-155: dropping a credential from the list deletes its file at startup", 
   const stack = await startCookieStack({ providers: mockProvider(["site"]) });
   try {
     const first = await login(stack, "mock:site");
-    await logout(stack, first.session_id);
+    await disconnect(stack, first.session_id);
     expect(cookieStoreFiles(stack.daemon.stateDir).length).toBe(1);
 
     // When: A is removed from persist_cookies and the daemon restarts
@@ -461,7 +461,7 @@ test("AC-156: a rejected restored cookie falls back to the login steps", async (
   const stack = await startCookieStack({ providers: mockProvider(["site"]) });
   try {
     const first = await login(stack, "mock:site");
-    await logout(stack, first.session_id);
+    await disconnect(stack, first.session_id);
     expect(cookieStoreFiles(stack.daemon.stateDir).length).toBe(1);
     await invalidateDeviceCookies(stack.fixture);
 
@@ -493,8 +493,11 @@ test("AC-157: cookie values never reach responses, audit, or stderr", async () =
     surfaces.push({ label: "mcp:login", text: JSON.stringify(firstRes) });
     expect(firstRes.isError, firstRes.text).toBe(false);
     const first = firstRes.json as LoginResult;
-    const logoutRes = await logout(stack, first.session_id);
-    surfaces.push({ label: "rpc:logout", text: JSON.stringify(logoutRes) });
+    const disconnectRes = await disconnect(stack, first.session_id);
+    surfaces.push({
+      label: "rpc:disconnect",
+      text: JSON.stringify(disconnectRes),
+    });
     const secondRes = await stack.mcp.callTool(
       "login",
       cookieLoginParams(stack.fixture, "mock:site"),
@@ -528,7 +531,7 @@ test("AC-158: a corrupt store file is replaced after a normal login", async () =
   const stack = await startCookieStack({ providers: mockProvider(["site"]) });
   try {
     const first = await login(stack, "mock:site");
-    await logout(stack, first.session_id);
+    await disconnect(stack, first.session_id);
     const files = cookieStoreFiles(stack.daemon.stateDir);
     expect(files.length).toBe(1);
     const garbage = "{ this is not json";

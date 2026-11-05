@@ -46,11 +46,15 @@ test("AC-68: the pipe SID and a TCP peer own separate sessions", async () => {
       new URL(s2.channel.endpoint).pathname,
     );
 
-    // When: the TCP peer calls logout(s1), and the pipe calls logout(s2)
-    const crossFromBridge = await bridgeRpc(stack.bridge.socketPath, "logout", {
-      session_id: s1.session_id,
-    });
-    const crossFromPipe = await pipeRpc(pipeName, "logout", {
+    // When: the TCP peer calls disconnect(s1), and the pipe calls disconnect(s2)
+    const crossFromBridge = await bridgeRpc(
+      stack.bridge.socketPath,
+      "disconnect",
+      {
+        session_id: s1.session_id,
+      },
+    );
+    const crossFromPipe = await pipeRpc(pipeName, "disconnect", {
       session_id: s2.session_id,
     });
 
@@ -58,12 +62,12 @@ test("AC-68: the pipe SID and a TCP peer own separate sessions", async () => {
     expect(crossFromBridge.error?.message).toBe("NOT_FOUND");
     expect(crossFromPipe.error?.message).toBe("NOT_FOUND");
 
-    // And: logout of one's own lease succeeds
-    const ownPipe = await pipeRpc(pipeName, "logout", {
+    // And: disconnect of one's own lease succeeds
+    const ownPipe = await pipeRpc(pipeName, "disconnect", {
       session_id: s1.session_id,
     });
     expect(ownPipe.result).toEqual({ ok: true });
-    const ownBridge = await bridgeRpc(stack.bridge.socketPath, "logout", {
+    const ownBridge = await bridgeRpc(stack.bridge.socketPath, "disconnect", {
       session_id: s2.session_id,
     });
     expect(ownBridge.result).toEqual({ ok: true });

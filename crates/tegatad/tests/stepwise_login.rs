@@ -427,8 +427,8 @@ fn a_stepwise_login_walks_to_a_handoff() {
     }
 
     // After the handoff, it can be logged out as the same session as login.
-    let logout = daemon.call("logout", json!({ "session_id": session_id }));
-    assert_eq!(logout["result"], json!({ "ok": true }), "{logout}");
+    let disconnect = daemon.call("disconnect", json!({ "session_id": session_id }));
+    assert_eq!(disconnect["result"], json!({ "ok": true }), "{disconnect}");
     daemon.wait_for_shutdowns(1);
     assert_eq!(daemon.status()["browsers"], 0);
 }
@@ -701,7 +701,7 @@ fn a_stepwise_login_counts_once_against_the_rate_limit() {
     }
     let done = daemon.step(&login_id, fill_submit(&["{{password}}"], "#verify"));
     let session_id = done["result"]["session_id"].as_str().expect("session_id");
-    daemon.call("logout", json!({ "session_id": session_id }));
+    daemon.call("disconnect", json!({ "session_id": session_id }));
 
     daemon.begin_pending();
     daemon.begin_pending();
@@ -716,7 +716,7 @@ fn restored_cookies_finish_login_begin_at_once() {
     let done = daemon.step(&login_id, fill_submit(&["{{password}}"], "#verify"));
     let session_id = done["result"]["session_id"].as_str().expect("session_id");
     assert_eq!(daemon.store_files(), 1, "the handoff stored the cookies");
-    daemon.call("logout", json!({ "session_id": session_id }));
+    daemon.call("disconnect", json!({ "session_id": session_id }));
     daemon.wait_for_shutdowns(1);
 
     let again = daemon.begin();
@@ -786,7 +786,7 @@ fn a_handoff_beside_a_shared_session_is_not_shared() {
 
     // A login after the shared session is closed starts a new browser instead of piggybacking on
     // the stepwise login's browser.
-    daemon.call("logout", json!({ "session_id": shared_session }));
+    daemon.call("disconnect", json!({ "session_id": shared_session }));
     daemon.wait_for_shutdowns(1);
     let again = daemon.call(
         "login",

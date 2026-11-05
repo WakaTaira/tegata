@@ -208,7 +208,7 @@ not one attempt per step.
 
 The daemon speaks newline-delimited JSON-RPC 2.0. Method dispatch is an explicit
 allowlist — `status`, `list_credentials`, `login`, `login_begin`, `login_step`,
-`authorize_device`, `disconnect` (and its deprecated alias `logout`), `get_totp`,
+`authorize_device`, `disconnect`, `get_totp`,
 `lock_vault`, `open_api_proxy`, `open_mcp_server`, plus the administrative methods `admin_peer_issue`,
 `admin_peer_revoke`, `admin_peer_list`, and `admin_token_issue`, and on Windows
 `admin_seal`, `admin_approval_list`, and `admin_approval_decide`. Anything else

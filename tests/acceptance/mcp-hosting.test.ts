@@ -362,7 +362,7 @@ test(
     } finally {
       for (const exchange of sockets) exchange.socket.destroy();
       if (sessionId !== undefined)
-        await rawRpc(stack.daemon.socketPath, "logout", {
+        await rawRpc(stack.daemon.socketPath, "disconnect", {
           session_id: sessionId,
         }).catch(() => {});
       await stopHostedMcpStack(stack);

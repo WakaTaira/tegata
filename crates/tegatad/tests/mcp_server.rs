@@ -417,16 +417,16 @@ fn username_only_env_values_are_not_scanned_but_values_with_the_secret_are() {
 }
 
 #[test]
-fn logout_stops_the_server_without_confusing_event_lines_with_responses() {
+fn disconnect_stops_the_server_without_confusing_event_lines_with_responses() {
     let daemon = Daemon::start(Options::new(connecting_executor()));
     let session_id = open(&daemon);
 
-    let logout = rpc(
+    let disconnect = rpc(
         daemon.socket(),
-        "logout",
+        "disconnect",
         json!({ "session_id": session_id }),
     );
-    assert_eq!(logout["result"]["ok"], json!(true));
+    assert_eq!(disconnect["result"]["ok"], json!(true));
     assert_eq!(
         executor_ops(&daemon),
         ["mcp_server_start", "mcp_server_stop", "shutdown"]
@@ -435,7 +435,7 @@ fn logout_stops_the_server_without_confusing_event_lines_with_responses() {
     assert_eq!(status["result"]["leases"], json!(0));
     let again = rpc(
         daemon.socket(),
-        "logout",
+        "disconnect",
         json!({ "session_id": session_id }),
     );
     error_message(&again, "NOT_FOUND");
@@ -462,12 +462,12 @@ fn exit_event_ends_the_lease_and_is_audited() {
     );
     let status = rpc(daemon.socket(), "status", json!({}));
     assert_eq!(status["result"]["leases"], json!(0));
-    let logout = rpc(
+    let disconnect = rpc(
         daemon.socket(),
-        "logout",
+        "disconnect",
         json!({ "session_id": session_id }),
     );
-    error_message(&logout, "NOT_FOUND");
+    error_message(&disconnect, "NOT_FOUND");
 }
 
 #[test]

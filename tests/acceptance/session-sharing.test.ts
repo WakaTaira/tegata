@@ -1,6 +1,6 @@
 // AC-56, AC-57, AC-59, AC-60, AC-61, AC-69, AC-70 — one browser per
 // (principal, namespace, cred_id), one lease per login: joining a live
-// browser, exclusive opt-out, lease-scoped logout and TTL, single-flight
+// browser, exclusive opt-out, lease-scoped disconnect and TTL, single-flight
 // start-up, a tab per lease, and the status counters.
 // Traceability: docs/secret/briefs/tegata-phase4.md acceptance condition
 // AC-56, AC-57, AC-59, AC-60, AC-61, AC-69, AC-70.
@@ -35,14 +35,17 @@ async function mcpLogin(
   return res.json as LoginResult;
 }
 
-async function logout(stack: Phase4Stack, sessionId: string): Promise<void> {
-  const res = await rawRpc(stack.daemon.socketPath, "logout", {
+async function disconnect(
+  stack: Phase4Stack,
+  sessionId: string,
+): Promise<void> {
+  const res = await rawRpc(stack.daemon.socketPath, "disconnect", {
     session_id: sessionId,
   });
-  stack.observe("rpc:logout", res);
+  stack.observe("rpc:disconnect", res);
   expect(
     res.error,
-    `logout failed: ${JSON.stringify(res.error)}`,
+    `disconnect failed: ${JSON.stringify(res.error)}`,
   ).toBeUndefined();
 }
 
@@ -86,7 +89,7 @@ test("AC-57: exclusive: true gets a private browser that nobody joins", async ()
   }
 });
 
-test("AC-59: logout returns one lease; the browser closes with the last one", async () => {
+test("AC-59: disconnect returns one lease; the browser closes with the last one", async () => {
   // Given: two leases s1 / s2 of the same principal share one browser
   const stack = await startPhase4Stack();
   try {
@@ -94,8 +97,8 @@ test("AC-59: logout returns one lease; the browser closes with the last one", as
     const s2 = await unixLogin(stack);
     expect(s2.channel.endpoint).toBe(s1.channel.endpoint);
 
-    // When: logout(s1)
-    await logout(stack, s1.session_id);
+    // When: disconnect(s1)
+    await disconnect(stack, s1.session_id);
     await sleep(1_500);
 
     // Then: the browser count stays at one, and the endpoint of s2 is connectable
@@ -105,8 +108,8 @@ test("AC-59: logout returns one lease; the browser closes with the last one", as
     });
     await browser.close();
 
-    // When: then logout(s2)
-    await logout(stack, s2.session_id);
+    // When: then disconnect(s2)
+    await disconnect(stack, s2.session_id);
 
     // Then: the browser count becomes 0 within 5 s
     await waitUntil(
@@ -213,8 +216,8 @@ test("AC-69: each lease gets its own tab, closed when the lease ends", async () 
     expect(before).toContain(s1.target_id);
     expect(before).toContain(s2.target_id);
 
-    // When: logout(s2)
-    await logout(stack, s2.session_id);
+    // When: disconnect(s2)
+    await disconnect(stack, s2.session_id);
 
     // Then: within 2 s the target of s2 disappears, the target of s1 remains, and the browser count
     // is one

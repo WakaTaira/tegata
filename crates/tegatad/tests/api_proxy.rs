@@ -421,16 +421,16 @@ fn open_api_proxy_injects_the_resolved_value_and_audits_requests() {
 }
 
 #[test]
-fn logout_stops_the_proxy_without_confusing_event_lines_with_responses() {
+fn disconnect_stops_the_proxy_without_confusing_event_lines_with_responses() {
     let daemon = Daemon::start(Options::new(PROXY_EXECUTOR));
     let session_id = open(&daemon);
 
-    let logout = rpc(
+    let disconnect = rpc(
         daemon.socket(),
-        "logout",
+        "disconnect",
         json!({ "session_id": session_id }),
     );
-    assert_eq!(logout["result"]["ok"], json!(true));
+    assert_eq!(disconnect["result"]["ok"], json!(true));
     // If an event line were matched as a response, the executor would be stopped before it receives
     // shutdown.
     assert_eq!(
@@ -458,7 +458,7 @@ fn logout_stops_the_proxy_without_confusing_event_lines_with_responses() {
     assert_eq!(unreachable["outcome"], json!("upstream_unreachable"));
     let again = rpc(
         daemon.socket(),
-        "logout",
+        "disconnect",
         json!({ "session_id": session_id }),
     );
     error_message(&again, "NOT_FOUND");
@@ -654,12 +654,12 @@ fn oauth_api_proxy_sends_oauth_wire_and_audits_token_events() {
                 && record["oauth_action"] == "issued"
         })
     });
-    let logout = rpc(
+    let disconnect = rpc(
         daemon.socket(),
-        "logout",
+        "disconnect",
         json!({ "session_id": session_id }),
     );
-    assert_eq!(logout["result"]["ok"], json!(true));
+    assert_eq!(disconnect["result"]["ok"], json!(true));
     wait_for("revoked oauth audit record", Duration::from_secs(5), || {
         daemon.audit_records().iter().any(|record| {
             record["method"] == "api_proxy_oauth"

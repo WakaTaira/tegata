@@ -175,7 +175,7 @@ The agent-facing surface is seven tools. Nothing else crosses the boundary.
 | `login` | `{cred_id, target_url, steps?, success_selector?, failure_selector?, exclusive?: boolean (dedicated browser)}` | `{session_id, target_id, channel: {kind: "cdp", endpoint}}` |
 | `authorize_device` | `{cred_id, verification_url, user_code, steps?, success_selector, failure_selector?}` | `{ok: true}` — approves a device-code grant in a dedicated browser |
 | `open_api_proxy` | `{name}` | `{session_id, base_url}` — a loopback URL that injects a credential into a fixed upstream API |
-| `disconnect` | `{session_id}` | `{ok}` — ends tegata's session and closes its browser; the site stays signed in. `logout` is a deprecated alias |
+| `disconnect` | `{session_id}` | `{ok}` — ends tegata's session and closes its browser; the site stays signed in |
 | `get_totp` | `{cred_id}` | `{code, expires_in}` — opt-in entries only, rate-limited |
 | `lock_vault` | `{namespace?}` | `{ok}` — locks one provider, or all of them |
 

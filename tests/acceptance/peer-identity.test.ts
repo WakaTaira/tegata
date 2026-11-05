@@ -29,15 +29,15 @@ test("AC-58: another principal can neither log out nor tunnel into a session", a
     const s1 = await peerLogin(stack, p1);
     const cdpPort = endpointPort(s1.channel.endpoint);
 
-    // When: p2 calls logout(s1)
-    const crossLogout = await tcpRpc(tcpPort, p2.token, "logout", {
+    // When: p2 calls disconnect(s1)
+    const crossDisconnect = await tcpRpc(tcpPort, p2.token, "disconnect", {
       session_id: s1.session_id,
     });
-    stack.observe("tcp:logout", crossLogout);
+    stack.observe("tcp:disconnect", crossDisconnect);
 
     // Then: the response is NOT_FOUND, the lease s1 remains, the tunnel of p1 works, and
     // the same tunnel from p2 is NOT_FOUND
-    expect(crossLogout.error?.message).toBe("NOT_FOUND");
+    expect(crossDisconnect.error?.message).toBe("NOT_FOUND");
     expect(await tcpTunnel(tcpPort, p1.token, s1.session_id, cdpPort)).toEqual({
       ok: true,
     });

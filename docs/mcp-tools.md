@@ -519,12 +519,6 @@ says nothing about the site, because `disconnect` never visits the site:
   without signing in again. To make the next login start from the sign-in form, an
   operator runs `tegatad cookies forget <cred_id>` after `disconnect`.
 
-### `logout`
-
-Deprecated alias of `disconnect`, kept so existing clients keep working, and
-removed in the next minor release. It takes the same input, returns the same
-output, and has the same effect. Its audit records carry `method: "logout"`.
-
 ## `authorize_device`
 
 Acts as the human approval step for a device-code grant started by an agent tool

@@ -1,5 +1,5 @@
 // AC-45, AC-46 — audit log maturation: size-based single-generation rotation,
-// and session_id / namespace recorded for logout and lock_vault.
+// and session_id / namespace recorded for disconnect and lock_vault.
 // Traceability: docs/secret/briefs/tegata-phase3.md acceptance condition #14, #15.
 
 import { expect, test } from "vitest";
@@ -44,7 +44,7 @@ test("AC-45: exceeding audit_log_max_bytes rotates one generation", async () => 
   }
 });
 
-test("AC-46: logout and lock_vault records carry their identifiers", async () => {
+test("AC-46: disconnect and lock_vault records carry their identifiers", async () => {
   // Given: a completed login
   const stack = await startPhase3Stack({
     makeProviders: (canaries) => [
@@ -60,21 +60,21 @@ test("AC-46: logout and lock_vault records carry their identifiers", async () =>
     expect(login.isError, `login failed: ${login.text}`).toBe(false);
     const result = login.json as LoginResult;
 
-    // When: logout and lock_vault run and the audit log is read
-    const logout = await stack.mcp.callTool("logout", {
+    // When: disconnect and lock_vault run and the audit log is read
+    const disconnect = await stack.mcp.callTool("disconnect", {
       session_id: result.session_id,
     });
-    expect(logout.isError, logout.text).toBe(false);
+    expect(disconnect.isError, disconnect.text).toBe(false);
     const locked = await stack.mcp.callTool("lock_vault", {
       namespace: "mock",
     });
     expect(locked.isError, locked.text).toBe(false);
 
-    // Then: the logout record names the session and the lock_vault record
+    // Then: the disconnect record names the session and the lock_vault record
     // names the namespace
     const { records } = readAuditRecords(stack.daemon.auditLogPath);
-    const logoutRecord = records.find((r) => r.method === "logout");
-    expect(logoutRecord?.session_id).toBe(result.session_id);
+    const disconnectRecord = records.find((r) => r.method === "disconnect");
+    expect(disconnectRecord?.session_id).toBe(result.session_id);
     const lockRecord = records.find((r) => r.method === "lock_vault");
     expect(lockRecord?.namespace).toBe("mock");
   } finally {

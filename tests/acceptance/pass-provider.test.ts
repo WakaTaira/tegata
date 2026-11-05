@@ -95,10 +95,10 @@ test("AC-43: a pass entry lists, logs in, and serves a TOTP code", async () => {
     const code = (totp.json as { code: string; expires_in: number }).code;
     expect(code).toMatch(/^\d{6}$/);
 
-    const logout = await stack.mcp.callTool("logout", {
+    const disconnect = await stack.mcp.callTool("disconnect", {
       session_id: result.session_id,
     });
-    expect(logout.isError, logout.text).toBe(false);
+    expect(disconnect.isError, disconnect.text).toBe(false);
   } finally {
     // The teardown leak check asserts no canary reached any agent surface
     await stopPhase3Stack(stack);

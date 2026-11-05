@@ -15,8 +15,8 @@ import {
 } from "./support/docker.js";
 import {
   type ContainerStack,
+  hostDisconnect,
   hostLogin,
-  hostLogout,
   probeMounts,
   startContainerStack,
   stopContainerStack,
@@ -98,7 +98,7 @@ describe.skipIf(!dockerAvailable())("AC-71 (docker)", () => {
       );
       expect(viaLoopback.connected, JSON.stringify(viaLoopback)).toBe(false);
     } finally {
-      await hostLogout(stack, login.session_id);
+      await hostDisconnect(stack, login.session_id);
     }
   });
 });

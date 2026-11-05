@@ -2279,9 +2279,7 @@ async fn handle_request(
         "authorize_device" => authorize_device(request, state, peer).await,
         "open_api_proxy" => open_service::<ApiProxyConfig>(request, state, peer).await,
         "open_mcp_server" => open_service::<McpServerConfig>(request, state, peer).await,
-        // logout is a deprecated alias of disconnect and will be removed in the next minor
-        // release.
-        "disconnect" | "logout" => disconnect(request, state, peer).await,
+        "disconnect" => disconnect(request, state, peer).await,
         "get_totp" => get_totp(request, state).await,
         "lock_vault" => lock_vault(request, state).await,
         _ => HandledRequest {
@@ -5639,7 +5637,7 @@ fn audit_param_keys(method: &str) -> &'static [&'static str] {
     match method {
         "login" | "login_begin" => &["cred_id", "target_url"],
         "authorize_device" => &["cred_id", "verification_url"],
-        "disconnect" | "logout" => &["session_id"],
+        "disconnect" => &["session_id"],
         "get_totp" => &["cred_id"],
         "list_credentials" | "lock_vault" => &["namespace"],
         _ => &[],

@@ -205,3 +205,74 @@ test("AC-92: Given an MCP broker connected to a daemon in the AC-88 state / When
     await daemon.stop();
   }
 });
+
+// #59: a rejected refresh token. Once the cached server config is stale, `bw unlock` crashes on
+// `invalid_grant`; the daemon signs in afresh within the same request.
+test.each(["grant-rejected", "grant-rejected-stays-logged-in"] as const)(
+  "AC-209: Given `bw unlock` fails with invalid_grant (%s) / When `list_credentials` runs / Then the daemon logs out and logs in once and the same request succeeds",
+  async (mode) => {
+    // Given: an existing login whose unlock fails with invalid_grant
+    const canaries = scenarioCanaries();
+    const daemon = await startColdStartDaemon(daemonOptions(mode, canaries));
+    try {
+      // When: `list_credentials`
+      const response = await rawRpc(daemon.socketPath, "list_credentials", {});
+
+      // Then: the same request succeeds through one unlock, one logout, and one login
+      expect(response.error).toBeUndefined();
+      expect(response.result).toEqual([
+        expect.objectContaining({ name: canaries.itemName }),
+      ]);
+      expect(daemon.callsNamed("unlock")).toHaveLength(1);
+      expect(daemon.callsNamed("logout")).toHaveLength(1);
+      expect(daemon.loginCalls()).toHaveLength(1);
+
+      // And: the diagnostic lines keep the email, master password, and session key masked
+      expect(daemon.stderr()).toContain("invalid_grant");
+      expect(daemon.stderr()).not.toContain(canaries.email);
+      expect(daemon.stderr()).not.toContain(canaries.masterPassword);
+      expect(daemon.stderr()).not.toContain(canaries.sessionKey);
+    } finally {
+      await daemon.stop();
+    }
+  },
+);
+
+test("AC-210: Given `bw unlock` fails without invalid_grant / When `list_credentials` runs / Then the error is `PROVIDER_UNAVAILABLE` and the login is kept", async () => {
+  // Given: an unlock failure that is not a rejected grant (a wrong master password)
+  const canaries = scenarioCanaries();
+  const daemon = await startColdStartDaemon(
+    daemonOptions("unlock-fail", canaries),
+  );
+  try {
+    // When: `list_credentials`
+    const response = await rawRpc(daemon.socketPath, "list_credentials", {});
+
+    // Then: it fails as before, with no logout and no login
+    expect(response.error?.message).toBe("PROVIDER_UNAVAILABLE");
+    expect(daemon.callsNamed("logout")).toHaveLength(0);
+    expect(daemon.loginCalls()).toHaveLength(0);
+  } finally {
+    await daemon.stop();
+  }
+});
+
+test("AC-211: Given the login after a rejected grant also answers invalid_grant / When `list_credentials` runs / Then the error is `PROVIDER_UNAVAILABLE` and no further logout runs", async () => {
+  // Given: unlock fails with invalid_grant, and so does the login that follows
+  const canaries = scenarioCanaries();
+  const daemon = await startColdStartDaemon(
+    daemonOptions("grant-rejected-relogin-fails", canaries),
+  );
+  try {
+    // When: `list_credentials`, which a cold start tries twice
+    const response = await rawRpc(daemon.socketPath, "list_credentials", {});
+
+    // Then: it fails. invalid_grant on login is a plain failure, so only the unlock led to a logout
+    expect(response.error?.message).toBe("PROVIDER_UNAVAILABLE");
+    expect(daemon.callsNamed("unlock")).toHaveLength(1);
+    expect(daemon.callsNamed("logout")).toHaveLength(1);
+    expect(daemon.loginCalls()).toHaveLength(2);
+  } finally {
+    await daemon.stop();
+  }
+});

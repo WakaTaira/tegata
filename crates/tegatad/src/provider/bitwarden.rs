@@ -180,6 +180,28 @@ impl fmt::Display for BwRunError {
 
 impl std::error::Error for BwRunError {}
 
+/// Why a session could not be established. The failed bw run stays available so that
+/// `unlock_or_relogin` can tell a rejected grant from any other unlock failure.
+enum BwEstablishError {
+    Run(BwRunError),
+    Other(ErrorCode),
+}
+
+impl From<ErrorCode> for BwEstablishError {
+    fn from(error: ErrorCode) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl BwEstablishError {
+    fn into_error_code(self) -> ErrorCode {
+        match self {
+            Self::Run(error) => classify_bw_run_error(&error),
+            Self::Other(error) => error,
+        }
+    }
+}
+
 enum BwOperationError {
     Normal(ErrorCode),
     NoColdStartRetry(ErrorCode),
@@ -188,6 +210,12 @@ enum BwOperationError {
 impl From<ErrorCode> for BwOperationError {
     fn from(error: ErrorCode) -> Self {
         Self::Normal(error)
+    }
+}
+
+impl From<BwEstablishError> for BwOperationError {
+    fn from(error: BwEstablishError) -> Self {
+        Self::Normal(error.into_error_code())
     }
 }
 
@@ -740,11 +768,11 @@ impl BitwardenCliProvider {
         login_args: &[String],
         password: &Secret,
         context: BwAttemptContext,
-    ) -> Result<String, ErrorCode> {
+    ) -> Result<String, BwEstablishError> {
         let mut session = self
             .run_bw_with_context(login_args, None, Some(password), context)
             .await
-            .map_err(|error| classify_bw_run_error(&error))?;
+            .map_err(BwEstablishError::Run)?;
         let value = session_key_from_stdout(&std::mem::take(&mut session.stdout));
         match value {
             Some(value) => {
@@ -753,7 +781,7 @@ impl BitwardenCliProvider {
             }
             None => {
                 session.finish(Some("parse"), None);
-                Err(ErrorCode::Internal)
+                Err(ErrorCode::Internal.into())
             }
         }
     }
@@ -789,7 +817,7 @@ impl BitwardenCliProvider {
         login_args: &[String],
         password: &Secret,
         context: BwAttemptContext,
-    ) -> Result<(), ErrorCode> {
+    ) -> Result<(), BwEstablishError> {
         let session = Secret::new(
             self.login_with_password(login_args, password, context)
                 .await?,
@@ -804,7 +832,41 @@ impl BitwardenCliProvider {
         }
         self.session = None;
         self.unlocked_at = None;
-        Err(ErrorCode::Internal)
+        Err(ErrorCode::Internal.into())
+    }
+
+    /// Unlocks the existing login. When the server has rejected the login's grant, unlocking can
+    /// never succeed again, so this signs in afresh once. The password is the one already fetched.
+    async fn unlock_or_relogin(
+        &mut self,
+        password: &Secret,
+        context: BwAttemptContext,
+    ) -> Result<(), BwEstablishError> {
+        let unlock_args = vec!["unlock".to_owned(), "--raw".to_owned()];
+        match self
+            .establish_session(&unlock_args, password, context)
+            .await
+        {
+            Err(BwEstablishError::Run(error)) if unlock_grant_was_rejected(&error) => {
+                // bw 2026.8.0 clears its own login state before it crashes, so "not logged in" is
+                // the usual answer here. `logout_best_effort` ignores it.
+                self.logout_best_effort(context).await;
+                let login_args = self.login_args();
+                self.establish_session(&login_args, password, context).await
+            }
+            result => result,
+        }
+    }
+
+    fn login_args(&self) -> Vec<String> {
+        vec!["login".to_owned(), self.email.clone(), "--raw".to_owned()]
+    }
+
+    /// A logout failure is not fatal. It is recorded only in the diagnostic line.
+    async fn logout_best_effort(&self, context: BwAttemptContext) {
+        let _ = self
+            .run_bw_with_context(&["logout".to_owned()], None, None, context)
+            .await;
     }
 
     async fn sync_session(&mut self, context: BwAttemptContext) -> Result<(), BwRunError> {
@@ -888,11 +950,7 @@ impl BitwardenCliProvider {
             // If the server differs, the login state must be discarded before changing the configuration.
             let logged_in = self.login_check(context).await?;
             if logged_in {
-                // A logout failure is still not fatal, as before. Record the failure only in the
-                // diagnostic line and continue.
-                let _ = self
-                    .run_bw_with_context(&["logout".to_owned()], None, None, context)
-                    .await;
+                self.logout_best_effort(context).await;
             }
             self.run_bw_with_context(
                 &[
@@ -907,14 +965,13 @@ impl BitwardenCliProvider {
             .await
             .map_err(|error| classify_bw_run_error(&error))?;
         }
-        let logged_in = self.login_check(context).await?;
-        let login_args = if logged_in {
-            vec!["unlock".to_owned(), "--raw".to_owned()]
+        if self.login_check(context).await? {
+            self.unlock_or_relogin(&password, context).await?;
         } else {
-            vec!["login".to_owned(), self.email.clone(), "--raw".to_owned()]
-        };
-        self.establish_session(&login_args, &password, context)
-            .await?;
+            let login_args = self.login_args();
+            self.establish_session(&login_args, &password, context)
+                .await?;
+        }
         drop(password);
         if let Err(error) = self.sync_session(context).await {
             self.session = None;
@@ -924,12 +981,10 @@ impl BitwardenCliProvider {
                     &error,
                 )));
             }
-            let _ = self
-                .run_bw_with_context(&["logout".to_owned()], None, None, context)
-                .await;
+            self.logout_best_effort(context).await;
 
             let password = self.password().await?;
-            let login_args = vec!["login".to_owned(), self.email.clone(), "--raw".to_owned()];
+            let login_args = self.login_args();
             self.establish_session(&login_args, &password, context)
                 .await?;
             drop(password);
@@ -1119,6 +1174,15 @@ fn should_retry_login_after_sync(error: &BwRunError) -> bool {
     matches!(error, BwRunError::NonZeroExit(_, _))
 }
 
+/// Whether a failed `bw unlock` means the server no longer accepts the login's refresh token. Once
+/// the cached server config goes stale, unlock refreshes it, the token refresh answers
+/// `invalid_grant`, and bw exits 1. A wrong master password fails before that with a decryption
+/// error, so it does not match.
+fn unlock_grant_was_rejected(error: &BwRunError) -> bool {
+    matches!(error, BwRunError::NonZeroExit(_, stderr)
+        if String::from_utf8_lossy(stderr).contains("invalid_grant"))
+}
+
 fn classify_second_sync_failure(error: &BwRunError) -> BwOperationError {
     let error_code = classify_bw_run_error(error);
     if should_retry_login_after_sync(error) {
@@ -1167,7 +1231,7 @@ mod tests {
     use super::{
         BwAttemptContext, BwOperationError, BwRunError, can_retry_cold_start,
         classify_bw_run_error, classify_second_sync_failure, issued_session_secrets,
-        sanitize_stderr, should_resync, should_retry_login_after_sync,
+        sanitize_stderr, should_resync, should_retry_login_after_sync, unlock_grant_was_rejected,
     };
     use crate::ErrorCode;
     use std::path::Path;
@@ -1313,6 +1377,30 @@ mod tests {
             status,
             Vec::new(),
         )));
+    }
+
+    #[test]
+    fn treats_only_a_nonzero_exit_naming_invalid_grant_as_a_rejected_grant() {
+        #[cfg(unix)]
+        let status = std::process::Command::new("sh")
+            .args(["-c", "exit 1"])
+            .status()
+            .expect("spawn shell");
+        #[cfg(windows)]
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "exit", "1"])
+            .status()
+            .expect("spawn command shell");
+        let rejected = b"ErrorResponse {\n  response: { error: 'invalid_grant' },\n".to_vec();
+        assert!(unlock_grant_was_rejected(&BwRunError::NonZeroExit(
+            status,
+            rejected.clone(),
+        )));
+        assert!(!unlock_grant_was_rejected(&BwRunError::NonZeroExit(
+            status,
+            b"Cryptography error, The decryption operation failed".to_vec(),
+        )));
+        assert!(!unlock_grant_was_rejected(&BwRunError::Timeout(rejected)));
     }
 
     #[test]

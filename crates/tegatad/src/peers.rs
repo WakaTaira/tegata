@@ -205,7 +205,8 @@ pub(crate) fn fill_random(bytes: &mut [u8]) -> io::Result<()> {
         };
 
         let status = unsafe {
-            // SAFETY: バッファは指定した長さだけ有効であり、システム RNG ではハンドルを null にします。
+            // SAFETY: The buffer is valid for the given length, and the handle is null because the
+            // system RNG is used.
             BCryptGenRandom(
                 std::ptr::null_mut(),
                 bytes.as_mut_ptr(),

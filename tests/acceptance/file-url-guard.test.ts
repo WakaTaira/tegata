@@ -17,9 +17,9 @@ interface LoginResult {
 }
 
 /**
- * 生の CDP クライアント。tests/acceptance/support/vm-e2e.mjs の
- * inspectSession と同じ send/pending 実装をここに持つ（harness.ts は
- * 触らない方針のため、ローカルに複製する）。
+ * A raw CDP client. It carries its own copy of the send/pending implementation of
+ * inspectSession in tests/acceptance/support/vm-e2e.mjs (copied locally because
+ * harness.ts is left untouched).
  */
 class CdpClient {
   private ws: WebSocket;
@@ -80,7 +80,7 @@ async function login(stack: Stack): Promise<LoginResult> {
   return res.json as LoginResult;
 }
 
-/** 新規 browser context にページを作り、そのセッションへ attach する。 */
+/** Creates a page in a new browser context and attaches to that session. */
 async function openPageSession(
   client: CdpClient,
 ): Promise<{ sessionId: string }> {
@@ -106,7 +106,7 @@ async function navigateAndInspect(
   url: string,
 ): Promise<{ errorText: unknown; innerText: unknown; href: unknown }> {
   const navResult = await client.send("Page.navigate", { url }, sessionId);
-  // ガードによる遮断は非同期に効くことがあるため、少し待ってから DOM を読む。
+  // The guard's blocking can take effect asynchronously, so wait briefly before reading the DOM.
   await new Promise((r) => setTimeout(r, 1_500));
   const evalResult = await client.send(
     "Runtime.evaluate",
@@ -130,7 +130,8 @@ async function navigateAndInspect(
 }
 
 test("AC-53a: navigating to a local file:// URL is denied and yields no page content", async () => {
-  // Given: 通常ハーネス（uid 分離なし）でログイン済みで、0644 で書いたカナリアファイルがある
+  // Given: logged in under the regular harness (no uid separation), with a canary file written with
+  // mode 0644
   const stack = await startStack();
   const canaryDir = fs.mkdtempSync(
     path.join(os.tmpdir(), "tegata-file-canary-"),
@@ -144,14 +145,15 @@ test("AC-53a: navigating to a local file:// URL is denied and yields no page con
     client = await CdpClient.connect(result.channel.endpoint);
     const { sessionId } = await openPageSession(client);
 
-    // When: そのファイルの file:// URL へ遷移する
+    // When: navigate to the file:// URL of that file
     const { errorText, innerText, href } = await navigateAndInspect(
       client,
       sessionId,
       `file://${canaryPath}`,
     );
 
-    // Then: 遷移結果は net::ERR_ACCESS_DENIED、ページはブラウザのエラーページで、本文はカナリアを含まない
+    // Then: the navigation result is net::ERR_ACCESS_DENIED, the page is the browser error page,
+    // and its body does not contain the canary
     expect(errorText).toBe("net::ERR_ACCESS_DENIED");
     expect(String(href).startsWith("chrome-error://")).toBe(true);
     expect(String(innerText)).not.toContain(canary);
@@ -163,7 +165,7 @@ test("AC-53a: navigating to a local file:// URL is denied and yields no page con
 });
 
 test("AC-53b: navigating to file:///proc/ is denied and yields no directory listing", async () => {
-  // Given: 通常ハーネス（uid 分離なし）でログイン済み
+  // Given: logged in under the regular harness (no uid separation)
   const stack = await startStack();
   let client: CdpClient | undefined;
   try {
@@ -171,14 +173,15 @@ test("AC-53b: navigating to file:///proc/ is denied and yields no directory list
     client = await CdpClient.connect(result.channel.endpoint);
     const { sessionId } = await openPageSession(client);
 
-    // When: file:///proc/ へ遷移する
+    // When: navigate to file:///proc/
     const { errorText, innerText, href } = await navigateAndInspect(
       client,
       sessionId,
       "file:///proc/",
     );
 
-    // Then: 遷移結果は net::ERR_ACCESS_DENIED、ページはブラウザのエラーページで、本文はディレクトリ一覧（cpuinfo・meminfo・self）を含まない
+    // Then: the navigation result is net::ERR_ACCESS_DENIED, the page is the browser error page,
+    // and its body does not contain a directory listing (cpuinfo, meminfo, self)
     expect(errorText).toBe("net::ERR_ACCESS_DENIED");
     expect(String(href).startsWith("chrome-error://")).toBe(true);
     for (const entry of ["cpuinfo", "meminfo", "self"]) {

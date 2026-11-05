@@ -1,12 +1,12 @@
 import { randomBytes } from "node:crypto";
 import type { AddressInfo, Server } from "node:net";
 
-/** loopback リスナーの利用者を識別する secret（128 bit、base64url）を生成する。 */
+/** Generates the secret (128 bit, base64url) that identifies the user of a loopback listener. */
 export function createLoopbackSecret(): string {
   return randomBytes(16).toString("base64url");
 }
 
-/** 127.0.0.1 の空きポートで待ち受け、割り当てられたポートを返す。 */
+/** Listens on a free port of 127.0.0.1 and returns the assigned port. */
 export function listenLoopback(server: Server): Promise<number> {
   return new Promise((resolve, reject) => {
     server.once("error", reject);
@@ -17,7 +17,7 @@ export function listenLoopback(server: Server): Promise<number> {
   });
 }
 
-/** 待ち受けを止め、既存の接続がすべて閉じた時点で解決する。 */
+/** Stops listening and resolves once all existing connections have closed. */
 export function closeServer(server: Server): Promise<void> {
   return new Promise((resolve) => {
     server.close(() => resolve());

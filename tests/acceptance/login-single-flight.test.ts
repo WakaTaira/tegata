@@ -25,31 +25,31 @@ async function loginCode(stack: Phase4Stack): Promise<string | undefined> {
 }
 
 test("AC-62: repeated failures on one key back off and are rate limited", async () => {
-  // Given: fixture が常に拒否する cred F（mock:site-badpass）
+  // Given: cred F (mock:site-badpass), which the fixture always rejects
   const stack = await startPhase4Stack();
   try {
-    // When: login(F)（試行 1、失敗）
+    // When: login(F) (attempt 1, fails)
     expect(await loginCode(stack)).toBe("INVALID_CREDENTIAL");
     expect(stack.fixture.loginPosts()).toBe(1);
 
-    // When: 直後に login(F)
-    // Then: バックオフ中なので RATE_LIMITED、POST /login は増えない
+    // When: login(F) immediately afterwards
+    // Then: RATE_LIMITED because of the backoff, and POST /login does not increase
     expect(await loginCode(stack)).toBe("RATE_LIMITED");
     expect(stack.fixture.loginPosts()).toBe(1);
 
-    // When: 2 s 待って login(F)（試行 2、失敗）
+    // When: wait 2 s, then login(F) (attempt 2, fails)
     await sleep(2_500);
     expect(await loginCode(stack)).toBe("INVALID_CREDENTIAL");
     expect(stack.fixture.loginPosts()).toBe(2);
 
-    // When: 5 s 待って login(F)（試行 3、失敗）
+    // When: wait 5 s, then login(F) (attempt 3, fails)
     await sleep(5_500);
     expect(await loginCode(stack)).toBe("INVALID_CREDENTIAL");
     expect(stack.fixture.loginPosts()).toBe(3);
 
-    // When: 15 s 待って login(F)
-    // Then: 10 分窓で 4 回目の起動になるため RATE_LIMITED、POST /login は
-    // 合計 3 回のまま
+    // When: wait 15 s, then login(F)
+    // Then: RATE_LIMITED because this would be the fourth launch in the 10-minute window,
+    // and POST /login stays at 3 in total
     await sleep(15_500);
     expect(await loginCode(stack)).toBe("RATE_LIMITED");
     expect(stack.fixture.loginPosts()).toBe(3);

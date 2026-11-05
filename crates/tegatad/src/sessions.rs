@@ -23,14 +23,15 @@ impl BrowserKey {
     }
 }
 
-/// 起動制御（試行回数の上限とバックオフ）を共有する単位。
+/// A unit that shares launch control (the attempt limit and backoff).
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum StartKey {
-    /// `login` のブラウザ起動。資格と呼び出し元の組ごとに制御する。
+    /// Browser launch for `login`. Controlled per pair of credential and caller.
     Browser(BrowserKey),
-    /// `open_api_proxy` のプロキシ起動。呼び出し元と `[[api_proxy]]` の名前の組ごとに制御する。
+    /// Proxy launch for `open_api_proxy`. Controlled per pair of caller and `[[api_proxy]]` name.
     ApiProxy { principal: String, name: String },
-    /// `open_mcp_server` の MCP サーバー起動。呼び出し元と `[[mcp_server]]` の名前の組ごとに制御する。
+    /// MCP server launch for `open_mcp_server`. Controlled per pair of caller and `[[mcp_server]]`
+    /// name.
     McpServer { principal: String, name: String },
 }
 
@@ -40,28 +41,32 @@ pub(crate) struct Lease {
     pub(crate) target: LeaseTarget,
 }
 
-/// リースが executor 上で占有している資源。リース終了時の解放要求の種類を決める。
+/// The resource a lease occupies on the executor. It determines the kind of release request sent
+/// when the lease ends.
 pub(crate) enum LeaseTarget {
-    /// ブラウザのタブ。解放は `release {target_id}` で行う。
+    /// A browser tab. It is released with `release {target_id}`.
     Tab(String),
-    /// 注入プロキシのリスナー。解放は `api_proxy_stop` で行う。
+    /// A listener of the injection proxy. It is released with `api_proxy_stop`.
     ApiProxy,
-    /// executor が起動した stdio MCP サーバーと中継のリスナー。解放は `mcp_server_stop` で行う。
+    /// A stdio MCP server started by the executor, together with the relay listener. It is released
+    /// with `mcp_server_stop`.
     McpServer,
 }
 
 impl LeaseTarget {
-    /// ブラウザのタブではなく、executor 接続 1 本を占有するサービス（注入プロキシ・MCP サーバー）であるかを判定する。
+    /// Returns whether this is a service (injection proxy or MCP server) that occupies one executor
+    /// connection, rather than a browser tab.
     pub(crate) fn is_service(&self) -> bool {
         matches!(self, Self::ApiProxy | Self::McpServer)
     }
 }
 
-/// executor 接続 1 本と、その上のリースの集合。
+/// One executor connection and the set of leases on it.
 ///
-/// ブラウザだけでなく注入プロキシと MCP サーバーも表す。これらのサービスの場合、`port` はリスナーの
-/// ポートであり、`endpoint` は空、リースは `LeaseTarget::ApiProxy` または `LeaseTarget::McpServer` の
-/// 1 件のみとなる。
+/// It represents not only browsers but also injection proxies and MCP servers. For these services,
+/// `port` is the port of the
+/// listener, `endpoint` is empty, and there is exactly one lease, either `LeaseTarget::ApiProxy` or
+/// `LeaseTarget::McpServer`.
 pub(crate) struct Browser {
     pub(crate) key: BrowserKey,
     pub(crate) executor: Arc<ExecutorConnection>,
@@ -70,21 +75,22 @@ pub(crate) struct Browser {
     pub(crate) deadline: Instant,
     pub(crate) leases: HashMap<String, Lease>,
     pub(crate) exclusive: bool,
-    /// `login` が起動したブラウザで、その資格が `persist_cookies` の対象であるか。
-    /// 真のとき、ブラウザの終了時に cookie を書き出して保管する。
+    /// Whether this is a browser started by `login` whose credential is a `persist_cookies` target.
+    /// If true, the cookies are written out and stored when the browser exits.
     pub(crate) persist_cookies: bool,
 }
 
 impl Browser {
-    /// 注入プロキシまたは MCP サーバーを表すかを判定する。これらのリースだけがサービスの `LeaseTarget` を持つ。
+    /// Returns whether this represents an injection proxy or an MCP server. Only these leases carry
+    /// the service `LeaseTarget`.
     pub(crate) fn is_service(&self) -> bool {
         self.leases.values().any(|lease| lease.target.is_service())
     }
 }
 
-/// 試行の上限を数える期間。
+/// The period over which the attempt limit is counted.
 const START_ATTEMPT_WINDOW_SECS: u64 = 600;
-/// 期間内に許す起動の試行回数。
+/// The number of launch attempts allowed within the period.
 const MAX_START_ATTEMPTS: usize = 3;
 
 pub(crate) struct StartControl {
@@ -107,7 +113,7 @@ impl StartControl {
             .retain(|attempt| now.duration_since(*attempt).as_secs() < START_ATTEMPT_WINDOW_SECS);
     }
 
-    /// 試行回数の上限に達しているか、バックオフ中であるかを判定する。
+    /// Returns whether the attempt limit has been reached or a backoff is in effect.
     pub(crate) fn is_limited(&mut self, now: Instant) -> bool {
         self.prune_attempts(now);
         self.attempts.len() >= MAX_START_ATTEMPTS || self.retry_at.is_some_and(|retry| retry > now)
@@ -123,7 +129,7 @@ impl StartControl {
         self.retry_at = None;
     }
 
-    /// 連続失敗の回数に応じて 2 秒・5 秒・15 秒のバックオフを設定する。
+    /// Sets a backoff of 2, 5 or 15 seconds according to the number of consecutive failures.
     pub(crate) fn record_failure(&mut self, now: Instant) {
         self.consecutive_failures += 1;
         let delay = match self.consecutive_failures {

@@ -28,7 +28,7 @@ pub(crate) struct CredentialRef {
 pub(crate) struct ResolvedCredential {
     pub(crate) locked: bool,
     pub(crate) secrets_preregistered: bool,
-    /// 資格に登録されたログイン先の URI。provider が持たない場合は `None` である。
+    /// The login URI registered for the credential. `None` if the provider has none.
     pub(crate) uri: Option<String>,
     pub(crate) username: Secret,
     pub(crate) password: Secret,

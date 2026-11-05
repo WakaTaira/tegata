@@ -20,9 +20,9 @@ interface ContainerProbe {
 }
 
 describe("AC-105 (docker)", () => {
-  // Given: agent コンテナの tegata-bridge と MCP（TEGATA_BRIDGE=1）
-  // When: MCP の open_api_proxy の base_url + "/api/whoami" へコンテナ内から GET
-  // Then: HTTP 200 で、本文が {"user":"fixture"}
+  // Given: tegata-bridge and MCP (TEGATA_BRIDGE=1) in the agent container
+  // When: GET base_url + "/api/whoami" from MCP open_api_proxy, issued inside the container
+  // Then: HTTP 200 with body {"user":"fixture"}
   test("AC-105: the agent container reaches the API proxy through bridge MCP", async () => {
     if (!dockerAvailable())
       throw new Error("Docker daemon is unavailable for AC-105");

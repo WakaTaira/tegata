@@ -1,8 +1,9 @@
-//! 段階ログイン（`login_begin` / `login_step`）。
+//! Stepwise login (`login_begin` / `login_step`).
 //!
-//! 段階ログインのブラウザは、ハンドオフ（`success_selector` の一致）まではこの台帳にのみ置き、
-//! `DaemonState::browsers` には登録しない。ハンドオフの時点で `login` と同じ規則のブラウザ
-//! セッションへ昇格させる。ハンドオフ前の応答には CDP endpoint を載せない。
+//! Until the handoff (a match of `success_selector`), the browser of a stepwise login is held only
+//! in this ledger
+//! and is not registered in `DaemonState::browsers`. At the handoff it is promoted to a browser
+//! session under the same rules as `login`. Responses before the handoff carry no CDP endpoint.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,13 +30,13 @@ use crate::{
     service_launch_settings, shutdown_executor_handle, start_control, stop_child, success,
 };
 
-/// `stepwise_idle_secs` の既定値。
+/// Default value of `stepwise_idle_secs`.
 pub(crate) const DEFAULT_IDLE_SECS: u64 = 120;
-/// `stepwise_max_secs` の既定値。
+/// Default value of `stepwise_max_secs`.
 pub(crate) const DEFAULT_MAX_SECS: u64 = 600;
-/// 1 回の段階ログインで受け付ける `login_step` の上限。
+/// Maximum number of `login_step` calls accepted in one stepwise login.
 const MAX_STEPS: usize = 40;
-/// `fill_submit` の `fills` の上限。
+/// Maximum number of `fills` in `fill_submit`.
 const MAX_FILLS: usize = 3;
 const USERNAME_PLACEHOLDER: &str = "{{username}}";
 const PASSWORD_PLACEHOLDER: &str = "{{password}}";
@@ -67,11 +68,11 @@ struct StepParams {
     action: StepAction,
 }
 
-/// `ref` の最大長。
+/// Maximum length of `ref`.
 const MAX_REF_LEN: usize = 32;
 
-/// 要素の指定。`ref`（スナップショットの参照）か `selector`（CSS）のどちらか一方だけを持つ。
-/// executor へは持っている方だけを平坦に送る。
+/// Element designation. It has exactly one of `ref` (a snapshot reference) or `selector` (CSS).
+/// Only the one that is present is sent to the executor, flattened.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 struct ElementRef {
     #[serde(
@@ -89,7 +90,8 @@ struct ElementRef {
     selector: Option<String>,
 }
 
-/// キーが存在する場合は文字列だけを受け付け、明示的な `null` を拒否する（キーの欠落は `default` で `None`）。
+/// Accepts only a string when the key is present and rejects an explicit `null` (a missing key
+/// becomes `None` through `default`).
 fn present_string<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {
@@ -104,7 +106,8 @@ impl ElementRef {
         }
     }
 
-    /// どちらか一方だけが指定され、`ref` は形式（`^(f\d+)?e\d+$`、32 文字以下）に合うかを判定する。
+    /// Checks that exactly one of them is specified and that `ref` matches the format
+    /// (`^(f\d+)?e\d+$`, at most 32 characters).
     fn is_valid(&self) -> bool {
         match (&self.element_ref, &self.selector) {
             (Some(element_ref), None) => is_valid_ref(element_ref),
@@ -114,7 +117,7 @@ impl ElementRef {
     }
 }
 
-/// `ref` の形式 `^(f\d+)?e\d+$`（32 文字以下）を判定する。
+/// Checks the `ref` format `^(f\d+)?e\d+$` (at most 32 characters).
 fn is_valid_ref(value: &str) -> bool {
     let digits = |text: &str| !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
     if value.len() > MAX_REF_LEN {
@@ -130,8 +133,8 @@ fn is_valid_ref(value: &str) -> bool {
     rest.strip_prefix('e').is_some_and(digits)
 }
 
-/// `submit` の対象。文字列形（selector の省略形）とオブジェクト形を受け付け、
-/// executor へは常にオブジェクト形で送る。
+/// Target of `submit`. Accepts a string form (the short form of a selector) and an object form,
+/// and always sends the object form to the executor.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(transparent)]
 struct SubmitTarget(ElementRef);
@@ -151,7 +154,8 @@ impl<'de> Deserialize<'de> for SubmitTarget {
     }
 }
 
-/// `login_step` の action。executor へはこの形のまま（`action` と各フィールドを平坦に）送る。
+/// Action of `login_step`. It is sent to the executor in this shape (`action` and each field,
+/// flattened).
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 enum StepAction {
@@ -199,7 +203,8 @@ impl Submit {
 }
 
 impl StepAction {
-    /// 要素の指定（`ref` と `selector` の排他・`ref` の形式）が正しいかを判定する。
+    /// Checks that the element designation is valid (`ref` and `selector` are mutually
+    /// exclusive, and `ref` has the correct format).
     fn has_valid_targets(&self) -> bool {
         match self {
             Self::Click { target } | Self::WaitFor { target } | Self::Fill { target, .. } => {
@@ -212,7 +217,8 @@ impl StepAction {
         }
     }
 
-    /// 要素の指定が正しく、値がプレースホルダであり、secret（`{{password}}` / `{{totp}}`）が `fill_submit` の中にだけ現れるかを判定する。
+    /// Checks that the element designation is valid, that the values are placeholders, and that
+    /// a secret (`{{password}}` / `{{totp}}`) appears only inside `fill_submit`.
     fn is_valid(&self) -> bool {
         if !self.has_valid_targets() {
             return false;
@@ -232,13 +238,14 @@ impl StepAction {
         }
     }
 
-    /// 現在の TOTP コードを executor へ渡す必要があるかを判定する。
+    /// Checks whether the current TOTP code needs to be passed to the executor.
     fn needs_totp(&self) -> bool {
         matches!(self, Self::FillSubmit { fills, .. } if fills.iter().any(|fill| fill.value == TOTP_PLACEHOLDER))
     }
 }
 
-/// `login_step` の params を解釈し、値の検証まで行う。不正は既存の不正 params と同じ `INTERNAL` とする。
+/// Interprets the params of `login_step` and validates the values as well. Invalid params yield
+/// `INTERNAL`, the same as other invalid params.
 fn parse_step_params(params: &Value) -> Result<StepParams, ErrorCode> {
     let params = parse_params::<StepParams>(params)?;
     if !params.action.is_valid() {
@@ -247,7 +254,8 @@ fn parse_step_params(params: &Value) -> Result<StepParams, ErrorCode> {
     Ok(params)
 }
 
-/// `login_step` の監査行に載せる action の種別名。既知の種別でなければ載せない。
+/// Kind name of the action recorded in the audit line of `login_step`. Not recorded unless it is a
+/// known kind.
 pub(crate) fn audit_action(params: &Value) -> Option<String> {
     params
         .get("action")
@@ -256,7 +264,8 @@ pub(crate) fn audit_action(params: &Value) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-/// `login_step` の監査行に載せる login_id。UUID の形でなければ載せない。
+/// login_id recorded in the audit line of `login_step`. Not recorded unless it has the shape of a
+/// UUID.
 pub(crate) fn audit_login_id(params: &Value) -> Option<String> {
     params
         .get("login_id")
@@ -265,7 +274,8 @@ pub(crate) fn audit_login_id(params: &Value) -> Option<String> {
         .map(|login_id| login_id.to_string())
 }
 
-/// executor への `login_begin` 要求。`cookies` は復元する保管済み cookie であり、復元しない場合は null とする。
+/// `login_begin` request to the executor. `cookies` are the stored cookies to restore, and null
+/// when nothing is restored.
 #[derive(Serialize)]
 struct ExecutorBeginRequest<'a> {
     op: &'static str,
@@ -290,7 +300,8 @@ impl Drop for BeginSecret {
     }
 }
 
-/// executor への `login_step` 要求。`totp` は `{{totp}}` を含む `fill_submit` でのみ値を持つ。
+/// `login_step` request to the executor. `totp` has a value only for a `fill_submit` that contains
+/// `{{totp}}`.
 #[derive(Serialize)]
 struct ExecutorStepRequest<'a> {
     op: &'static str,
@@ -306,14 +317,14 @@ impl Drop for ExecutorStepRequest<'_> {
     }
 }
 
-/// executor が段階ログインの要求に返した状態。
+/// State the executor returned for a stepwise login request.
 enum ExecutorState {
     Pending(Value),
     Done(DoneState),
     Aborted,
 }
 
-/// ハンドオフに用いる executor の `done` 応答の値。
+/// Value of the executor `done` response used for the handoff.
 struct DoneState {
     endpoint: String,
     target_id: String,
@@ -321,7 +332,8 @@ struct DoneState {
     steps_skipped: bool,
 }
 
-/// executor の `login_begin` / `login_step` への応答行を解釈する。`id` が一致しない応答は `INTERNAL` とする。
+/// Interprets the executor response line to `login_begin` / `login_step`. A response whose `id`
+/// does not match yields `INTERNAL`.
 fn parse_state_response(line: &str, id: u64) -> Result<ExecutorState, ExecutorFailure> {
     let mut value: Value = serde_json::from_str(line).map_err(|_| ErrorCode::Internal)?;
     if value.get("id").and_then(Value::as_u64) != Some(id) {
@@ -375,7 +387,7 @@ fn parse_done(value: &mut Value) -> Result<DoneState, ExecutorFailure> {
     })
 }
 
-/// ハンドオフ前の executor 接続と、次に送る要求の id。
+/// Executor connection before the handoff, and the id of the next request to send.
 pub(crate) struct PendingExecutor {
     handle: ExecutorHandle,
     next_id: u64,
@@ -389,21 +401,22 @@ impl PendingExecutor {
     }
 }
 
-/// executor 接続の置き場。同じ段階ログインの `login_step` はこの Mutex で直列化する。
-/// 終了処理は中身を取り出して `None` にする。
+/// Holder of the executor connection. `login_step` calls of the same stepwise login are serialized
+/// by this Mutex.
+/// Termination takes the contents out and leaves `None`.
 type Slot = Arc<Mutex<Option<PendingExecutor>>>;
 
-/// 台帳の 1 件。
+/// One ledger entry.
 pub(crate) struct Entry {
     key: BrowserKey,
     exclusive: bool,
     persist_cookies: bool,
     browser_started_at: Instant,
     last_active: Instant,
-    /// 処理中の `login_step` の数。0 のときに限りアイドル期限を適用する。
+    /// Number of `login_step` calls in progress. The idle deadline applies only when this is 0.
     in_flight: usize,
     steps: usize,
-    /// executor へ渡した TOTP コードの数。
+    /// Number of TOTP codes passed to the executor.
     totp_entered: usize,
     slot: Slot,
 }
@@ -431,17 +444,17 @@ impl Entry {
     }
 }
 
-/// `login_step` の受付結果。
+/// Result of admitting a `login_step`.
 enum Claim {
     NotFound,
-    /// 期限切れを検出して台帳から除いた。
+    /// Expiry was detected and the entry was removed from the ledger.
     Expired(Entry),
-    /// `login_step` の上限を超えたため台帳から除いた。
+    /// The `login_step` limit was exceeded, so the entry was removed from the ledger.
     Exhausted(Entry),
     Ready(Ticket),
 }
 
-/// 受け付けた `login_step` の実行に要る値。
+/// Values needed to execute an admitted `login_step`.
 struct Ticket {
     key: BrowserKey,
     exclusive: bool,
@@ -450,7 +463,8 @@ struct Ticket {
     slot: Slot,
 }
 
-/// login_id から段階ログインを引く台帳。デーモンの状態の Mutex の下で操作する。
+/// Ledger that looks up stepwise logins by login_id. It is operated on under the Mutex of the
+/// daemon state.
 pub(crate) struct Ledger {
     entries: HashMap<String, Entry>,
     idle: Duration,
@@ -475,8 +489,8 @@ impl Ledger {
             || (entry.in_flight == 0 && now >= entry.last_active + self.idle)
     }
 
-    /// 呼び出し元の段階ログインであれば 1 回の `login_step` として受け付ける。
-    /// 他の principal の login_id は存在しないものとして扱う。
+    /// Admits it as one `login_step` if it is the caller's stepwise login.
+    /// The login_id of another principal is treated as nonexistent.
     fn claim(&mut self, login_id: &str, principal: &str, now: Instant) -> Claim {
         let Some(entry) = self.entries.get(login_id) else {
             return Claim::NotFound;
@@ -514,14 +528,16 @@ impl Ledger {
             .filter(|entry| Arc::ptr_eq(&entry.slot, slot))
     }
 
-    /// 受け付けた `login_step` の段階ログインが、まだ終了されていないかを判定する。
+    /// Checks whether the stepwise login of an admitted `login_step` has not been terminated
+    /// yet.
     fn is_current(&self, login_id: &str, slot: &Slot) -> bool {
         self.entries
             .get(login_id)
             .is_some_and(|entry| Arc::ptr_eq(&entry.slot, slot))
     }
 
-    /// `login_step` の完了を記録し、アイドル期限の起点を応答の時刻へ進める。
+    /// Records the completion of a `login_step` and advances the start of the idle deadline to
+    /// the response time.
     fn release(&mut self, login_id: &str, slot: &Slot, now: Instant) {
         if let Some(entry) = self.current_mut(login_id, slot) {
             entry.in_flight = entry.in_flight.saturating_sub(1);
@@ -542,7 +558,7 @@ impl Ledger {
         self.entries.remove(login_id)
     }
 
-    /// 期限切れの段階ログインを台帳から除いて返す。
+    /// Removes expired stepwise logins from the ledger and returns them.
     fn take_expired(&mut self, now: Instant) -> Vec<(String, Entry)> {
         let expired = self
             .entries
@@ -553,7 +569,7 @@ impl Ledger {
         self.take_ids(expired)
     }
 
-    /// principal の段階ログインを台帳から除いて返す。
+    /// Removes the stepwise logins of a principal from the ledger and returns them.
     fn take_principal(&mut self, principal: &str) -> Vec<(String, Entry)> {
         let selected = self
             .entries
@@ -564,7 +580,8 @@ impl Ledger {
         self.take_ids(selected)
     }
 
-    /// principal の段階ログインであれば台帳から除いて返す。
+    /// Removes the stepwise login from the ledger and returns it if it belongs to the
+    /// principal.
     fn take_owned(&mut self, login_id: &str, principal: &str) -> Option<Entry> {
         if self.entries.get(login_id)?.key.principal != principal {
             return None;
@@ -572,7 +589,8 @@ impl Ledger {
         self.entries.remove(login_id)
     }
 
-    /// namespace（`None` は全体）の段階ログインを台帳から除いて返す。
+    /// Removes the stepwise logins of a namespace (`None` means all) from the ledger and
+    /// returns them.
     fn take_namespace(&mut self, namespace: Option<&str>) -> Vec<(String, Entry)> {
         let selected = self
             .entries
@@ -594,7 +612,8 @@ impl Ledger {
     }
 }
 
-/// 段階ログインの終了理由。監査の method・outcome とレート制限への計上を決める。
+/// Reason a stepwise login ends. It determines the audit method and outcome and the accounting for
+/// the rate limit.
 #[derive(Clone, Copy)]
 pub(crate) enum EndReason {
     Rejected,
@@ -636,7 +655,7 @@ impl EndReason {
         }
     }
 
-    /// 1 回のログイン失敗としてレート制限のバックオフに数えるか。
+    /// Whether it counts as one login failure toward the rate-limit backoff.
     fn counts_as_failure(self) -> bool {
         matches!(
             self,
@@ -685,8 +704,9 @@ pub(crate) async fn login_begin(
         .with_audit_approval_grant(grant)
 }
 
-/// 承認ゲートを通過した `login_begin` について、相乗り・レート制限・資格の解決・executor の起動を行う。
-/// 起動制御はこの間だけ保持し、`pending` の間は保持しない。
+/// For a `login_begin` that passed the approval gate, handles piggybacking, the rate limit,
+/// credential resolution, and executor startup.
+/// The startup control is held only during this, and not while `pending`.
 async fn begin_after_approval(
     id: Value,
     state: &SharedState,
@@ -713,7 +733,7 @@ async fn begin_after_approval(
     };
     let settings = service_launch_settings(state).await;
     let cookie_store = state.lock().await.cookie_store.clone();
-    // 承認ゲートとアンロック確認を通過した後にのみ、保管済み cookie を読み出す。
+    // Read the stored cookies only after passing the approval gate and the unlock check.
     let persist_cookies = cookie_store.persists(&params.cred_id);
     let restored = persist_cookies
         .then(|| cookie_store.load(&key, cookie_store::unix_now()))
@@ -787,7 +807,7 @@ async fn begin_after_approval(
     }
 }
 
-/// 起動した段階ログインのブラウザと、その起動時の条件。
+/// Browser of a started stepwise login, and the conditions at its startup.
 struct Launched {
     key: BrowserKey,
     exclusive: bool,
@@ -796,9 +816,12 @@ struct Launched {
     pending: PendingExecutor,
 }
 
-/// `pending` の段階ログインを台帳へ登録する。executor の起動中（`open_executor_with` の待機中）は
-/// 台帳に無いため、その間に生じた vault のロック・peer の失効・デーモンの停止処理の終了対象から漏れる。
-/// 登録した直後にその時点の状態を確認し、既に終了対象であれば `pending` を返さずに自ら終了する。
+/// Registers a `pending` stepwise login in the ledger. While the executor is starting (during the
+/// wait in `open_executor_with`),
+/// it is not in the ledger, so it would be missed as a target of the termination handling for a
+/// vault lock, a peer revocation, or a daemon shutdown that occurs in that window.
+/// Right after registering, it checks the state at that point, and if it is already a termination
+/// target, it ends itself without returning `pending`.
 async fn register_pending(
     state: &SharedState,
     peer: &PeerIdentity,
@@ -836,9 +859,12 @@ async fn register_pending(
     Ok(login_id)
 }
 
-/// 段階ログインの登録直後に、既に終了対象になっていないかを判定する。
-/// 判定は既存の状態（プロバイダのロック状態、peer 台帳、デーモンの停止フラグ）からのみ行う。
-/// ロック状態は原因を区別しないため、起動中に TTL による自動ロックが起きた場合も `lock_vault` と同じく終了する。
+/// Checks right after a stepwise login is registered whether it has already become a termination
+/// target.
+/// The check uses only existing state (the provider lock state, the peer ledger, and the daemon
+/// shutdown flag).
+/// The lock state does not distinguish causes, so an automatic TTL lock that occurs during startup
+/// also ends it, the same as `lock_vault`.
 async fn immediate_end_reason(
     state: &SharedState,
     key: &BrowserKey,
@@ -859,8 +885,10 @@ async fn immediate_end_reason(
     None
 }
 
-/// `immediate_end_reason` の終了理由に対応する応答。lock_vault は `VAULT_LOCKED`、peer 失効は
-/// 通常の失効 peer への応答と同じ `UNAUTHORIZED`。デーモン停止はどのみち接続が畳まれるため `INTERNAL` とする。
+/// Response corresponding to the termination reason of `immediate_end_reason`. lock_vault yields
+/// `VAULT_LOCKED`, and a revoked peer yields
+/// `UNAUTHORIZED`, the same as the response to an ordinarily revoked peer. A daemon shutdown closes
+/// the connection anyway, so it yields `INTERNAL`.
 fn immediate_error(reason: EndReason) -> ErrorCode {
     match reason {
         EndReason::LockVault => ErrorCode::VaultLocked,
@@ -873,7 +901,7 @@ fn pending_result(login_id: &str, snapshot: Value) -> Value {
     json!({ "state": "pending", "login_id": login_id, "snapshot": snapshot })
 }
 
-/// `login` と同じ形の成功応答に `state: "done"` を加える。
+/// Adds `state: "done"` to a success response of the same shape as `login`.
 fn done_result(mut result: Value) -> Value {
     if let Some(object) = result.as_object_mut() {
         object.insert("state".to_owned(), json!("done"));
@@ -881,8 +909,9 @@ fn done_result(mut result: Value) -> Value {
     result
 }
 
-/// 段階ログインのブラウザを通常のブラウザセッションへ昇格させる。呼び出し元は起動制御を保持していること。
-/// 同じ鍵の共有セッションが既にあれば、非共有のセッションとして登録する。
+/// Promotes the browser of a stepwise login to an ordinary browser session. The caller must hold
+/// the startup control.
+/// If a shared session with the same key already exists, it is registered as a non-shared session.
 async fn hand_off(
     state: &SharedState,
     control: &mut StartControl,
@@ -908,7 +937,8 @@ async fn hand_off(
         browser_started_at: launched.browser_started_at,
     };
     let result = register_login_browser(state, registration).await?;
-    // 登録が成功した後にのみバックオフをリセットする。登録失敗（INTERNAL）時に成功と数えないため。
+    // Reset the backoff only after the registration succeeds, so that a registration failure
+    // (INTERNAL) is not counted as a success.
     control.record_success();
     if launched.persist_cookies
         && let Some(cookies) = done.cookies.as_ref()
@@ -956,9 +986,9 @@ pub(crate) async fn login_step(
     }
 }
 
-/// executor の応答を受けた後の扱い。
+/// How to proceed after receiving the executor response.
 enum Next {
-    /// 段階ログインを続ける（`pending` のスナップショット、または `SELECTOR_NOT_FOUND`）。
+    /// Continue the stepwise login (a `pending` snapshot, or `SELECTOR_NOT_FOUND`).
     Continue(Result<Value, ExecutorFailure>),
     Handoff(DoneState),
     End(EndReason, ExecutorFailure),
@@ -979,7 +1009,8 @@ fn next_after(outcome: Result<ExecutorState, ExecutorFailure>) -> Next {
     }
 }
 
-/// 受け付けた `login_step` を、同じ段階ログインの他の step と直列に executor へ送る。
+/// Sends an admitted `login_step` to the executor, serialized with the other steps of the same
+/// stepwise login.
 async fn run_step(
     state: &SharedState,
     peer: &PeerIdentity,
@@ -989,7 +1020,8 @@ async fn run_step(
     ticket: Ticket,
 ) -> HandledRequest {
     let mut slot = ticket.slot.lock().await;
-    // 待機中に終了された段階ログインは、終了処理が executor を回収する。
+    // A stepwise login terminated while waiting has its executor reclaimed by the termination
+    // handling.
     let current = state
         .lock()
         .await
@@ -1079,7 +1111,8 @@ async fn run_step(
     }
 }
 
-/// `{{totp}}` を含む `fill_submit` であれば、資格を解決して現在の TOTP コードを返す。
+/// For a `fill_submit` that contains `{{totp}}`, resolves the credential and returns the current
+/// TOTP code.
 async fn step_totp(
     state: &SharedState,
     action: &StepAction,
@@ -1092,7 +1125,7 @@ async fn step_totp(
     Ok(current_totp(&credential))
 }
 
-/// `login_step` で `done` に達した段階ログインをハンドオフする。
+/// Hands off a stepwise login that reached `done` in `login_step`.
 async fn hand_off_step(
     state: &SharedState,
     peer: &PeerIdentity,
@@ -1135,7 +1168,8 @@ async fn hand_off_step(
             success(id, result).with_audit_shared(false)
         }
         Err(error) => {
-            // 登録に失敗した executor は register_login_browser が停止済みである。
+            // An executor whose registration failed has already been stopped by
+            // register_login_browser.
             finish(
                 state,
                 login_id,
@@ -1150,7 +1184,8 @@ async fn hand_off_step(
     }
 }
 
-/// executor へ `login_step` を 1 件送り、応答を待つ。TOTP コードを含む直列化結果は書き込み後に消去する。
+/// Sends one `login_step` to the executor and waits for the response. The serialized result
+/// containing the TOTP code is erased after the write.
 async fn exchange_step(
     pending: &mut PendingExecutor,
     action: &StepAction,
@@ -1183,8 +1218,9 @@ async fn exchange_step(
     parse_state_response(&response, id)
 }
 
-/// ハンドオフ前の executor を停止する。`abort` では先に executor へ破棄を依頼する。
-/// 停止手順そのものは `shutdown_executor_handle` に集約し、`authorize_device` の使い捨て接続と共有する。
+/// Stops the executor before the handoff. For `abort`, it first asks the executor to discard.
+/// The stop procedure itself is consolidated in `shutdown_executor_handle` and shared with the
+/// throwaway connection of `authorize_device`.
 async fn stop_pending(mut pending: PendingExecutor, abort: bool) {
     if abort {
         let _ = exchange_step(
@@ -1199,7 +1235,8 @@ async fn stop_pending(mut pending: PendingExecutor, abort: bool) {
     shutdown_executor_handle(&mut pending.handle, id).await;
 }
 
-/// 台帳から除いた段階ログインを終了する。処理中の step があれば、その完了を待ってから executor を回収する。
+/// Ends a stepwise login that was removed from the ledger. If a step is in progress, it waits for
+/// its completion before reclaiming the executor.
 async fn end_entry(
     state: &SharedState,
     login_id: &str,
@@ -1211,7 +1248,8 @@ async fn end_entry(
     finish(state, login_id, &entry.key, pending, reason, peer).await;
 }
 
-/// executor を停止し、失敗として数える終了理由であればバックオフを記録し、終了を監査する。
+/// Stops the executor, records the backoff if the termination reason counts as a failure, and
+/// audits the termination.
 async fn finish(
     state: &SharedState,
     login_id: &str,
@@ -1257,19 +1295,21 @@ async fn audit_stepwise(
     }
 }
 
-/// namespace（`None` は全体）の段階ログインをすべて終了する。`lock_vault` とデーモンの停止で用いる。
+/// Ends all stepwise logins of a namespace (`None` means all). Used by `lock_vault` and daemon
+/// shutdown.
 pub(crate) async fn terminate(state: &SharedState, namespace: Option<&str>, reason: EndReason) {
     let entries = state.lock().await.stepwise.take_namespace(namespace);
     end_all(state, entries, reason).await;
 }
 
-/// 失効した peer（principal）の段階ログインをすべて終了する。
+/// Ends all stepwise logins of a revoked peer (principal).
 pub(crate) async fn terminate_principal(state: &SharedState, principal: &str) {
     let entries = state.lock().await.stepwise.take_principal(principal);
     end_all(state, entries, EndReason::PeerRevoked).await;
 }
 
-/// 応答走査が secret を検出して差し替えた `pending` 応答の段階ログインを、SNAPSHOT_REJECTED と同等に終了する。
+/// Ends the stepwise login of a `pending` response that the response scan replaced after detecting
+/// a secret, the same as SNAPSHOT_REJECTED.
 pub(crate) async fn end_leaked(state: &SharedState, login_id: &str, peer: &PeerIdentity) {
     let entry = state
         .lock()
@@ -1288,7 +1328,7 @@ pub(crate) async fn end_leaked(state: &SharedState, login_id: &str, peer: &PeerI
     }
 }
 
-/// 段階ログインの method の `pending` 応答であれば、その login_id を返す。
+/// If the response is `pending` for a stepwise login method, returns its login_id.
 pub(crate) fn pending_login_id(method: &str, result: Option<&Value>) -> Option<String> {
     if !matches!(method, "login_begin" | "login_step") {
         return None;
@@ -1312,7 +1352,7 @@ async fn end_all(state: &SharedState, entries: Vec<(String, Entry)>, reason: End
     while tasks.join_next().await.is_some() {}
 }
 
-/// 期限切れの段階ログインを 1 秒ごとに検出して終了する。
+/// Detects expired stepwise logins every second and ends them.
 pub(crate) fn spawn_reaper(state: SharedState) {
     tokio::spawn(async move {
         let mut ticker = interval(Duration::from_secs(1));

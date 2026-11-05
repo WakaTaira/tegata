@@ -41,22 +41,22 @@ describe.skipIf(!dockerAvailable())("AC-71 (docker)", () => {
   });
 
   test("AC-71: an outsider container without a token is refused everywhere", async () => {
-    // Given: ホストのデーモンが docker bridge のゲートウェイ IP に bind、
-    //        トークン無しの outsider コンテナ
+    // Given: the host daemon is bound to the docker bridge gateway IP, and
+    //        an outsider container has no token
     if (stack === undefined || outsider === undefined)
       throw new Error("stack not started");
     const { gateway } = stack.network;
     const daemonPort = stack.daemon.tcpPort as number;
 
-    // When: preamble 無しで接続
+    // When: connect without a preamble
     const silent = await tcpProbe(outsider, gateway, daemonPort);
 
-    // Then: 10 s 以内に切断（preamble の待ち 10 s に 2 s の猶予を足して判定）
+    // Then: disconnected within 10 s (judged as the 10 s preamble wait plus 2 s of slack)
     expect(silent.connected, JSON.stringify(silent)).toBe(true);
     expect(silent.closed, JSON.stringify(silent)).toBe(true);
     expect(silent.ms).toBeLessThan(12_000);
 
-    // When: 偽トークンで preamble
+    // When: send a preamble with a fake token
     const forged = await tcpProbe(
       outsider,
       gateway,
@@ -71,8 +71,8 @@ describe.skipIf(!dockerAvailable())("AC-71 (docker)", () => {
       error: "UNAUTHORIZED",
     });
 
-    // When: ホストの 127.0.0.1 の CDP ポートへ接続（コンテナからホストへ届く
-    //       唯一の経路であるゲートウェイ IP と、コンテナ自身の 127.0.0.1 の両方）
+    // When: connect to the CDP port on the host's 127.0.0.1 (both the gateway IP, the
+    //       only route from a container to the host, and the container's own 127.0.0.1)
     const login = await hostLogin(stack);
     try {
       const cdpPort = endpointPort(login.channel.endpoint);
@@ -91,7 +91,7 @@ describe.skipIf(!dockerAvailable())("AC-71 (docker)", () => {
         5_000,
       );
 
-      // Then: 到達不可（ECONNREFUSED または timeout）
+      // Then: unreachable (ECONNREFUSED or timeout)
       expect(viaGateway.connected, JSON.stringify(viaGateway)).toBe(false);
       expect(["ECONNREFUSED", "EHOSTUNREACH", "timeout"]).toContain(
         viaGateway.error,

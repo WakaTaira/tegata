@@ -5,7 +5,8 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { describe, expect, test } from "vitest";
 import { createServer as createMcpServer } from "./index.js";
 
-// src と dist のどちらから実行されても packages/tegata-mcp/<dir>/ 直下なので、同じ深さで解決できる。
+// Whether run from src or dist, it sits directly under packages/tegata-mcp/<dir>/, so it resolves
+// at the same depth.
 const agentPath = fileURLToPath(
   new URL(
     "../../../integrations/claude-code/agents/tegata-login.md",
@@ -15,7 +16,8 @@ const agentPath = fileURLToPath(
 
 const toolPrefix = "mcp__tegata__";
 
-// frontmatter の `key: value` 行のみを扱う簡易パーサ（YAML 依存を避けるため）。
+// A simple parser that handles only `key: value` lines of the frontmatter (to avoid a YAML
+// dependency).
 function parseFrontmatter(text: string): Record<string, string> {
   const lines = text.split(/\r?\n/);
   if (lines[0]?.trim() !== "---") throw new Error("frontmatter not found");
@@ -30,7 +32,8 @@ function parseFrontmatter(text: string): Record<string, string> {
   return fields;
 }
 
-// tools 行を解析し、mcp__tegata__ 接頭辞を外したツール名を返す。形式違反は例外とする。
+// Parses the tools line and returns the tool names with the mcp__tegata__ prefix removed. Throws on
+// a format violation.
 function parseToolNames(tools: string | undefined): string[] {
   if (tools === undefined) throw new Error("tools is missing");
   return tools.split(",").map((entry) => {

@@ -116,7 +116,7 @@ async function startDeviceFlowDaemon(opts: {
               const res = await rawRpc(socketPath, "status", {});
               if (res.result !== undefined) return;
             } catch {
-              // ソケットが受付可能になるまで待機します。
+              // Wait until the socket accepts connections.
             }
           }
           await new Promise((resolve) => setTimeout(resolve, 100));

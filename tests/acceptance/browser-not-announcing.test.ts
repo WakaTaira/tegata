@@ -34,7 +34,7 @@ async function loginToFingerprint(stack: Stack): Promise<LoginResult> {
   return res.json as LoginResult;
 }
 
-/** AC-202 の Then の文書リクエスト側（User-Agent と Sec-CH-UA）を検査する。 */
+/** Checks the document-request side of the AC-202 Then (User-Agent and Sec-CH-UA). */
 function expectRequestNotAnnouncing(request: FingerprintRequest): void {
   const context = JSON.stringify(request);
   expect(request.user_agent, context).not.toBeNull();
@@ -43,7 +43,7 @@ function expectRequestNotAnnouncing(request: FingerprintRequest): void {
   expect(request.sec_ch_ua, context).not.toContain("Headless");
 }
 
-/** AC-202 の Then のページ観測値側を検査する。 */
+/** Checks the page-observation side of the AC-202 Then. */
 function expectObservationNotAnnouncing(
   observation: FingerprintObservation,
 ): void {
@@ -66,10 +66,10 @@ function expectObservationNotAnnouncing(
 }
 
 test("AC-202: the logged-in page sees a browser that does not announce automation", async () => {
-  // Given: fixture のログインページと、ログイン後に /fingerprint/ へ遷移する資格がある
+  // Given: the fixture login page, and a credential that navigates to /fingerprint/ after login
   const stack = await startStack();
   try {
-    // When: login を行い、ログイン後のページで観測値を記録する
+    // When: log in and record the observed values on the post-login page
     const result = await loginToFingerprint(stack);
     expect(result.channel.kind).toBe("cdp");
     const { request, observation } = await waitForFingerprint(
@@ -87,10 +87,11 @@ test("AC-202: the logged-in page sees a browser that does not announce automatio
       },
     );
 
-    // Then: 記録された値が、webdriver が false、plugins が 1 以上、
-    // window.chrome が object、JS の UA・User-Agent ヘッダ・Sec-CH-UA ヘッダの
-    // いずれにも Headless を含まない、screen がウィンドウより大きい、
-    // outerHeight が innerHeight より大きい、brands が 2 つ以上、の全部を満たす
+    // Then: the recorded values satisfy all of the following: webdriver is false,
+    // plugins is 1 or more, window.chrome is an object, none of the JS UA,
+    // the User-Agent header, and the Sec-CH-UA header contain Headless, screen is
+    // larger than the window, outerHeight is greater than innerHeight, and brands
+    // has 2 or more entries
     expectRequestNotAnnouncing(request);
     expectObservationNotAnnouncing(observation);
   } finally {
@@ -99,7 +100,7 @@ test("AC-202: the logged-in page sees a browser that does not announce automatio
 });
 
 test("AC-203: a tab created by raw CDP Target.createTarget with a URL does not announce automation from its first request", async () => {
-  // Given: AC-202 と同じ条件でログインし、返された CDP エンドポイントがある
+  // Given: logged in under the same conditions as AC-202, with the returned CDP endpoint
   const stack = await startStack();
   let client: CdpClient | undefined;
   try {
@@ -108,8 +109,8 @@ test("AC-203: a tab created by raw CDP Target.createTarget with a URL does not a
     const before = await fingerprintState(stack.fixture.url);
     const requestsBefore = before.requests.length;
 
-    // When: エージェントが生の CDP で Target.createTarget({ url: <fixture の /fingerprint/> })
-    // を呼び、URL 付きで新しいタブを作る
+    // When: the agent calls Target.createTarget({ url: <the fixture's /fingerprint/> })
+    // over raw CDP to create a new tab with a URL
     client = await CdpClient.connect(result.channel.endpoint);
     await client.send("Target.createTarget", {
       url: `${stack.fixture.url}/fingerprint/`,
@@ -131,7 +132,8 @@ test("AC-203: a tab created by raw CDP Target.createTarget with a URL does not a
       },
     );
 
-    // Then: 初回の文書リクエストのヘッダと、ページの観測値が、AC-202 の条件を全部満たす
+    // Then: the headers of the first document request and the page observations both satisfy all
+    // the AC-202 conditions
     expectRequestNotAnnouncing(firstRequest);
     for (const observation of observations) {
       expectObservationNotAnnouncing(observation);
@@ -143,8 +145,8 @@ test("AC-203: a tab created by raw CDP Target.createTarget with a URL does not a
 });
 
 test("AC-204: the daemon refuses to start when only the Chromium headless shell is installed", async () => {
-  // Given: PLAYWRIGHT_BROWSERS_PATH が chromium_headless_shell-* だけを含み、
-  // 完全版 chromium-* を含まないディレクトリを指している
+  // Given: PLAYWRIGHT_BROWSERS_PATH points to a directory that contains only
+  // chromium_headless_shell-* and no full chromium-*
   const browsers = headlessShellOnlyBrowsersPath();
   const layout = layOutSpawnModeDaemon();
   try {
@@ -154,13 +156,13 @@ test("AC-204: the daemon refuses to start when only the Chromium headless shell 
       ),
     ).toBe(true);
 
-    // When: デーモンを起動する
+    // When: start the daemon
     const exit = await runDaemonWithEnvUntilExit(layout, {
       PLAYWRIGHT_BROWSERS_PATH: browsers.dir,
     });
 
-    // Then: デーモンは起動に失敗して非 0 で終了し、標準エラーに完全版 Chromium が
-    // 必要である旨と --only-shell の文字列が含まれる
+    // Then: the daemon fails to start and exits non-zero, and stderr states that
+    // full Chromium is required and contains the string --only-shell
     expect(
       exit.code,
       `daemon kept running without the full Chromium; stderr: ${exit.stderr}`,

@@ -19,9 +19,12 @@ export type ApiProxyOptions = {
 export type ApiProxy = {
   port: number;
   secret: string;
-  /** 以後の要求に注入する値を差し替える。不正なヘッダ値は例外とし、現在の値を保つ。 */
+  /**
+   * Replaces the value injected into subsequent requests. An invalid header value throws and keeps
+   * the current value.
+   */
   setHeaderValue: (value: string) => void;
-  /** 以後の要求を上流へ送らず 503 で応答させる。 */
+  /** Makes subsequent requests answer 503 without being sent upstream. */
   markUnavailable: () => void;
   close: () => Promise<void>;
 };
@@ -62,15 +65,16 @@ function splitQuery(target: string): { pathname: string; query: string } {
 function secretEquals(candidate: string, secret: string): boolean {
   const candidateBytes = Buffer.from(candidate, "utf8");
   const secretBytes = Buffer.from(secret, "utf8");
-  // secret の長さは公開情報であるため、長さの不一致は即座に拒否してよい。
+  // The secret length is public, so a length mismatch may be rejected immediately.
   if (candidateBytes.length !== secretBytes.length) return false;
   return timingSafeEqual(candidateBytes, secretBytes);
 }
 
 /**
- * 要求 target の先頭 segment を secret と照合する。
- * 不一致の場合も先頭 segment（secret の位置）は記録用 path に含めない。
- * 誤って secret に文字が連結された要求が監査へ secret を運ぶことを防ぐためである。
+ * Matches the first segment of the request target against the secret.
+ * Even on a mismatch, the first segment (the secret position) is excluded from the logged path.
+ * This keeps a request with characters accidentally appended to the secret from carrying the secret
+ * into the audit log.
  */
 export function matchSecretPath(
   target: string,
@@ -86,9 +90,12 @@ export function matchSecretPath(
 }
 
 /**
- * secret を剥がした後の path が、上流で base path の外へ解決されうる形を含むかを判定する。
- * パーセントデコード後に `.` / `..` となる segment、`%2e` 表記、バックスラッシュ（`%5c` を含む）を拒否する。
- * デコードできない segment は解釈が上流次第となるため、同じく拒否する。
+ * Determines whether the path left after stripping the secret could resolve outside the base path
+ * upstream.
+ * Rejects segments that become `.` / `..` after percent-decoding, `%2e` notation, and backslashes
+ * (including `%5c`).
+ * Segments that cannot be decoded are rejected as well, because their interpretation is left to the
+ * upstream.
  */
 export function hasUnsafePathSegment(path: string): boolean {
   if (path.includes("\\") || /%2e/i.test(path)) return true;
@@ -123,7 +130,7 @@ function connectionTokensOf(rawHeaders: string[]): Set<string> {
   return tokens;
 }
 
-/** rawHeaders 形式の配列から hop-by-hop と除外指定のヘッダを取り除く。 */
+/** Removes hop-by-hop and excluded headers from an array in rawHeaders format. */
 export function filterHeaders(
   rawHeaders: string[],
   excluded: Set<string> = new Set(),
@@ -147,8 +154,8 @@ function parseUpstream(upstream: string): Upstream {
   const transport = url.protocol === "https:" ? https : http;
   return {
     url,
-    // WHATWG URL は IPv6 リテラルの hostname を角括弧付きで返すが、http.request は括弧なしの
-    // アドレスを要求するため、ここで剥がしておく。
+    // WHATWG URL returns an IPv6 literal hostname in brackets, but http.request expects the
+    // address without brackets, so they are stripped here.
     hostname: url.hostname.replace(/^\[(.*)\]$/, "$1"),
     basePath: url.pathname.replace(/\/+$/, ""),
     transport,
@@ -217,7 +224,7 @@ function forward(
     record(502);
     respondBadGateway(response);
   });
-  // agent 側が応答完了前に切断した場合は、上流への要求も打ち切る。
+  // If the agent disconnects before the response completes, the upstream request is aborted too.
   response.on("close", () => {
     if (!response.writableFinished) upstreamRequest.destroy();
   });
@@ -234,8 +241,9 @@ function handleRequest(
   state: InjectionState,
 ): void {
   const match = matchSecretPath(request.url ?? "", secret);
-  // secret を持たない要求は記録しない。loopback の任意の利用者が、リース所有者の名義で
-  // 監査行を増やせないようにするためである。上流へ送らない要求も同じく記録の対象外とする。
+  // Requests without the secret are not logged, so that an arbitrary loopback user cannot
+  // add audit lines under the lease owner's name. Requests not sent upstream are likewise excluded
+  // from logging.
   if (!match.matched || hasUnsafePathSegment(match.path)) {
     request.resume();
     respondNotFound(response);
@@ -265,8 +273,9 @@ function handleRequest(
 }
 
 /**
- * 上流へ固定ヘッダを注入する loopback の HTTP プロキシを起動する。
- * 注入値・secret・query は例外メッセージを含めどこにも出力しない。
+ * Starts a loopback HTTP proxy that injects fixed headers upstream.
+ * The injected value, the secret, and the query are never emitted anywhere, including exception
+ * messages.
  */
 export async function startApiProxy(
   options: ApiProxyOptions,

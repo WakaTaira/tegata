@@ -1,4 +1,7 @@
-/** 段階ログインの settle 判定、aria スナップショットの取得と、入力した欄の消去を行う。 */
+/**
+ * Handles the settle decision of stepwise login, obtaining the aria snapshot, and clearing the
+ * fields that were filled.
+ */
 
 import {
   type ElementHandle,
@@ -13,30 +16,31 @@ import {
   waitForDomQuietInPage,
 } from "./snapshot.js";
 
-/** ナビゲーションが起きた場合に、新しい文書の domcontentloaded を待つ上限。 */
+/** Upper bound on waiting for domcontentloaded of the new document when a navigation occurs. */
 export const SETTLE_NAVIGATION_MS = 10_000;
-/** DOM の変更がこの時間途切れたら落ち着いたとみなす。 */
+/** The page is considered settled when DOM changes stop for this long. */
 export const SETTLE_QUIET_MS = 500;
-/** DOM の変更が途切れるのを待つ上限。 */
+/** Upper bound on waiting for DOM changes to stop. */
 export const SETTLE_DOM_MAX_MS = 5_000;
 const NAVIGATION_POLL_MS = 50;
-// 待機中に次のナビゲーションが始まった場合に、待ち直す回数の上限。
+// Upper bound on how many times to wait again when the next navigation starts during a wait.
 const SETTLE_MAX_ROUNDS = 3;
-// page 内の待機が page 側の改変で戻らない場合に、Node 側で打ち切るまでの余裕。
+// Margin before the Node side cuts off a wait inside the page that does not return because the page
+// tampered with it.
 const PAGE_EVALUATE_GRACE_MS = 1_000;
-// 1 つの欄の消去を待つ上限。
+// Upper bound on waiting for the clearing of one field.
 const CLEAR_FIELD_TIMEOUT_MS = 5_000;
-/** ariaSnapshot の上限。 */
+/** Upper bound for ariaSnapshot. */
 export const ARIA_SNAPSHOT_TIMEOUT_MS = 10_000;
-// 1 つの frame から role 属性値を集めるのを待つ上限。
+// Upper bound on waiting to collect role attribute values from one frame.
 const COLLECT_ROLES_TIMEOUT_MS = 5_000;
 
-/** main frame のナビゲーションを観測する。 */
+/** Observes navigations of the main frame. */
 export type NavigationTracker = {
-  /** 前回の clearNavigation 以降にナビゲーションの開始または確定があったかを返す。 */
+  /** Returns whether a navigation started or committed since the previous clearNavigation. */
   hasNavigation: () => boolean;
   clearNavigation: () => void;
-  /** 開始したナビゲーションが、確定も中断もしていないかを返す。 */
+  /** Returns whether a started navigation has neither committed nor been aborted. */
   navigationPending: () => boolean;
   dispose: () => void;
 };
@@ -50,7 +54,7 @@ export function trackNavigation(page: Page): NavigationTracker {
     try {
       return request.isNavigationRequest() && request.frame() === mainFrame;
     } catch {
-      // service worker の要求など、frame を持たない要求は対象外とする。
+      // Requests that have no frame, such as service worker requests, are excluded.
       return false;
     }
   };
@@ -91,7 +95,10 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** `promise` を最大 `ms` ミリ秒待ち、間に合わなければ `fallback` を返す。打ち切った側の失敗は捨てる。 */
+/**
+ * Waits up to `ms` milliseconds for `promise` and returns `fallback` if it is not in time. The
+ * failure of the side that was cut off is discarded.
+ */
 async function withTimeout<T>(
   promise: Promise<T>,
   ms: number,
@@ -111,7 +118,10 @@ async function withTimeout<T>(
   }
 }
 
-/** 開始したナビゲーションの確定を待ち、新しい文書の domcontentloaded を待つ。上限内に達したかを返す。 */
+/**
+ * Waits for a started navigation to commit, then waits for domcontentloaded of the new document.
+ * Returns whether it was reached within the limit.
+ */
 async function waitForNewDocument(
   page: Page,
   tracker: NavigationTracker,
@@ -143,9 +153,12 @@ async function waitForDomQuiet(page: Page, maxMs: number): Promise<boolean> {
 }
 
 /**
- * action の後にページが落ち着くのを待ち、上限内に落ち着いたかを返す（networkidle は用いない）。
- * ナビゲーションがあれば新しい文書の domcontentloaded を合計 10 s まで、その後 DOM の変更が 500 ms 途切れるのを
- * 合計 5 s まで待つ。待機中に次のナビゲーションが始まった場合は、残りの上限の範囲で待ち直す。
+ * Waits for the page to settle after an action and returns whether it settled within the limit
+ * (networkidle is not used).
+ * If there was a navigation, it waits up to 10 s in total for domcontentloaded of the new document,
+ * and then up to 5 s in total for
+ * DOM changes to stop for 500 ms. If the next navigation starts during a wait, it waits again
+ * within the remaining limit.
  */
 export async function settlePage(
   page: Page,
@@ -168,7 +181,8 @@ export async function settlePage(
     try {
       quiet = await waitForDomQuiet(page, domBudget);
     } catch (error) {
-      // ナビゲーションで実行文脈が破棄された場合は、その通知を待ってから次の回で新しい文書を待ち直す。
+      // If the execution context was destroyed by a navigation, the wait is for that notification,
+      // and then the next round waits for the new document again.
       if (page.isClosed()) throw error;
       quiet = false;
       await sleep(NAVIGATION_POLL_MS);
@@ -180,7 +194,10 @@ export async function settlePage(
   return false;
 }
 
-/** 入力した欄のうち、まだ文書にあって値が空でないものを空にする。文書から外れた欄は無視する。 */
+/**
+ * Empties those of the filled fields that are still in the document and have a non-empty value.
+ * Fields detached from the document are ignored.
+ */
 export async function clearFilledFields(
   handles: readonly ElementHandle[],
 ): Promise<void> {
@@ -201,12 +218,14 @@ export async function disposeHandles(
   );
 }
 
-// 値を出力されうる、explicit role を持つ欄。
+// Fields with an explicit role, whose value may be emitted.
 const EXPLICIT_ROLE_FIELDS = "input[role], textarea[role]";
 
 /**
- * 1 つの frame の input[role]・textarea[role] の role 属性値を集める。要素の検索と属性の読み取りは Playwright の
- * locator が page の JS から隔離された文脈で行うため、page が querySelectorAll や getAttribute を差し替えても結果は変わらない。
+ * Collects the role attribute values of input[role] and textarea[role] in one frame. Element lookup
+ * and attribute reads are done by Playwright's
+ * locator in a context isolated from the page's JS, so the result does not change even if the page
+ * replaces querySelectorAll or getAttribute.
  */
 async function collectFrameRoles(frame: Frame): Promise<string[]> {
   const fields = await frame.locator(EXPLICIT_ROLE_FIELDS).all();
@@ -218,7 +237,10 @@ async function collectFrameRoles(frame: Frame): Promise<string[]> {
   return roles.filter((role): role is string => role !== null);
 }
 
-/** 全 frame の role 属性値を集める。1 つの frame でも失敗（例外・上限の超過）すれば undefined を返す。 */
+/**
+ * Collects the role attribute values of all frames. Returns undefined if even one frame fails (an
+ * exception or exceeding the limit).
+ */
 async function collectExplicitRoles(page: Page): Promise<string[] | undefined> {
   const perFrame = await Promise.all(
     page.frames().map((frame) =>
@@ -234,8 +256,10 @@ async function collectExplicitRoles(page: Page): Promise<string[] | undefined> {
 }
 
 /**
- * ariaSnapshot（ai モード）を 1 回取り、その前後で集めた role 属性値とともに返す。
- * aria-ref はこの呼び出しの結果に対して解決されるため、次の action を解決するまで ariaSnapshot を他の目的で呼んではならない。
+ * Takes ariaSnapshot (ai mode) once, and returns it together with the role attribute values
+ * collected before and after.
+ * aria-ref is resolved against the result of this call, so ariaSnapshot must not be called for
+ * other purposes until the next action is resolved.
  */
 export async function captureAriaSnapshot(
   page: Page,
@@ -254,7 +278,8 @@ export async function captureAriaSnapshot(
     url: page.url(),
     title: typeof title === "string" ? title : "",
     aria,
-    // 前後のどちらかで集められなかった場合は、全ての役割を値の除去の対象とする。
+    // If the values could not be collected either before or after, all roles are made targets for
+    // value removal.
     roles:
       before === undefined || after === undefined
         ? "all"

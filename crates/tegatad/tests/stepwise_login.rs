@@ -1,6 +1,7 @@
-//! 段階ログイン（Issue #46）のデーモン側の振る舞いを、偽の executor で確かめる。
-//! ブラウザを使わないため、executor とのプロトコル・台帳・期限・レート制限・監査を直接検証する。
-//! UNIX ドメインソケット経由で RPC を送るため、UNIX でのみ実行する。
+//! Verifies the daemon-side behavior of stepwise login (Issue #46) with a fake executor.
+//! No browser is used, so the protocol with the executor, the ledger, expiry, rate limiting, and
+//! audit are verified directly.
+//! RPCs are sent over a UNIX domain socket, so these tests run on UNIX only.
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -15,14 +16,18 @@ use uuid::Uuid;
 mod common;
 use common::{create_private_dir, rpc, try_rpc};
 
-/// 段階ログインに応じる偽の executor。submit・click の selector で応答を切り替える。
-/// `#verify` はハンドオフ、`#missing` は SELECTOR_NOT_FOUND、`#reject` は SNAPSHOT_REJECTED、
-/// `#mismatch` は FILL_MISMATCH、`#vanish` は応答せずに切断する。`#echo-user` は username を
-/// マスクせずに含むスナップショットを返す（executor の検査をすり抜けた場合の模擬）。
-/// `target_url` が `http://127.0.0.1/delay` の `login_begin` は、応答を少し遅らせる
-/// （executor 起動中に daemon 側の状態が変わる競合をテストで作るため）。
-/// 受け取った要求の op・action・totp・secret のキー・cookies の数を `executor.js.requests` に記録する。
-/// stdin が閉じられたら必ず終了する。
+/// Fake executor that handles stepwise login. It switches its response on the submit and click
+/// selectors.
+/// `#verify` is a handoff, `#missing` is SELECTOR_NOT_FOUND, `#reject` is SNAPSHOT_REJECTED,
+/// `#mismatch` is FILL_MISMATCH, and `#vanish` disconnects without responding. `#echo-user` returns
+/// a snapshot that contains the username
+/// unmasked (simulating a case that slipped past the executor's check).
+/// A `login_begin` whose `target_url` is `http://127.0.0.1/delay` delays its response slightly
+/// (so tests can create a race in which the daemon-side state changes while the executor is
+/// starting).
+/// It records the op, action, totp, secret keys, and number of cookies of each request it receives
+/// in `executor.js.requests`.
+/// It always exits when stdin is closed.
 const STEPWISE_EXECUTOR: &str = r##"
 const fs = require("node:fs");
 const readline = require("node:readline");
@@ -169,7 +174,7 @@ impl Daemon {
         )
     }
 
-    /// `login_begin` が pending を返すことを確かめ、login_id を返す。
+    /// Verifies that `login_begin` returns pending, and returns the login_id.
     fn begin_pending(&self) -> String {
         let response = self.begin();
         let result = &response["result"];
@@ -212,13 +217,14 @@ impl Daemon {
             .collect()
     }
 
-    /// 指定した login_id の監査行が現れるまで待つ。
+    /// Waits until the audit line for the given login_id appears.
     fn wait_for_record(&self, method: &str, login_id: &str) -> Value {
         self.wait_for_record_matching(method, |record| record["login_id"] == login_id)
     }
 
-    /// 条件を満たす監査行が現れるまで待つ。login_id が応答に現れない場合など、
-    /// login_id 以外の条件で 1 行を探したいときに用いる。
+    /// Waits until an audit line matching the condition appears. Used to find a line by a condition
+    /// other than login_id,
+    /// for example when the login_id does not appear in the response.
     fn wait_for_record_matching(&self, method: &str, matches: impl Fn(&Value) -> bool) -> Value {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -251,7 +257,7 @@ impl Daemon {
             .collect()
     }
 
-    /// 偽の executor が `shutdown` を受け取るまで待つ。
+    /// Waits until the fake executor receives `shutdown`.
     fn wait_for_shutdowns(&self, count: usize) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while self
@@ -361,7 +367,8 @@ fn a_stepwise_login_walks_to_a_handoff() {
     assert_eq!(daemon.status()["browsers"], 1);
     assert_eq!(daemon.status()["leases"], 1);
 
-    // executor には username と password だけを渡し、TOTP コードは {{totp}} を含む fill_submit でのみ渡す。
+    // Only the username and password are passed to the executor; the TOTP code is passed only
+    // through a fill_submit containing {{totp}}.
     let requests = daemon.executor_requests();
     let begin = &requests[0];
     assert_eq!(begin["op"], "login_begin");
@@ -377,7 +384,8 @@ fn a_stepwise_login_walks_to_a_handoff() {
     let code = steps[2]["totp"].as_str().expect("TOTP code");
     assert!(code.len() == 6 && code.chars().all(|c| c.is_ascii_digit()));
 
-    // 監査: login_begin 行は stepwise と login_id を持ち、login_step 行は action の種別のみを持つ。
+    // Audit: the login_begin line has stepwise and login_id, and the login_step line has only the
+    // kind of action.
     let begin_record = &daemon.records("login_begin")[0];
     assert_eq!(begin_record["stepwise"], true);
     assert_eq!(begin_record["login_id"], login_id.as_str());
@@ -403,7 +411,7 @@ fn a_stepwise_login_walks_to_a_handoff() {
         "{audit}"
     );
 
-    // 応答・監査・stderr に資格も TOTP コードも現れない。
+    // Neither the credential nor the TOTP code appears in the response, audit, or stderr.
     for surface in [
         begun.to_string(),
         clicked.to_string(),
@@ -418,7 +426,7 @@ fn a_stepwise_login_walks_to_a_handoff() {
         assert!(!surface.contains(code), "{surface}");
     }
 
-    // ハンドオフ後は login と同じセッションとして logout できる。
+    // After the handoff, it can be logged out as the same session as login.
     let logout = daemon.call("logout", json!({ "session_id": session_id }));
     assert_eq!(logout["result"], json!({ "ok": true }), "{logout}");
     daemon.wait_for_shutdowns(1);
@@ -570,7 +578,7 @@ fn abort_ends_the_login_without_counting_a_failure() {
     assert_eq!(ops[1..], ["login_step:abort", "shutdown"], "{ops:?}");
     daemon.wait_for_record("stepwise_aborted", &login_id);
 
-    // abort は失敗として数えないため、バックオフに掛からない。
+    // An abort is not counted as a failure, so it does not trigger backoff.
     daemon.begin_pending();
 }
 
@@ -651,8 +659,10 @@ fn lock_vault_ends_the_stepwise_logins_of_the_namespace() {
 
 #[test]
 fn lock_vault_during_login_begin_ends_the_pending_login_before_it_is_returned() {
-    // executor の起動中（`login_begin` への応答待ち）は段階ログインがまだ台帳に無い。
-    // この間に lock_vault が走っても、登録直後の自己終了判定が pending を返させない。
+    // While the executor is starting (waiting for the response to `login_begin`), the stepwise
+    // login is not yet in the ledger.
+    // Even if lock_vault runs in this window, the self-termination check right after registration
+    // must not make it return pending.
     let daemon = Daemon::start();
     let begun = std::thread::scope(|scope| {
         let begin_thread = scope.spawn(|| {
@@ -774,7 +784,8 @@ fn a_handoff_beside_a_shared_session_is_not_shared() {
     assert_eq!(done["result"]["state"], "done", "{done}");
     assert_eq!(daemon.status()["browsers"], 2);
 
-    // 共有セッションを閉じた後の login は、段階ログインのブラウザへ相乗りせずに新しく起動する。
+    // A login after the shared session is closed starts a new browser instead of piggybacking on
+    // the stepwise login's browser.
     daemon.call("logout", json!({ "session_id": shared_session }));
     daemon.wait_for_shutdowns(1);
     let again = daemon.call(
@@ -800,7 +811,7 @@ fn a_snapshot_caught_by_the_response_scan_ends_the_login() {
     daemon.wait_for_shutdowns(1);
     assert!(!daemon.audit_text().contains(USERNAME));
 
-    // SNAPSHOT_REJECTED と同じく失敗として数えるため、直後の login_begin はバックオフに掛かる。
+    // Counted as a failure like SNAPSHOT_REJECTED, so the next login_begin is subject to backoff.
     let again = daemon.begin();
     assert_eq!(error_message(&again), "RATE_LIMITED", "{again}");
 }
@@ -831,7 +842,7 @@ fn revoking_a_peer_ends_its_stepwise_logins() {
     assert_eq!(record["outcome"], "peer_revoked");
     daemon.wait_for_shutdowns(1);
 
-    // 他の principal の段階ログインは続く。
+    // Stepwise logins of other principals continue.
     let still = daemon.step(&own, snapshot());
     assert_eq!(still["result"]["state"], "pending", "{still}");
     assert!(

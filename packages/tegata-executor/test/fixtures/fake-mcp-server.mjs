@@ -1,4 +1,4 @@
-// mcp-host の単体テスト用の偽サーバーである。stdin の各行をコマンドとして解釈する。
+// A fake server for unit tests of mcp-host. Interprets each line of stdin as a command.
 import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
@@ -51,5 +51,5 @@ input.on("line", (line) => {
   const rest = space < 0 ? "" : line.slice(space + 1);
   commands[name]?.(rest);
 });
-// stubborn と ignore-eof は stdin の EOF 後も終了しない。
+// stubborn and ignore-eof do not exit even after EOF on stdin.
 if (mode === "stubborn" || mode === "ignore-eof") setInterval(() => {}, 1_000);

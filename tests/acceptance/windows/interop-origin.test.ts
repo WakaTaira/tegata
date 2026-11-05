@@ -1,4 +1,4 @@
-// AC-93 / AC-94 — WSL interop の pipe caller を監査し、管理 RPC を拒否する。
+// AC-93 / AC-94 — audit the WSL interop pipe caller and reject admin RPCs.
 // Traceability: docs/secret/briefs/tegata-issue13-interop-admin.md.
 
 import { randomBytes } from "node:crypto";
@@ -18,17 +18,17 @@ beforeAll(async () => {
 });
 
 test("AC-93: interop status audit records peer_pid and wsl_interop origin", async () => {
-  // Given: foreground デーモン
+  // Given: a foreground daemon
   const daemon = await startForegroundPhase4Daemon({
     allowedSids: [mySid],
     legacyToken: randomBytes(32).toString("base64url"),
   });
   try {
-    // When: WSL interop の pipe client（`pipeRpc`）から `status`
+    // When: `status` from the WSL interop pipe client (`pipeRpc`)
     const response = await pipeRpc(daemon.pipeName, "status", {});
     expect(response.error, JSON.stringify(response.error)).toBeUndefined();
 
-    // Then: 監査行に `peer_pid`（正の整数）と `peer_origin: "wsl_interop"` がある
+    // Then: the audit line has `peer_pid` (a positive integer) and `peer_origin: "wsl_interop"`
     const audit = readForegroundAudit(daemon.stateDirWsl);
     const record = audit.find((entry) => entry.method === "status");
     expect(record, JSON.stringify(audit)).toBeDefined();
@@ -41,16 +41,17 @@ test("AC-93: interop status audit records peer_pid and wsl_interop origin", asyn
 });
 
 test("AC-94: interop admin_peer_list is rejected and audited as wsl_interop", async () => {
-  // Given: 同じデーモン
+  // Given: the same daemon
   const daemon = await startForegroundPhase4Daemon({
     allowedSids: [mySid],
     legacyToken: randomBytes(32).toString("base64url"),
   });
   try {
-    // When: interop の pipe client から `admin_peer_list`
+    // When: `admin_peer_list` from the interop pipe client
     const response = await pipeRpc(daemon.pipeName, "admin_peer_list", {});
 
-    // Then: `ADMIN_REQUIRED`（非昇格でも interop でも拒否され、回帰しない）、監査行の `peer_origin` は `"wsl_interop"`
+    // Then: `ADMIN_REQUIRED` (rejected whether elevated or via interop, so it does not regress),
+    // and the audit line's `peer_origin` is `"wsl_interop"`
     expect(response.error?.message).toBe("ADMIN_REQUIRED");
     const audit = readForegroundAudit(daemon.stateDirWsl);
     const record = audit.find((entry) => entry.method === "admin_peer_list");

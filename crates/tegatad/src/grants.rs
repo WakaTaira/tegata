@@ -14,24 +14,27 @@ const APPROVAL_CODE_MIN: u8 = 10;
 #[cfg(any(unix, test))]
 const APPROVAL_CODE_SPAN: u8 = 90;
 
-/// 承認ゲートの通過が付与によるものかを監査行に示す値。
+/// A value that tells the audit line whether passing the approval gate was due to a grant.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ApprovalGrant {
-    /// 承認が成立し、付与を新たに記録した。
+    /// Approval was given and a new grant was recorded.
     Issued,
-    /// 有効な付与があり、承認を求めずに通した。
+    /// A valid grant existed, so the request passed without asking for approval.
     Reused,
 }
 
-/// (principal, cred_id) ごとの承認の付与。メモリにのみ保持し、永続化しない。
+/// Approval grants per (principal, cred_id). They are held in memory only and are not persisted.
 ///
-/// 有効期間は付与時刻からの固定であり、参照しても延長しない。有効期間が 0 の場合は
-/// 付与を記録せず、毎回承認を求める従来の挙動となる。
+/// The validity period is fixed from the time of the grant and is not extended by lookups. With a
+/// validity
+/// period of 0, no grant is recorded and approval is requested every time, as in the earlier
+/// behavior.
 pub(crate) struct ApprovalGrants {
     ttl: Duration,
     issued: HashMap<(String, String), Instant>,
-    /// 破棄のたびに増える世代。承認待ちの間に破棄が起きたかを判定するために用いる。
+    /// A generation that increases on every revocation. It is used to detect whether a revocation
+    /// happened while waiting for approval.
     generation: u64,
 }
 
@@ -44,7 +47,8 @@ impl ApprovalGrants {
         }
     }
 
-    /// 現在の破棄の世代を返す。承認を求める前に控え、`issue` へ渡す。
+    /// Returns the current revocation generation. Take it before asking for approval and pass it to
+    /// `issue`.
     pub(crate) fn generation(&self) -> u64 {
         self.generation
     }
@@ -54,7 +58,7 @@ impl ApprovalGrants {
         self.ttl
     }
 
-    /// 有効な付与があれば真を返す。期限切れの付与はこの時点で除去する。
+    /// Returns true if a valid grant exists. An expired grant is removed at this point.
     pub(crate) fn reuse(&mut self, principal: &str, cred_id: &str, now: Instant) -> bool {
         if self.ttl.is_zero() {
             return false;
@@ -64,8 +68,10 @@ impl ApprovalGrants {
             .contains_key(&(principal.to_owned(), cred_id.to_owned()))
     }
 
-    /// 付与を記録し、記録したかを返す。有効期間が 0 の構成、および `observed` を控えた後に
-    /// 破棄が起きた場合は記録しない。承認待ちの間の `lock_vault` を付与が上書きしないためである。
+    /// Records a grant and returns whether it was recorded. Nothing is recorded when the validity
+    /// period is 0,
+    /// or when a revocation happened after `observed` was taken. This keeps a grant from
+    /// overwriting a `lock_vault` that occurred while waiting for approval.
     pub(crate) fn issue(
         &mut self,
         principal: String,
@@ -81,8 +87,10 @@ impl ApprovalGrants {
         true
     }
 
-    /// `namespace` に属する資格の付与を破棄する。`None` の場合はすべて破棄する。
-    /// 世代は namespace を問わず進め、承認待ちの付与の記録を保守的に取りやめさせる。
+    /// Revokes the grants of credentials belonging to `namespace`; with `None`, revokes all of
+    /// them.
+    /// The generation advances regardless of namespace, which conservatively cancels the recording
+    /// of grants awaiting approval.
     pub(crate) fn revoke(&mut self, namespace: Option<&str>) {
         self.generation = self.generation.wrapping_add(1);
         let Some(namespace) = namespace else {
@@ -95,15 +103,15 @@ impl ApprovalGrants {
     }
 
     fn prune(&mut self, now: Instant) {
-        // 期限を付与時刻からの経過で判定するのは、設定値が極端に大きい場合に
-        // Instant の加算が桁あふれしないようにするためである。
+        // Expiry is judged by the time elapsed since the grant so that adding to an Instant
+        // cannot overflow when the configured value is extremely large.
         let ttl = self.ttl;
         self.issued
             .retain(|_, issued_at| now.saturating_duration_since(*issued_at) < ttl);
     }
 }
 
-/// 承認フックへ渡す照合番号（10〜99）を CSPRNG から生成する。
+/// Generates from the CSPRNG the verification number (10 to 99) passed to the approval hook.
 #[cfg(unix)]
 pub(crate) fn approval_code() -> io::Result<u8> {
     loop {
@@ -115,7 +123,8 @@ pub(crate) fn approval_code() -> io::Result<u8> {
     }
 }
 
-/// 256 は 90 で割り切れないため、90 の倍数未満の値のみを採用して剰余の偏りを除く。
+/// 256 is not divisible by 90, so only values below the largest multiple of 90 are accepted to
+/// remove modulo bias.
 #[cfg(any(unix, test))]
 fn approval_code_from_byte(byte: u8) -> Option<u8> {
     (byte < APPROVAL_CODE_SPAN * 2).then(|| APPROVAL_CODE_MIN + byte % APPROVAL_CODE_SPAN)

@@ -144,7 +144,7 @@ function waitReady(child: ChildProcess, stderr: () => string): Promise<void> {
         }
       } catch {}
     });
-    // stderr の末尾は exit より後に届きうるため、パイプが閉じる close で読む。
+    // The tail of stderr can arrive after exit, so read it on the close event when the pipe closes.
     child.once("close", (code) => {
       clearTimeout(timer);
       reject(
@@ -181,8 +181,8 @@ export async function startApprovalDaemon(opts: {
       path.join(stateDirWsl, "token_hash"),
       `${sha256Hex("acceptance-token")}\n`,
     );
-    // WSL 側のパスは Windows プロセスから読めないため、リグ証明書を %TEMP%
-    // 配下へ複製し、bw には Windows パスで渡す。
+    // The WSL-side path cannot be read by Windows processes, so the rig certificate is copied
+    // under %TEMP% and passed to bw as a Windows path.
     fs.copyFileSync(rig.vaultCert, path.join(dirWsl, "vault-ca.pem"));
     await sealForInteropUser(`${dirWin}\\state\\sealed.blob`);
     fs.writeFileSync(
@@ -201,8 +201,8 @@ export async function startApprovalDaemon(opts: {
         "[[providers]]",
         `namespace = ${JSON.stringify(APPROVAL_NAMESPACE)}`,
         'type = "bitwarden-cli"',
-        // localhost は Windows 側で ::1 に解決され、WSL の localhost 転送は
-        // IPv4 だけを運ぶため、127.0.0.1 を明示する（RIG.md 参照）。
+        // localhost resolves to ::1 on the Windows side, and the WSL localhost forwarding carries
+        // only IPv4, so 127.0.0.1 is specified explicitly (see RIG.md).
         `server_url = ${JSON.stringify(`https://127.0.0.1:${rig.vaultPort}`)}`,
         `email = ${JSON.stringify(rig.vaultEmail)}`,
         'askpass_cmd = ""',
@@ -215,7 +215,8 @@ export async function startApprovalDaemon(opts: {
         env: {
           ...process.env,
           NODE_EXTRA_CA_CERTS: `${dirWin}\\vault-ca.pem`,
-          // interop が Windows 側へ引き継ぐ環境変数は WSLENV に列挙したものに限られる。
+          // The environment variables that interop carries over to the Windows side are limited to
+          // those listed in WSLENV.
           WSLENV: [process.env.WSLENV, "NODE_EXTRA_CA_CERTS"]
             .filter((v) => v !== undefined && v !== "")
             .join(":"),

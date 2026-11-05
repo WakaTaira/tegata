@@ -104,10 +104,10 @@ async function fetchWithTimeout(
   }
 }
 
-/** 終了済みプロキシの接続拒否または 404 を 2 秒以内に確認する。 */
+/** Verifies within 2 seconds that the terminated proxy refuses connections or returns 404. */
 async function expectProxyUnavailable(baseUrl: string): Promise<void> {
   const deadline = Date.now() + 2_000;
-  let lastStatus = "接続結果なし";
+  let lastStatus = "no connection result";
   while (Date.now() < deadline) {
     try {
       const response = await fetchWithTimeout(
@@ -136,8 +136,8 @@ function throwawayCanaries(): CanarySet {
 }
 
 // Given: [[api_proxy]] name = "fx"（upstream = fixture、cred X）
-// When: open_api_proxy {name: "fx"} の base_url + "/api/whoami" へ GET
-// Then: HTTP 200 で、本文が {"user":"fixture"}
+// When: GET base_url + "/api/whoami" from open_api_proxy {name: "fx"}
+// Then: HTTP 200 with body {"user":"fixture"}
 test("AC-98: open_api_proxy injects cred X for the fixture whoami request", async () => {
   const stack = await singleProxyStack();
   let sessionId: string | undefined;
@@ -156,9 +156,9 @@ test("AC-98: open_api_proxy injects cred X for the fixture whoami request", asyn
   }
 });
 
-// Given: AC-98 のプロキシ
-// When: secret を欠いた path と、別の secret の path で "/api/whoami" へ GET
-// Then: どちらも HTTP 404 で、fixture の "/api/whoami" 受信数は増えない
+// Given: the AC-98 proxy
+// When: GET "/api/whoami" with a path lacking the secret, and with another secret's path
+// Then: both return HTTP 404, and the fixture's receive count for "/api/whoami" does not increase
 test("AC-99: api-proxy paths without the issued secret never reach upstream", async () => {
   const stack = await singleProxyStack();
   let sessionId: string | undefined;
@@ -183,9 +183,10 @@ test("AC-99: api-proxy paths without the issued secret never reach upstream", as
   }
 });
 
-// Given: AC-98 のプロキシ
-// When: agent が Authorization: Bearer wrong を付けて "/api/whoami" へ GET
-// Then: 注入値で置換されて HTTP 200、応答ヘッダ・本文・MCP 出力・leak guard 走査で cred X の password が 0 件
+// Given: the AC-98 proxy
+// When: the agent sends GET "/api/whoami" with Authorization: Bearer wrong
+// Then: the value is replaced with the injected one and HTTP 200 is returned; cred X's password
+// appears 0 times in response headers, body, MCP output, and the leak guard scan
 test("AC-100: caller authorization is replaced and the credential stays out of observed surfaces", async () => {
   const stack = await singleProxyStack();
   let sessionId: string | undefined;
@@ -214,15 +215,16 @@ test("AC-100: caller authorization is replaced and the credential stays out of o
   }
 });
 
-// Given: プロキシ s1
+// Given: proxy s1
 // When: logout {session_id: s1}
-// Then: 2 秒以内に base_url への GET が接続拒否または HTTP 404
-// Given: プロキシ s2
+// Then: within 2 seconds, GET to base_url is refused or returns HTTP 404
+// Given: proxy s2
 // When: lock_vault
-// Then: 2 秒以内に base_url への GET が接続拒否または HTTP 404
-// Given: トップレベル session_ttl_secs = 3 のプロキシ s3
-// When: 4 秒待つ
-// Then: 2 秒以内に base_url への GET が接続拒否または HTTP 404、監査に s3 の session_expired
+// Then: within 2 seconds, GET to base_url is refused or returns HTTP 404
+// Given: proxy s3 with top-level session_ttl_secs = 3
+// When: wait 4 seconds
+// Then: within 2 seconds, GET to base_url is refused or returns HTTP 404, and the audit log
+// contains session_expired for s3
 test("AC-101: logout, lock_vault, and proxy TTL terminate their sessions", async () => {
   const logoutStack = await singleProxyStack();
   try {
@@ -281,12 +283,12 @@ test("AC-101: logout, lock_vault, and proxy TTL terminate their sessions", async
   }
 });
 
-// Given: 未定義の name
+// Given: an undefined name
 // When: open_api_proxy {name: "nope"}
 // Then: NOT_FOUND
-// Given: upstream = "http://example.com" の config
-// When: daemon を起動
-// Then: exit code 非ゼロで stderr に upstream の理由がある
+// Given: a config with upstream = "http://example.com"
+// When: start the daemon
+// Then: non-zero exit code, and stderr gives the reason for the upstream rejection
 test("AC-102: unknown proxies fail closed and non-loopback upstreams refuse startup", async () => {
   const stack = await singleProxyStack();
   try {
@@ -313,9 +315,11 @@ test("AC-102: unknown proxies fail closed and non-loopback upstreams refuse star
   expect(exit.stderr).toMatch(/example\.com|loopback|allowlist|local/i);
 });
 
-// Given: AC-98 の GET（query ?q=secretish 付き）
-// When: 監査ログを読む
-// Then: open_api_proxy 行（target_url = upstream）と api_proxy_request 行（proxy = "fx"、GET、path = "/api/whoami"、status = 200、principal あり）があり、secretish・password・path secret は 0 件
+// Given: the AC-98 GET (with query ?q=secretish)
+// When: read the audit log
+// Then: an open_api_proxy line (target_url = upstream) and an api_proxy_request line (proxy = "fx",
+// GET, path = "/api/whoami", status = 200, with a principal) exist, and secretish, password, and
+// the path secret appear 0 times
 test("AC-103: api-proxy audit records describe the request without secret material", async () => {
   const stack = await singleProxyStack();
   let sessionId: string | undefined;
@@ -362,9 +366,10 @@ test("AC-103: api-proxy audit records describe the request without secret materi
   }
 });
 
-// Given: approve_cmd が env をファイルへ書いて exit 1 するスクリプト
+// Given: a script for approve_cmd that writes its env to a file and exits 1
 // When: open_api_proxy {name: "fx"}
-// Then: APPROVAL_DENIED となり、ファイルに TEGATA_METHOD=open_api_proxy と TEGATA_TARGET_URL=<upstream> がある
+// Then: APPROVAL_DENIED, and the file contains TEGATA_METHOD=open_api_proxy and
+// TEGATA_TARGET_URL=<upstream>
 test("AC-104: approve_cmd receives api-proxy references and can deny the call", async () => {
   const scratch = fs.mkdtempSync(
     path.join(os.tmpdir(), "tegata-api-proxy-hitl-"),

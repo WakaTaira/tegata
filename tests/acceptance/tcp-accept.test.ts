@@ -22,7 +22,7 @@ async function openSilent(port: number): Promise<net.Socket> {
 }
 
 test("AC-66: silent connections neither stall real clients nor pile up", async () => {
-  // Given: TCP 口と、無言のまま張った接続 7 本（上限 8 の内側）
+  // Given: a TCP port, and 7 connections opened and left silent (within the limit of 8)
   const stack = await startPhase4Stack({ tcp: true });
   const held: net.Socket[] = [];
   try {
@@ -30,17 +30,18 @@ test("AC-66: silent connections neither stall real clients nor pile up", async (
     const peer = await issuePeer(stack.daemon.socketPath, "probe");
     for (let i = 0; i < 7; i++) held.push(await openSilent(tcpPort));
 
-    // When: 正規の preamble + status を送る
+    // When: send a valid preamble + status
     const started = Date.now();
     const res = await tcpRpc(tcpPort, peer.token, "status", {}, 15_000);
     const elapsed = Date.now() - started;
 
-    // Then: 2 s 以内に応答を得る（無言接続の 10 s 待ちに巻き込まれない）
+    // Then: a response arrives within 2 s (it is not caught up in the 10 s wait of the silent
+    // connections)
     expect(res.preamble).toBeUndefined();
     expect(res.result, JSON.stringify(res)).toBeDefined();
     expect(elapsed).toBeLessThan(2_000);
 
-    // When: 8 本目の無言接続で上限に達した状態で、9 本目を開く
+    // When: with the limit reached by an 8th silent connection, open a 9th
     held.push(await openSilent(tcpPort));
     const ninth = await openSilent(tcpPort);
     held.push(ninth);
@@ -49,7 +50,7 @@ test("AC-66: silent connections neither stall real clients nor pile up", async (
       sleep(1_000).then(() => false),
     ]);
 
-    // Then: 9 本目は 1 s 以内に切断される
+    // Then: the 9th is disconnected within 1 s
     expect(closedWithinASecond).toBe(true);
   } finally {
     for (const sock of held) sock.destroy();

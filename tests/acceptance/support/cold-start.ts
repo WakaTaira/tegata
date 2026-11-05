@@ -64,7 +64,7 @@ if [ "\${1:-}" = "login" ] && [ "\${2:-}" = "--check" ]; then
 fi
 
 if [ "\${1:-}" = "login" ] || [ "\${1:-}" = "unlock" ]; then
-  # 診断行のマスク経路を通すため、email・master password・払い出す session key を stderr に混ぜる。
+  # Mix the email, master password, and issued session key into stderr to exercise the diagnostic line's masking.
   printf 'debug: %s %s %s\\n' "$FAKE_BW_EMAIL" "\${BW_PASSWORD:-}" "$FAKE_BW_SESSION" >&2
   printf '%s\\n' "$FAKE_BW_SESSION"
   exit 0
@@ -196,7 +196,7 @@ async function waitForDaemon(
         const response = await rawRpc(socketPath, "status", {});
         if (response.result !== undefined) return;
       } catch {
-        // 起動途中のソケット接続失敗は、次の試行で確認します。
+        // Failures to connect to the socket during startup are rechecked on the next attempt.
       }
     }
     await new Promise((resolve) => setTimeout(resolve, 50));

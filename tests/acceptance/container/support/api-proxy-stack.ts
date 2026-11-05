@@ -76,7 +76,7 @@ export async function startBridge(
   throw new Error(`tegata-bridge did not open its socket: ${log}`);
 }
 
-/** API proxy の container スイート用に、host daemon と agent bridge を構成する。 */
+/** Builds the host daemon and the agent bridge for the container suite of the API proxy. */
 export async function startApiProxyContainerStack(): Promise<ApiProxyContainerStack> {
   const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "tegata-agent-"));
   const guard = await createLeakGuard({
@@ -157,7 +157,7 @@ export async function startApiProxyContainerStack(): Promise<ApiProxyContainerSt
   }
 }
 
-/** container 内 MCP と host 側資源を逆順に停止する。 */
+/** Stops the in-container MCP and the host-side resources in reverse order. */
 export async function stopApiProxyContainerStack(
   stack: ApiProxyContainerStack,
 ): Promise<void> {

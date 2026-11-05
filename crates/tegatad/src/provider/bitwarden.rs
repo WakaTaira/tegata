@@ -229,8 +229,9 @@ impl BwRunError {
         }
     }
 
-    /// spawn・appdata ディレクトリ作成に伴う `io::Error` の種類のみを返す。パスを含み得る
-    /// `Display` 文は診断行に載せないため、`ErrorKind` の `Debug` 表現に限定する。
+    /// Returns only the kind of the `io::Error` raised by spawn and appdata directory creation. The
+    /// `Display` text, which can contain paths, is kept out of the diagnostic line, so this is
+    /// limited to the `Debug` form of `ErrorKind`.
     fn io_error_kind(&self) -> Option<io::ErrorKind> {
         match self {
             Self::CreateDir(error) | Self::Process(error, _) => Some(error.kind()),
@@ -297,9 +298,10 @@ fn session_key_from_stdout(stdout: &[u8]) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// `login --raw` / `unlock --raw` の stdout は新たに払い出された session key そのものである。
-/// 診断行の stderr を切り詰める前にマスクするため、stdout から得た session key と stdout 全体の
-/// trim 値を秘匿対象として返す。
+/// The stdout of `login --raw` / `unlock --raw` is the freshly issued session key itself.
+/// The stderr of the diagnostic line is masked before truncation, so this returns the session key
+/// taken from stdout and
+/// the trimmed value of the whole stdout as the secrets to hide.
 fn issued_session_secrets(args: &[String], stdout: &[u8]) -> Vec<String> {
     let issues_session = match args.first().map(String::as_str) {
         Some("unlock") => true,
@@ -452,8 +454,10 @@ impl BitwardenCliProvider {
             })
     }
 
-    /// 失敗時の診断行を出さずに、失敗と診断の材料を呼び出し側へ返す。失敗が正常な回答を
-    /// 意味する呼び出し（`login --check` の exit 1 など）は、呼び出し側の意味論で診断行を出す。
+    /// Returns the failure and the material for a diagnostic to the caller without emitting a
+    /// diagnostic line on failure.
+    /// For calls where a failure is a normal answer (for example exit 1 of `login --check`), the
+    /// caller emits the diagnostic line according to its own semantics.
     async fn run_bw_unreported(
         &self,
         args: &[String],
@@ -828,7 +832,8 @@ impl BitwardenCliProvider {
                 output.finish(None, Some("logged_in"));
                 Ok(true)
             }
-            // exit 1 は「未ログイン」という正常な回答であり、障害として診断行に載せない。
+            // Exit 1 is the normal answer "not logged in", so it is not put in the diagnostic line
+            // as a failure.
             Err((error @ BwRunError::NonZeroExit(_, _), diagnostic)) => {
                 if error.exit_code() == Some(1) {
                     emit_bw_diag(diagnostic, None, Some("logged_out"));
@@ -883,7 +888,8 @@ impl BitwardenCliProvider {
             // If the server differs, the login state must be discarded before changing the configuration.
             let logged_in = self.login_check(context).await?;
             if logged_in {
-                // logout の失敗は従来どおり致命としない。失敗は診断行にのみ残して続行する。
+                // A logout failure is still not fatal, as before. Record the failure only in the
+                // diagnostic line and continue.
                 let _ = self
                     .run_bw_with_context(&["logout".to_owned()], None, None, context)
                     .await;
@@ -1030,8 +1036,10 @@ impl BitwardenCliProvider {
                 })
                 .collect());
         }
-        // cold start は、ロックされておらず catalog がまだ一度も埋まっていない状態を指す。
-        // ロック中は直前の分岐で返しているため、ここでは catalog の空判定のみで足りる。
+        // A cold start is the state where the vault is not locked and the catalog has never been
+        // populated.
+        // A locked vault was already returned by the previous branch, so checking only whether the
+        // catalog is empty is enough here.
         let context = BwAttemptContext::new(self.catalog.is_empty(), 1);
         let method = crate::current_rpc_method();
         let retry_cold_start = can_retry_cold_start(context, method.as_deref());
@@ -1224,7 +1232,8 @@ mod tests {
             None,
             &issued,
         );
-        // 切り詰めより前にマスクされるため、300 バイト境界をまたぐ session key の断片も残らない。
+        // The mask is applied before truncation, so no fragment of a session key spanning the
+        // 300-byte boundary remains.
         assert_eq!(sanitized, format!("{}[REDACTED]", "x".repeat(290)));
         assert_eq!(
             issued_session_secrets(&["unlock".to_owned(), "--raw".to_owned()], b"key\n"),

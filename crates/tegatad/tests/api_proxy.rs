@@ -1,5 +1,6 @@
-//! 注入プロキシ（`[[api_proxy]]` と `open_api_proxy`）のデーモン側を、偽 executor で検証する。
-//! UNIX ドメインソケット経由で RPC を送るため、UNIX でのみ実行する。
+//! Verifies the daemon side of the injection proxy (`[[api_proxy]]` and `open_api_proxy`) with a
+//! fake executor.
+//! RPCs are sent over a UNIX domain socket, so these tests run on UNIX only.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -19,10 +20,13 @@ const UPSTREAM: &str = "http://127.0.0.1:9";
 const PROXY_PORT: u16 = 38998;
 const PATH_SECRET: &str = "fake-path-secret_A1";
 
-/// 受けた要求を `executor.js.log` に 1 行ずつ記録する偽 executor。
-/// 開始応答の直後と、停止・終了の応答の直前に id を持たないイベント行を書き、
-/// デーモンがイベント行を応答と取り違えないことを確かめられるようにする。
-/// stdin が閉じても待機を続けるが、テストのディレクトリが消えたら終了する。ディレクトリはデーモンの停止後に後始末で消されるため、デーモン自身の回収は検証対象に残したまま、孤児を残さない（#47）。
+/// Fake executor that records each request it receives, one per line, in `executor.js.log`.
+/// It writes an event line without an id right after the start response and right before the stop
+/// and shutdown responses,
+/// so tests can confirm that the daemon does not mistake event lines for responses.
+/// It keeps waiting even after stdin closes, but exits once the test directory is gone. The
+/// directory is removed during cleanup after the daemon stops, so no orphan is left behind while
+/// the daemon's own reaping stays under test (#47).
 const PROXY_EXECUTOR: &str = r#"
 const fs = require("node:fs");
 const readline = require("node:readline");
@@ -49,8 +53,10 @@ rl.on("line", (line) => {
 rl.on("close", () => { setInterval(() => { if (!fs.existsSync(__dirname)) process.exit(0); }, 200); });
 "#;
 
-/// 開始応答の直後に、監査で整形されるべき path のイベント行を書く偽 executor。
-/// 1 行目は path secret と同じ形の先頭 segment、2 行目は上限を超える長さの path を持つ。
+/// Fake executor that writes event lines with paths the audit log must normalize right after the
+/// start response.
+/// The first line has a leading segment shaped like the path secret; the second has a path longer
+/// than the limit.
 const PATH_EVENT_EXECUTOR: &str = r#"
 const readline = require("node:readline");
 const event = (path, status) =>
@@ -70,7 +76,7 @@ rl.on("line", (line) => {
 });
 "#;
 
-/// 開始要求を失敗させる偽 executor。
+/// Fake executor that fails the start request.
 const FAILING_PROXY_EXECUTOR: &str = r#"
 const readline = require("node:readline");
 const rl = readline.createInterface({ input: process.stdin });
@@ -121,8 +127,10 @@ rl.on("line", (line) => {
 });
 "#;
 
-/// `api_proxy_stop` の応答を、デーモンの停止処理の待機（1 秒）より長く遅らせる OAuth の偽 executor。
-/// 応答の直前に失効のイベント行を書き、executor が停止要求の中で行う revocation を模す。
+/// OAuth fake executor that delays its `api_proxy_stop` response beyond the daemon's stop wait (1
+/// second).
+/// It writes a revocation event line right before the response, imitating the revocation the
+/// executor performs during a stop request.
 const SLOW_REVOKING_OAUTH_PROXY_EXECUTOR: &str = r#"
 const fs = require("node:fs");
 const readline = require("node:readline");
@@ -376,7 +384,7 @@ fn open_api_proxy_injects_the_resolved_value_and_audits_requests() {
 
     let status = rpc(daemon.socket(), "status", json!({}));
     assert_eq!(status["result"]["leases"], json!(1));
-    // プロキシはブラウザとして数えない。
+    // The proxy is not counted as a browser.
     assert_eq!(status["result"]["browsers"], json!(0));
 
     wait_for(
@@ -423,7 +431,8 @@ fn logout_stops_the_proxy_without_confusing_event_lines_with_responses() {
         json!({ "session_id": session_id }),
     );
     assert_eq!(logout["result"]["ok"], json!(true));
-    // イベント行が応答として照合されると executor は shutdown を受け取る前に停止させられる。
+    // If an event line were matched as a response, the executor would be stopped before it receives
+    // shutdown.
     assert_eq!(
         executor_ops(&daemon),
         ["api_proxy_start", "api_proxy_stop", "shutdown"]
@@ -751,7 +760,8 @@ fn approve_cmd_receives_the_upstream_and_can_deny() {
     assert!(executor_ops(&daemon).is_empty());
 }
 
-/// 設定を与えてデーモンを起動し、終了コードと stderr を返す。起動し続けた場合は None を返す。
+/// Starts the daemon with the given config and returns the exit code and stderr. Returns None if it
+/// keeps running.
 fn run_until_exit(api_proxies: String) -> Option<(i32, String)> {
     let mut options = Options::new(PROXY_EXECUTOR);
     options.api_proxies = api_proxies;

@@ -27,11 +27,11 @@ function loginArgs(stack: WinStack): Record<string, unknown> {
 }
 
 test("AC-68: the pipe SID and a TCP peer own separate sessions", async () => {
-  // Given: リグのサービス、bridge（TCP peer）、pipe client（interop SID）
+  // Given: the rig service, the bridge (TCP peer), and a pipe client (interop SID)
   const stack = await startWinStack();
   const pipeName = rigPipeName();
   try {
-    // When: pipe から login（s1）、bridge から同じ cred で login（s2）
+    // When: login from the pipe (s1), and login with the same cred from the bridge (s2)
     const viaPipe = await pipeRpc(pipeName, "login", loginArgs(stack));
     stack.guard.observe("pipe:login", viaPipe);
     expect(viaPipe.error, JSON.stringify(viaPipe.error)).toBeUndefined();
@@ -40,13 +40,13 @@ test("AC-68: the pipe SID and a TCP peer own separate sessions", async () => {
     expect(viaBridge.isError, `login failed: ${viaBridge.text}`).toBe(false);
     const s2 = viaBridge.json as LoginResult;
 
-    // Then: 別のブラウザ（endpoint の path = ブラウザ id が異なる。bridge は
-    // ポートだけを書き換えるので path で比較できる）
+    // Then: different browsers (the endpoint path = the browser id differs. The bridge
+    // rewrites only the port, so the paths can be compared)
     expect(new URL(s1.channel.endpoint).pathname).not.toBe(
       new URL(s2.channel.endpoint).pathname,
     );
 
-    // When: TCP peer が logout(s1)、pipe が logout(s2) を呼ぶ
+    // When: the TCP peer calls logout(s1), and the pipe calls logout(s2)
     const crossFromBridge = await bridgeRpc(stack.bridge.socketPath, "logout", {
       session_id: s1.session_id,
     });
@@ -54,11 +54,11 @@ test("AC-68: the pipe SID and a TCP peer own separate sessions", async () => {
       session_id: s2.session_id,
     });
 
-    // Then: どちらも NOT_FOUND
+    // Then: both are NOT_FOUND
     expect(crossFromBridge.error?.message).toBe("NOT_FOUND");
     expect(crossFromPipe.error?.message).toBe("NOT_FOUND");
 
-    // And: 自分のリースの logout は通る
+    // And: logout of one's own lease succeeds
     const ownPipe = await pipeRpc(pipeName, "logout", {
       session_id: s1.session_id,
     });

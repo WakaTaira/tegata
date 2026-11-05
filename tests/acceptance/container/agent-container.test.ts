@@ -42,13 +42,13 @@ describe.skipIf(!dockerAvailable())("AC-72 / AC-73 (docker)", () => {
   });
 
   test("AC-72: the agent container logs in through the bridge and drives the session over CDP", async () => {
-    // Given: agent コンテナで tegata-bridge（p1 のトークン）と MCP（TEGATA_BRIDGE=1）
+    // Given: tegata-bridge (with the token of p1) and MCP (TEGATA_BRIDGE=1) in the agent container
     if (stack?.mcp === undefined || stack.agent === undefined)
       throw new Error("agent stack not started");
     const mcp: McpSession = stack.mcp;
     const agent: Container = stack.agent;
 
-    // When: login(X) の endpoint に Playwright で connectOverCDP（コンテナ内から）
+    // When: connectOverCDP with Playwright (from inside the container) to the endpoint of login(X)
     const res = await mcp.callTool(
       "login",
       loginParams(stack.fixture.url, "mock:site"),
@@ -69,25 +69,26 @@ describe.skipIf(!dockerAvailable())("AC-72 / AC-73 (docker)", () => {
       error?: string;
     };
 
-    // Then: fixture のログイン後ページのタイトルが取れる
+    // Then: the title of the fixture post-login page is retrievable
     expect(page.error, probe.stdout).toBeUndefined();
     expect(page.title).toBe(LOGGED_IN_PAGE_TITLE);
     expect(stack.fixture.loginPosts()).toBe(1);
   });
 
   test("AC-73: no canary reaches the agent container", async () => {
-    // Given: AC-72 の状態（bridge・MCP サーバー・リースが生きている）
+    // Given: the AC-72 state (the bridge, the MCP server, and the lease are alive)
     if (stack?.agent === undefined) throw new Error("agent stack not started");
     expect(login).toBeDefined();
     const agent: Container = stack.agent;
 
-    // When: コンテナ内の FS・環境変数・ps 出力を leakscan で走査。
-    //       FS は / 直下の全ディレクトリ。/proc /sys /dev は擬似 FS なので除外し、
-    //       /nix と /app はホストから読み取り専用でマウントしたツール類
-    //       （store closure / node_modules / MCP / probe）でコンテナ側から書き込めず、
-    //       ホスト側 guard の走査対象でもあるので除外する。ps 出力と環境変数は
-    //       全プロセスの cmdline / environ を吸い出したファイルとして /tmp に置き、
-    //       同じ走査に含める。カナリアは stdin で渡す。
+    // When: scan the FS, environment variables, and ps output inside the container with leakscan.
+    //       The FS scan covers every top-level directory under /. /proc, /sys, and /dev are
+    //       excluded because they are pseudo filesystems, and /nix and /app are excluded
+    //       because they hold tooling mounted read-only from the host (the store closure /
+    //       node_modules / MCP / probe), cannot be written from the container side, and are
+    //       already covered by the host-side guard scan. The ps output and environment
+    //       variables are dumped as a file of every process's cmdline / environ, placed in
+    //       /tmp, and included in the same scan. The canaries are passed via stdin.
     const dumpPath = "/tmp/tegata-acceptance-proc.txt";
     await agent.exec([
       "sh",
@@ -114,7 +115,7 @@ describe.skipIf(!dockerAvailable())("AC-72 / AC-73 (docker)", () => {
       },
     );
 
-    // Then: カナリア（password / TOTP seed ほか guard の全カナリア）が 0 件
+    // Then: 0 canaries found (the password, the TOTP seed, and every other guard canary)
     expect(scan.status, `${scan.stdout}\n${scan.stderr}`).toBe(0);
     const report = JSON.parse(scan.stdout) as { hits: unknown[] };
     expect(report.hits).toEqual([]);

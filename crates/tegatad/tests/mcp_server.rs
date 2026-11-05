@@ -1,5 +1,6 @@
-//! stdio MCP サーバーの起動（`[[mcp_server]]` と `open_mcp_server`）のデーモン側を、偽 executor で検証する。
-//! UNIX ドメインソケット経由で RPC を送るため、UNIX でのみ実行する。
+//! Verifies the daemon side of stdio MCP server launching (`[[mcp_server]]` and `open_mcp_server`)
+//! with a fake executor.
+//! RPCs are sent over a UNIX domain socket, so these tests run on UNIX only.
 #![cfg(unix)]
 
 use std::path::PathBuf;
@@ -20,10 +21,15 @@ const COMMAND: &str = "/opt/fake/bin/fake-mcp-server";
 const RELAY_PORT: u16 = 38999;
 const STREAM_SECRET: &str = "fake-stream-secret_A1";
 
-/// 受けた要求を `executor.js.log` に 1 行ずつ記録する偽 executor の雛形。
-/// `__AFTER_START__` は開始応答の直後に実行する処理に置き換える。停止・終了の応答の直前には
-/// id を持たないイベント行を書き、デーモンがイベント行を応答と取り違えないことを確かめられるようにする。
-/// stdin が閉じても待機を続けるが、テストのディレクトリが消えたら終了する。ディレクトリはデーモンの停止後に後始末で消されるため、デーモン自身の回収は検証対象に残したまま、孤児を残さない（#47）。
+/// Template for a fake executor that records each request it receives, one per line, in
+/// `executor.js.log`.
+/// `__AFTER_START__` is replaced with the processing to run right after the start response. It
+/// writes
+/// an event line without an id right before the stop and shutdown responses, so tests can confirm
+/// that the daemon does not mistake event lines for responses.
+/// It keeps waiting even after stdin closes, but exits once the test directory is gone. The
+/// directory is removed during cleanup after the daemon stops, so no orphan is left behind while
+/// the daemon's own reaping stays under test (#47).
 const MCP_EXECUTOR_TEMPLATE: &str = r#"
 const fs = require("node:fs");
 const readline = require("node:readline");
@@ -49,7 +55,7 @@ rl.on("line", (line) => {
 rl.on("close", () => { setInterval(() => { if (!fs.existsSync(__dirname)) process.exit(0); }, 200); });
 "#;
 
-/// 開始要求を失敗させる偽 executor。
+/// Fake executor that fails the start request.
 const FAILING_MCP_EXECUTOR: &str = r#"
 const readline = require("node:readline");
 const rl = readline.createInterface({ input: process.stdin });
@@ -65,12 +71,14 @@ rl.on("line", (line) => {
 });
 "#;
 
-/// 開始後に接続の成立だけを知らせる偽 executor の本文を返す。
+/// Returns the body of a fake executor that only reports that the connection was established after
+/// start.
 fn connecting_executor() -> String {
     MCP_EXECUTOR_TEMPLATE.replace("__AFTER_START__", r#"event("connected", {});"#)
 }
 
-/// 開始後に接続の成立を知らせ、少し後にサーバーの自発的な終了を知らせる偽 executor の本文を返す。
+/// Returns the body of a fake executor that reports the connection after start and, shortly
+/// afterwards, reports that the server exited on its own.
 fn exiting_executor() -> String {
     MCP_EXECUTOR_TEMPLATE.replace(
         "__AFTER_START__",
@@ -78,7 +86,8 @@ fn exiting_executor() -> String {
     )
 }
 
-/// 開始後に接続の成立を知らせ、少し後に行検査での漏洩の検出を知らせる偽 executor の本文を返す。
+/// Returns the body of a fake executor that reports the connection after start and, shortly
+/// afterwards, reports a leak detected by line scanning.
 fn leaking_executor() -> String {
     MCP_EXECUTOR_TEMPLATE.replace(
         "__AFTER_START__",
@@ -106,7 +115,8 @@ impl Options {
     }
 }
 
-/// `[[mcp_server]]` の 1 項目を作る。`env` は `[mcp_server.env]` の本文である（空なら表を省く）。
+/// Builds one `[[mcp_server]]` entry. `env` is the body of `[mcp_server.env]` (the table is omitted
+/// if empty).
 fn mcp_server_section(name: &str, command: &str, env: &str) -> String {
     let env = if env.is_empty() {
         String::new()
@@ -329,14 +339,14 @@ fn open_mcp_server_sends_rendered_env_and_scan_and_audits_the_session() {
         .map(|value| value.as_str().expect("scan string").to_owned())
         .collect::<Vec<_>>();
     scan.sort();
-    // `{{username}}` のみを含む USER は漏洩検査の対象に入らない。
+    // A USER containing only `{{username}}` is not subject to leak scanning.
     let mut expected = vec![PASSWORD.to_owned(), format!("Bearer {PASSWORD}"), code];
     expected.sort();
     assert_eq!(scan, expected);
 
     let status = rpc(daemon.socket(), "status", json!({}));
     assert_eq!(status["result"]["leases"], json!(1));
-    // MCP サーバーはブラウザとして数えない。
+    // The MCP server is not counted as a browser.
     assert_eq!(status["result"]["browsers"], json!(0));
 
     wait_for(
@@ -373,7 +383,7 @@ fn open_mcp_server_sends_rendered_env_and_scan_and_audits_the_session() {
     assert!(!audit.contains(STREAM_SECRET));
 }
 
-/// `mcp_server_start` の `scan` を文字列の列として取り出す。
+/// Extracts the `scan` of `mcp_server_start` as a list of strings.
 fn start_scan(daemon: &Daemon) -> Vec<String> {
     daemon
         .executor_log()
@@ -595,7 +605,8 @@ fn approve_cmd_receives_the_server_target_and_can_deny() {
     assert!(executor_ops(&daemon).is_empty());
 }
 
-/// 設定を与えてデーモンを起動し、終了コードと stderr を返す。起動し続けた場合は None を返す。
+/// Starts the daemon with the given config and returns the exit code and stderr. Returns None if it
+/// keeps running.
 fn run_until_exit(mcp_servers: String) -> Option<(i32, String)> {
     let mut options = Options::new(connecting_executor());
     options.mcp_servers = mcp_servers;

@@ -39,8 +39,9 @@ function html(title: string, body: string): string {
   return `<!doctype html><html><head><title>${title}</title></head><body>${body}</body></html>`;
 }
 
-// 段階ログインの最小のサイト。username → password → 成功ページの 3 画面と、password を返す悪性ページ、
-// 誤った password を欄に残したまま再描画するページを持つ。
+// A minimal site for stepwise login. It has three screens (username, password, success page), a
+// malicious page that returns the password,
+// and a page that re-renders while leaving a wrong password in the field.
 const site = {
   posts: [] as string[],
   stickyReports: [] as Array<{ when: string; length: number }>,
@@ -218,7 +219,7 @@ afterEach(async () => {
 
 type Response = Record<string, unknown>;
 
-/** 1 回の処理が標準出力へ書く応答行を読み取る。 */
+/** Reads the response line that one run writes to standard output. */
 async function captureResponse(action: () => Promise<void>): Promise<Response> {
   const lines: string[] = [];
   const spy = vi.spyOn(process.stdout, "write").mockImplementation(((
@@ -279,7 +280,7 @@ function snapshotOf(response: Response): Snapshot {
   return response.snapshot as Snapshot;
 }
 
-/** 応答のスナップショットから、役割と名前で 1 行を探してその ref を返す。 */
+/** Finds one line in the response snapshot by role and name and returns its ref. */
 function refOf(response: Response, role: string, name?: string): string {
   const line = snapshotOf(response)
     .page.split("\n")
@@ -292,7 +293,7 @@ function refOf(response: Response, role: string, name?: string): string {
   return ref as string;
 }
 
-/** username 画面から password 画面まで進める。 */
+/** Advances from the username screen to the password screen. */
 async function advanceToPassword(
   fields: Record<string, unknown> = {},
 ): Promise<Response> {
@@ -526,7 +527,8 @@ describe("stepwise login", { timeout: 90_000 }, () => {
     ]);
     expect(site.posts).toEqual(["username", "password"]);
 
-    // ハンドオフ後は login の成功後と同じ要求を受け付け、段階ログインの操作は受け付けない。
+    // After the handoff, it accepts the same requests as after a successful login and does not
+    // accept stepwise login operations.
     const exportRequest = parseRequest('{"op":"export_cookies","id":3}');
     if (exportRequest.op !== "export_cookies") throw new Error("not export");
     const exported = await captureResponse(() =>
@@ -624,7 +626,7 @@ describe("stepwise login", { timeout: 90_000 }, () => {
     expect(await step({ action: "snapshot" })).toMatchObject({
       error: "INTERNAL",
     });
-    // ブラウザは破棄済みであり、新しい段階ログインを始められる。
+    // The browser has been discarded, and a new stepwise login can be started.
     expect(await begin("/login")).toMatchObject({ state: "pending" });
   });
 

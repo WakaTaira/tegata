@@ -87,7 +87,10 @@ type DeviceStep = DeviceFillStep | ClickStep | WaitForStep;
 
 type RequestId = number;
 
-/** デーモンと受け渡す cookie の形。Playwright の Cookie 型のうち、ここに挙げる項目のみを扱う。 */
+/**
+ * The cookie shape exchanged with the daemon. Of Playwright's Cookie type, only the fields listed
+ * here are handled.
+ */
 export type Cookie = {
   name: string;
   value: string;
@@ -106,7 +109,7 @@ type LoginRequest = {
   steps: LoginStep[] | null;
   success_selector: string | null;
   failure_selector: string | null;
-  // 省略は null と同じ扱いとし、cookie を復元しない。
+  // Omission is treated the same as null, and no cookies are restored.
   cookies?: Cookie[] | null;
   secret: {
     username: string;
@@ -124,7 +127,7 @@ type AuthorizeDeviceRequest = {
   steps: DeviceStep[] | null;
   success_selector: string;
   failure_selector: string | null;
-  // 省略は null と同じ扱いとし、cookie を復元しない。
+  // Omission is treated the same as null, and no cookies are restored.
   cookies?: Cookie[] | null;
   secret: LoginRequest["secret"];
 };
@@ -153,7 +156,7 @@ type OAuthRequestConfig = {
   steps: DeviceStep[] | null;
   success_selector: string;
   failure_selector: string | null;
-  // 省略は null と同じ扱いとし、cookie を復元しない。
+  // Omission is treated the same as null, and no cookies are restored.
   cookies?: Cookie[] | null;
   secret: LoginRequest["secret"];
 };
@@ -194,7 +197,10 @@ type LoginBeginRequest = {
   secret: { username: string; password: string };
 };
 
-/** 段階ログインで要素を指す形。ref は直前のスナップショットの見出し行の ref である。 */
+/**
+ * The form that points at an element in stepwise login. ref is the ref on a heading line of the
+ * previous snapshot.
+ */
 type ElementTarget = { ref: string } | { selector: string };
 
 type StepwiseFill = ElementTarget & { value: FillStep["value"] };
@@ -212,7 +218,7 @@ type LoginStepRequest = {
   op: "login_step";
   id?: RequestId;
   action: StepwiseAction;
-  // デーモンは fill_submit に {{totp}} が含まれる場合にのみ現在のコードを渡す。
+  // The daemon passes the current code only when fill_submit contains {{totp}}.
   totp: string | null;
 };
 
@@ -258,7 +264,10 @@ export class FillMismatchError extends Error {
   }
 }
 
-/** 値を入れる要素の frame の origin が main frame の origin と一致しないことを表す。 */
+/**
+ * Indicates that the origin of the frame of the element to fill does not match the origin of the
+ * main frame.
+ */
 export class FillTargetRefusedError extends Error {}
 
 export class InvalidCredentialError extends Error {}
@@ -279,7 +288,10 @@ type DiagnosticRequest =
   | LoginBeginRequest
   | LoginStepRequest;
 
-/** 診断行から置換する秘密の候補。未設定の値（null・undefined・空文字）は無視される。 */
+/**
+ * Secret candidates to replace in diagnostic lines. Unset values (null, undefined, empty string)
+ * are ignored.
+ */
 type SecretCandidates = Array<string | null | undefined>;
 
 function truncateUtf8(value: string, maxBytes: number): string {
@@ -322,7 +334,8 @@ function cookieValues(cookies: Cookie[] | null | undefined): string[] {
 }
 
 function requestSecrets(request: DiagnosticRequest): SecretCandidates {
-  // env にはリテラルも含まれるが、秘密との区別を executor では行わず、すべて置換対象とする。
+  // env also contains literals, but the executor does not distinguish them from secrets and
+  // replaces all of them.
   if (request.op === "mcp_server_start") {
     return [...Object.values(request.env), ...request.scan];
   }
@@ -336,7 +349,8 @@ function requestSecrets(request: DiagnosticRequest): SecretCandidates {
         ]
       : [request.header_value];
   }
-  // login_step の要求が持つ秘密は TOTP のコードのみであり、段階ログインの資格は呼び出し側が実行時の秘密として渡す。
+  // The only secret in a login_step request is the TOTP code; the credentials of a stepwise login
+  // are passed by the caller as runtime secrets.
   if (request.op === "login_step") return [request.totp];
   if (request.op === "login_begin") {
     return [
@@ -350,7 +364,8 @@ function requestSecrets(request: DiagnosticRequest): SecretCandidates {
     request.secret.password,
     request.secret.totp,
   ];
-  // 復元用 cookie の値も、失敗時のページ内例外文言に紛れ込みうるため秘匿対象に含める。
+  // Restored cookie values can also leak into in-page exception text on failure, so they are
+  // included in the secrets to hide.
   if (request.op !== "login") {
     return [
       ...loginSecrets,
@@ -362,8 +377,10 @@ function requestSecrets(request: DiagnosticRequest): SecretCandidates {
 }
 
 /**
- * 診断行を組み立てる。`runtimeSecrets` には要求に含まれず実行中に得た秘密
- * （device code・user code・token 等）を渡し、要求由来の秘密と同じく置換する。
+ * Builds a diagnostic line. `runtimeSecrets` takes secrets obtained at runtime that are not part of
+ * the request
+ * (device code, user code, token, etc.), and they are replaced the same way as secrets derived from
+ * the request.
  */
 export function formatExecutorErrorLine(
   request: DiagnosticRequest,
@@ -484,7 +501,7 @@ let activeMcpStart: Promise<void> | undefined;
 let activeOAuthStart:
   | { controller: AbortController; done: Promise<void> }
   | undefined;
-// ハンドオフ前の段階ログイン。ハンドオフ・終了・後始末で undefined に戻す。
+// The stepwise login before handoff. Reset to undefined on handoff, termination, and cleanup.
 let activeStepwise: StepwiseSession | undefined;
 let shuttingDown = false;
 
@@ -569,9 +586,10 @@ export function headfulUserAgentMetadata(
   };
 }
 
-// 新規タブの初回ナビゲーションでは client hints がガードの接続前に確定しており、
-// Emulation.setUserAgentOverride が反映されません。そのため文書リクエストを捕捉し、
-// Headless ブランドを除いた client hints に書き換えてから継続します。
+// On the first navigation of a new tab, the client hints are fixed before the guard connects,
+// so Emulation.setUserAgentOverride does not take effect. The document request is therefore
+// intercepted,
+// rewritten to client hints without the Headless brand, and then continued.
 const guardFetchPatterns = [
   { urlPattern: "file://*", requestStage: "Request" },
   { urlPattern: "*", resourceType: "Document", requestStage: "Request" },
@@ -723,8 +741,8 @@ function fallbackPlatform(): string {
   throw new Error(`unsupported browser platform: ${process.platform}`);
 }
 
-// 実 Chromium が brands に必ず含める GREASE ブランドです。fallback でも落とさないことで、
-// brands が Chromium 1 件だけという実ブラウザに存在しない組み合わせを避けます。
+// The GREASE brand that a real Chromium always includes in brands. Keeping it even in the fallback
+// avoids a combination that no real browser has, where brands holds only Chromium.
 const greaseBrand = "Not)A;Brand";
 const greaseMajorVersion = "24";
 const greaseFullVersion = `${greaseMajorVersion}.0.0.0`;
@@ -846,7 +864,9 @@ function parseOAuthConfig(value: unknown, id?: RequestId): OAuthRequestConfig {
   };
 }
 
-/** 静的トークン（`header_value`）と OAuth（`value_template` + `oauth`）のどちらか一方のみを受け付ける。 */
+/**
+ * Accepts exactly one of a static token (`header_value`) and OAuth (`value_template` + `oauth`).
+ */
 function parseApiProxyStart(
   value: Record<string, unknown>,
   id?: RequestId,
@@ -892,7 +912,10 @@ function hasNul(value: string): boolean {
   return value.includes("\0");
 }
 
-/** 環境変数名として spawn が受け付けない名前（空・`=`・NUL を含む）を拒否する。 */
+/**
+ * Rejects names that spawn does not accept as environment variable names (empty, or containing `=`
+ * or NUL).
+ */
 function isEnvRecord(value: unknown): value is Record<string, string> {
   return (
     isRecord(value) &&
@@ -909,8 +932,9 @@ function isEnvRecord(value: unknown): value is Record<string, string> {
 }
 
 /**
- * spawn が同期的に投げる引数検査の例外は値を引用するため、NUL を含む値はここで拒否し、
- * 例外経路へ秘密を運ばせない。
+ * The argument validation exceptions that spawn throws synchronously quote the values, so a value
+ * containing NUL is rejected here
+ * to keep secrets off the exception path.
  */
 function parseMcpServerStart(
   value: Record<string, unknown>,
@@ -943,7 +967,7 @@ const cookieSameSiteValues: ReadonlySet<unknown> = new Set([
   "None",
 ]);
 
-// Playwright が受け付ける有効期限の上限（9999-12-31T23:59:59Z）。
+// The upper limit of the expiry that Playwright accepts (9999-12-31T23:59:59Z).
 const MAX_COOKIE_EXPIRES_SECONDS = 253_402_300_799;
 
 function isCookieExpires(value: unknown): value is number {
@@ -954,7 +978,7 @@ function isCookieExpires(value: unknown): value is number {
   );
 }
 
-/** 形が正しい場合に限り、既知の項目だけを写した cookie を返す。 */
+/** Returns a cookie copying only the known fields, if and only if the shape is valid. */
 function toCookie(value: unknown): Cookie | undefined {
   if (
     !isRecord(value) ||
@@ -984,8 +1008,9 @@ function toCookie(value: unknown): Cookie | undefined {
 }
 
 /**
- * cookie の内容は executor 自身が過去に返したものであり、信頼境界の外側の入力として扱う。
- * 形の不正な要素は捨て、要求全体は拒否しない。
+ * The cookie contents are what the executor itself returned earlier, and are treated as input from
+ * outside the trust boundary.
+ * Malformed elements are dropped, and the request as a whole is not rejected.
  */
 function parseCookies(value: unknown, id?: RequestId): Cookie[] | null {
   if (isAbsent(value)) return null;
@@ -996,7 +1021,7 @@ function parseCookies(value: unknown, id?: RequestId): Cookie[] | null {
   });
 }
 
-// fill_submit の 1 回に入れられる欄の上限。
+// Upper bound on the number of fields one fill_submit can fill.
 const MAX_STEPWISE_FILLS = 3;
 
 function parseLoginBegin(
@@ -1049,7 +1074,7 @@ function isRef(value: unknown): value is string {
   );
 }
 
-/** ref と selector のどちらか一方のみを受け付ける。null は指定が無いものとして扱わず、不正とする。 */
+/** Accepts exactly one of ref and selector. null is not treated as unspecified but as invalid. */
 function parseElementTarget(
   value: Record<string, unknown>,
   id?: RequestId,
@@ -1063,14 +1088,16 @@ function parseElementTarget(
   throw new InvalidRequestError(id);
 }
 
-/** submit の要素は、ref か selector を持つオブジェクトか、selector の省略形の文字列とする。 */
+/**
+ * The submit element is an object with a ref or selector, or a string in the short selector form.
+ */
 function parseSubmitTarget(value: unknown, id?: RequestId): ElementTarget {
   if (typeof value === "string") return { selector: value };
   if (isRecord(value)) return parseElementTarget(value, id);
   throw new InvalidRequestError(id);
 }
 
-/** click と press_enter のどちらか一方のみを受け付ける。 */
+/** Accepts exactly one of click and press_enter. */
 function parseStepwiseSubmit(value: unknown, id?: RequestId): StepwiseSubmit {
   if (!isRecord(value)) throw new InvalidRequestError(id);
   const hasClick = value.click !== undefined;
@@ -1085,8 +1112,9 @@ function parseStepwiseSubmit(value: unknown, id?: RequestId): StepwiseSubmit {
 }
 
 /**
- * 段階ログインの action を検証する。単独の fill は {{username}} のみとし、{{password}} と {{totp}} は
- * fill_submit の中でのみ受け付ける（MCP のスキーマ・デーモンの検証と同じ二重防御）。
+ * Validates a stepwise login action. A standalone fill accepts only {{username}}, and {{password}}
+ * and {{totp}} are accepted
+ * only inside fill_submit (the same double defense as the MCP schema and the daemon's validation).
  */
 function parseStepwiseAction(
   value: Record<string, unknown>,
@@ -1395,10 +1423,13 @@ async function openGuard(endpoint: string): Promise<CdpGuard> {
             await send("Target.setAutoAttach", autoAttachParams, sessionId);
           }
         }
-        // デバッガ待ちで停止中の target では、Emulation.setUserAgentOverride の応答が
-        // 再開まで返りません。そのため上書きの応答を待たずに再開命令を続けて送り、
-        // 両方の応答を待ちます。コマンドは送信順に処理されるため、User-Agent は
-        // 再開後の最初のリクエストから上書きされます（client hints は guardFetchPatterns を参照）。
+        // On a target paused waiting for the debugger, the response to
+        // Emulation.setUserAgentOverride
+        // does not return until it resumes. The resume command is therefore sent right after,
+        // without waiting for the override response, and both responses are awaited. Commands are
+        // processed in send order,
+        // so the User-Agent is overridden from the first request after resuming (see
+        // guardFetchPatterns for client hints).
         const commands: Array<Promise<unknown>> = [];
         if (fileGuardTarget && userAgentOverride !== undefined) {
           commands.push(
@@ -1458,8 +1489,8 @@ async function openGuard(endpoint: string): Promise<CdpGuard> {
         return;
       }
       const headers = headfulClientHintHeaders(request.headers);
-      // 継続の失敗は中断済みのナビゲーションで正常に起こりうるうえ、
-      // file:// 遮断にも影響しないため、ガード失敗として扱いません。
+      // A continuation failure can legitimately occur for an already aborted navigation,
+      // and it does not affect the file:// blocking, so it is not treated as a guard failure.
       void send(
         "Fetch.continueRequest",
         headers === undefined
@@ -1594,20 +1625,29 @@ function isTimeoutError(error: unknown): boolean {
   return error instanceof Error && error.name === "TimeoutError";
 }
 
-/** 入力の結果。他の欄の値を page の外へ持ち出さないよう、比較は page 内で行い結果の種別のみを返す。 */
+/**
+ * The result of filling. The comparison is done inside the page and only the kind of result is
+ * returned, so that other fields' values are not carried out of the page.
+ */
 type FillStatus = "ok" | "not_password" | "not_fillable" | "mismatch";
 
 type FillArguments = { value: string; passwordOnly: boolean };
 
 /**
- * page 内で実行する入力処理。Playwright の fill はフォーカス → 全選択 → 文字挿入の順で行うため、
- * 入力中にフォーカスを移すサイトでは別の欄へ秘密が入る。そこでフォーカスに依存せず、
- * 要素のネイティブな value setter で直接設定し、同じ文書の他の欄が変化していないことを検証する。
- * page へシリアライズされるため、外部の識別子を参照してはならない。
+ * The fill routine run inside the page. Playwright's fill proceeds focus, select all, insert
+ * characters,
+ * so on a site that moves focus while typing, the secret ends up in a different field. This routine
+ * therefore
+ * sets the value directly with the element's native value setter, independent of focus, and
+ * verifies that no other field in the same document changed.
+ * It is serialized into the page, so it must not reference external identifiers.
  *
- * page 側の getter・setter は例外を送出することがあり、その文言には欄の値が含まれうる。
- * 例外を page の外へ伝播させるとその文言が stderr へ達し、また残留した秘密の消去も行われないため、
- * 例外はすべて捕捉して結果の種別へ変換し、値を設定した後であれば消去を行ってから返す。
+ * Getters and setters on the page side may throw, and the exception text can contain the field's
+ * value.
+ * Propagating an exception out of the page would let that text reach stderr and would also skip
+ * clearing the remaining secret,
+ * so every exception is caught and converted into a result kind, and if the value was already set
+ * it is cleared before returning.
  */
 async function setValueInPage(
   element: Element,
@@ -1624,7 +1664,7 @@ async function setValueInPage(
   const view = resolveView();
   if (view === undefined) return "mismatch";
   if (view === null) return "not_fillable";
-  // フレーム内の要素は、そのフレームの window のコンストラクタでのみ判定できる。
+  // An element inside a frame can be identified only with the constructors of that frame's window.
   const isInput = (target: Element): target is HTMLInputElement =>
     target instanceof view.HTMLInputElement;
   const isTextArea = (target: Element): target is HTMLTextAreaElement =>
@@ -1651,7 +1691,8 @@ async function setValueInPage(
     field.dispatchEvent(new view.Event("input", { bubbles: true }));
     field.dispatchEvent(new view.Event("change", { bubbles: true }));
   };
-  // closed な shadow root は page 側から辿れないため、その内側の欄は検証の対象外となる。
+  // A closed shadow root cannot be traversed from the page side, so fields inside it are not
+  // verified.
   const collectFields = (
     root: Document | ShadowRoot,
     into: Field[],
@@ -1664,7 +1705,7 @@ async function setValueInPage(
   };
   const otherFields = (): Field[] =>
     collectFields(target.ownerDocument, []).filter((field) => field !== target);
-  // 入力前に存在しなかった欄は、空であることを期待値とする。
+  // A field that did not exist before filling is expected to be empty.
   let expected: Map<Field, string>;
   try {
     expected = new Map<Field, string>();
@@ -1676,12 +1717,14 @@ async function setValueInPage(
     otherFields().filter(
       (field) => field.value !== (expected.get(field) ?? ""),
     );
-  // queueMicrotask や setTimeout(0) で遅延された page 側の変更を、比較の前に反映させる。
+  // Page-side changes deferred by queueMicrotask or setTimeout(0) are flushed before the
+  // comparison.
   const yieldToPage = (): Promise<void> =>
     new Promise((resolve) => {
       view.setTimeout(resolve, 0);
     });
-  // 値または期待値を読めない欄は秘密が残っていないことを確認できないため、残留とみなす。
+  // A field whose value or expected value cannot be read cannot be confirmed to hold no secret, so
+  // it is treated as residue.
   const isResidual = (field: Field): boolean => {
     try {
       const want = field === target ? "" : (expected.get(field) ?? "");
@@ -1695,7 +1738,7 @@ async function setValueInPage(
     try {
       others = otherFields();
     } catch {
-      // 欄の列挙に失敗しても、入力先の欄は消去の対象とする。
+      // Even if enumerating the fields fails, the target field is cleared.
     }
     return [
       ...(isResidual(target) ? [target] : []),
@@ -1706,11 +1749,13 @@ async function setValueInPage(
     try {
       setNativeValue(field, "");
     } catch {
-      // 1 つの欄の失敗で、他の欄の消去を止めない。
+      // A failure on one field does not stop clearing the others.
     }
   };
-  // 秘密が意図しない欄に残ったまま送信されないよう、変化した欄をすべて空にする。
-  // 空にした際のイベントで page が値を書き戻しうるため、回数を区切って再検証する。
+  // All changed fields are emptied so that a secret does not remain in an unintended field and get
+  // submitted.
+  // The page may write a value back on the event fired by emptying, so re-verification is repeated
+  // a bounded number of times.
   const clearResidualFields = async (): Promise<void> => {
     for (let pass = 0; pass < 3; pass += 1) {
       const residual = residualFields();
@@ -1721,13 +1766,14 @@ async function setValueInPage(
         try {
           expected.set(field, "");
         } catch {
-          // 期待値を更新できない欄は、次の回でも残留とみなされ再び消去される。
+          // A field whose expected value cannot be updated is treated as residue again in the next
+          // round and cleared again.
         }
       }
       try {
         await yieldToPage();
       } catch {
-        // 待機に失敗しても、残りの回数で再検証と消去を続ける。
+        // Even if waiting fails, re-verification and clearing continue for the remaining rounds.
       }
     }
   };
@@ -1736,12 +1782,14 @@ async function setValueInPage(
     await yieldToPage();
     if (target.value === value && changedFields().length === 0) return "ok";
   } catch {
-    // 例外の文言は破棄し、秘密が残りうる欄の消去へ進む。
+    // The exception text is discarded, and processing moves on to clearing the fields that may hold
+    // a secret.
   }
   try {
     await clearResidualFields();
   } catch {
-    // 組み込みオブジェクトの改変などで消去の途中に例外が生じても、入力先の欄だけは空にする。
+    // Even if an exception occurs midway through clearing, for example from tampering with built-in
+    // objects, the target field is emptied.
     clearField(target);
   }
   return "mismatch";
@@ -1759,7 +1807,10 @@ async function waitForVisible(
   }
 }
 
-/** 可視になった要素へ値を設定し、設定の検証に失敗した場合は FillMismatchError とする。 */
+/**
+ * Sets the value on an element once it becomes visible, and raises FillMismatchError if verifying
+ * the setting fails.
+ */
 async function fillLocator(
   locator: Locator,
   value: string,
@@ -1781,7 +1832,10 @@ async function fillLocator(
   if (status !== "ok") throw new FillMismatchError(stepIndex);
 }
 
-/** ElementHandle の要素へ値を設定し、設定の検証に失敗した場合は FillMismatchError とする。 */
+/**
+ * Sets the value on an ElementHandle element, and raises FillMismatchError if verifying the setting
+ * fails.
+ */
 async function fillHandle(
   handle: ElementHandle,
   value: string,
@@ -2094,8 +2148,10 @@ async function throwIfRejected(
   }
 }
 
-// SPA 型サイトでは拒否表示が遅れて描画され、次の操作のセレクタ待ちが先に timeout しうる。
-// そのためセレクタ不在で失敗した時点で failure_selector を再確認し、拒否として分類する。
+// On SPA-style sites the rejection message may render late, so the wait for the next operation's
+// selector can time out first.
+// When a failure is caused by a missing selector, failure_selector is therefore checked again and
+// classified as a rejection.
 async function withRejectionCheck(
   page: Page,
   failureSelector: string | null,
@@ -2202,7 +2258,7 @@ async function executeDeviceFlow(
 
 const playwrightRequire = createRequire(import.meta.url);
 
-/** browsers.json の内容から、完全版 Chromium の browserVersion を取り出します。 */
+/** Extracts the browserVersion of the full Chromium from the contents of browsers.json. */
 export function chromiumVersionFromManifest(manifest: unknown): string {
   const browsers = isRecord(manifest) ? manifest.browsers : undefined;
   const entry = Array.isArray(browsers)
@@ -2234,8 +2290,9 @@ function userAgentPlatform(platform: NodeJS.Platform): string {
 }
 
 /**
- * 起動引数 --user-agent に渡す UA を組み立てます。実ブラウザの UA 縮減に合わせ、
- * 版はメジャー番号のみを残して残りを 0 にします。
+ * Builds the UA passed to the --user-agent launch argument. To match the UA reduction of real
+ * browsers,
+ * it keeps only the major version number and sets the rest to 0.
  */
 export function browserUserAgent(
   browserVersion: string,
@@ -2253,7 +2310,8 @@ export type FullChromiumCheck = { ok: true } | { ok: false; reason: string };
 function isExecutableFile(executablePath: string): boolean {
   if (!fs.existsSync(executablePath)) return false;
   try {
-    // 検索権限のあるディレクトリは X_OK を満たすため、通常ファイルであることも確認します。
+    // A directory with search permission satisfies X_OK, so it is also checked to be a regular
+    // file.
     if (!fs.statSync(executablePath).isFile()) return false;
     fs.accessSync(executablePath, fs.constants.X_OK);
     return true;
@@ -2274,8 +2332,9 @@ function fullChromiumMissingReason(
 }
 
 /**
- * channel: "chromium" で起動する完全版 Chromium が実行可能かを確かめます。
- * chromium.executablePath() は存在しないパスでも返すため、実ファイルを検査します。
+ * Checks whether the full Chromium launched with channel: "chromium" is executable.
+ * chromium.executablePath() returns a path even if it does not exist, so the real file is
+ * inspected.
  */
 export function checkFullChromium(
   executablePath: () => string,
@@ -2304,7 +2363,7 @@ export function checkFullChromium(
   };
 }
 
-/** hello への応答です。完全版 Chromium が無ければ理由を添えて ok: false を返します。 */
+/** The response to hello. If the full Chromium is missing, returns ok: false with the reason. */
 export function helloResponse(check: FullChromiumCheck): unknown {
   const identity = { uid: process.getuid?.() ?? null, pid: process.pid };
   if (check.ok) return { ok: true, ...identity };
@@ -2313,22 +2372,24 @@ export function helloResponse(check: FullChromiumCheck): unknown {
 
 async function openBrowserPage() {
   const port = await reservePort();
-  // 完全版 Chromium では URL 付きで作られたタブの初回リクエストがガードより先に出るため、
-  // 起動引数でも Headless を含まない UA を与えます。
+  // With the full Chromium, the first request of a tab created with a URL goes out before the
+  // guard,
+  // so a UA without Headless is also given through the launch arguments.
   const launchUserAgent = browserUserAgent(
     bundledChromiumVersion(),
     process.platform,
   );
   const dir = await mkdtemp(path.join(os.tmpdir(), "tegata-browser-"));
   activeTempDir = dir;
-  // ブラウザが参照する設定・キャッシュを executor の作業領域から隔離します。
+  // Isolates the settings and caches the browser references from the executor's working area.
   const browser = await chromium.launch({
     headless: true,
     channel: "chromium",
     args: [
       `--remote-debugging-port=${port}`,
       "--disable-blink-features=AutomationControlled",
-      // 画面とウィンドウの大きさを分け、後から CDP で作られるページにも同じ値を適用します。
+      // Screen and window sizes are kept separate, and the same values are applied to pages created
+      // later over CDP.
       "--screen-info={1920x1080}",
       "--window-size=1280,807",
       `--user-agent=${launchUserAgent}`,
@@ -2341,7 +2402,8 @@ async function openBrowserPage() {
     },
   });
   activeBrowser = browser;
-  // ページ操作より先に CDP エンドポイントを取得し、全 target にガードを張ります。
+  // The CDP endpoint is obtained before any page operation, and the guard is installed on every
+  // target.
   const endpoint = await waitForEndpoint(port);
   const guard = await openGuard(endpoint);
   activeGuard = guard;
@@ -2349,7 +2411,8 @@ async function openBrowserPage() {
     browser.newBrowserCDPSession(),
   );
   try {
-    // viewport を固定せず、起動引数のウィンドウと画面の大きさをそのまま使います。
+    // The viewport is not fixed; the window and screen sizes from the launch arguments are used as
+    // they are.
     const page = await withGuard(guard, () =>
       browser.newPage({ viewport: null }),
     );
@@ -2408,9 +2471,9 @@ async function openBrowserPage() {
 }
 
 /**
- * Playwright の cookie から、デーモンと受け渡す項目のみを写す。
- * toCookie と同じ検証・コピーを再利用する。検証を通らない要素は捨てる
- * （デーモン側でも再検証するため、ここで例外にしてログイン全体を失敗させない）。
+ * Copies only the fields exchanged with the daemon from a Playwright cookie.
+ * Reuses the same validation and copying as toCookie. Elements that fail validation are dropped
+ * (the daemon validates again, so an exception here must not fail the whole login).
  */
 export function toExportedCookie(cookie: Cookie): Cookie | undefined {
   return toCookie(cookie);
@@ -2428,9 +2491,11 @@ async function readContextCookies(
 }
 
 /**
- * cookie を context へ復元し、受け付けられた件数を返す。Chromium は 1 件でも受け付けない cookie があると
- * 一括の設定全体を拒否するため、その場合は 1 件ずつ設定し直して受け付けられないものを捨てる。
- * 個々の失敗の例外は cookie の内容を含みうるため破棄し、ガードの失敗のみを伝播させる。
+ * Restores cookies into the context and returns the number accepted. Chromium rejects the whole
+ * bulk setting if even one cookie is not accepted,
+ * so in that case the cookies are set again one at a time and those not accepted are dropped.
+ * The exception of an individual failure may contain the cookie contents, so it is discarded and
+ * only guard failures are propagated.
  */
 async function restoreCookies(
   guard: CdpGuard,
@@ -2456,10 +2521,10 @@ async function restoreCookies(
   return restored;
 }
 
-// 既定ステップ（steps が null）が最初に待つ要素。
+// The element that the default steps (steps is null) wait for first.
 const DEFAULT_FIRST_STEP_SELECTOR = 'input[type="password"]';
 
-// ステップの selector 待ちの上限（1 ステップあたり）。
+// Upper bound on the selector wait of a step (per step).
 const STEP_SELECTOR_TIMEOUT_MS = 10_000;
 
 function firstStepSelector(steps: LoginStep[] | null): string | undefined {
@@ -2467,8 +2532,10 @@ function firstStepSelector(steps: LoginStep[] | null): string | undefined {
   return steps[0]?.selector;
 }
 
-// 競争は可視の一致のいずれかで判定するため、先頭の一致が非表示でも後続の可視の一致を検出する。
-// 最終判定（waitForLoginResult 等）は attach で判定しており、競争とは基準が異なる。
+// The race is decided by any visible match, so a later visible match is detected even if the first
+// match is hidden.
+// The final decision (waitForLoginResult etc.) is made on attach, which is a different criterion
+// from the race.
 async function waitUntilVisible(
   page: Page,
   selector: string,
@@ -2487,8 +2554,8 @@ async function waitUntilVisible(
 }
 
 /**
- * 成功の要素と最初のステップの要素のどちらが先に可視になるかを返す。
- * どちらも上限までに現れない場合は undefined を返す。
+ * Returns which becomes visible first, the success element or the first step's element.
+ * Returns undefined if neither appears within the limit.
  */
 export async function raceSuccessAgainstFirstStep(
   page: Page,
@@ -2508,8 +2575,10 @@ export async function raceSuccessAgainstFirstStep(
 }
 
 /**
- * 復元した cookie によって既にログイン済みであるかを判定する。ログイン済みであれば、ステップを実行せず
- * （秘密をページへ入れず）に成功として扱える。success_selector が無い場合は判定しない。
+ * Decides whether the restored cookies have already logged in. If so, the login can be treated as a
+ * success
+ * without running the steps (and without putting secrets into the page). No decision is made when
+ * success_selector is absent.
  */
 async function isLoggedInByRestoredCookies(
   guard: CdpGuard,
@@ -2562,8 +2631,8 @@ async function executeLogin(request: LoginRequest): Promise<LoginOutcome> {
 }
 
 /**
- * ハンドオフ前の段階ログイン。CDP endpoint はハンドオフまでどの応答にも載せない。
- * filled は入力した欄であり、失敗時の消去に用いる。
+ * The stepwise login before handoff. The CDP endpoint is included in no response until handoff.
+ * filled holds the fields that were filled and is used for clearing on failure.
  */
 type StepwiseSession = {
   endpoint: string;
@@ -2578,7 +2647,8 @@ type StepwiseSession = {
   cookieValues: string[];
   totpCodes: string[];
   filled: ElementHandle[];
-  // 直前のスナップショットの見出し行が持つ ref。スナップショットを取るたびに置き換える。
+  // The refs held by the heading lines of the previous snapshot. Replaced every time a snapshot is
+  // taken.
   refs: Set<string>;
   guardMonitored: boolean;
 };
@@ -2594,12 +2664,16 @@ type StepwiseOutcome =
     }
   | { state: "aborted" };
 
-// 段階ログインを終了させずに応答するエラー。これ以外のエラーではブラウザを破棄してから応答する。
+// Errors answered without ending the stepwise login. For any other error, the browser is discarded
+// before answering.
 const CONTINUABLE_STEPWISE_ERRORS: ReadonlySet<ErrorCode> = new Set([
   "SELECTOR_NOT_FOUND",
 ]);
 
-/** 診断行から置換する段階ログインの秘密（資格・入力した TOTP コード・復元した cookie の値）。 */
+/**
+ * Secrets of the stepwise login to replace in diagnostic lines (credentials, the entered TOTP code,
+ * and restored cookie values).
+ */
 function stepwiseSecrets(session: StepwiseSession): string[] {
   return [
     session.secret.username,
@@ -2609,14 +2683,17 @@ function stepwiseSecrets(session: StepwiseSession): string[] {
   ];
 }
 
-/** 待機中のブラウザでガードが失われた場合に executor ごと終了させる監視を、1 度だけ張る。 */
+/**
+ * Installs, only once, a watch that terminates the whole executor if the guard is lost on a waiting
+ * browser.
+ */
 function monitorStepwiseGuard(session: StepwiseSession): void {
   if (session.guardMonitored) return;
   session.guardMonitored = true;
   monitorGuardFailure(session.guard);
 }
 
-/** action を実行し、その後ページが落ち着くのを待つ。落ち着いたかを返す。 */
+/** Runs the action and then waits for the page to settle. Returns whether it settled. */
 async function runWithSettle(
   session: StepwiseSession,
   action: () => Promise<unknown>,
@@ -2631,7 +2708,7 @@ async function runWithSettle(
   }
 }
 
-/** success_selector と failure_selector の attach を即時に確認する（待たない）。 */
+/** Immediately checks the attach of success_selector and failure_selector (without waiting). */
 async function readStepwiseResult(
   session: StepwiseSession,
 ): Promise<"success" | "failure" | undefined> {
@@ -2664,7 +2741,10 @@ async function takeStepwiseSnapshot(
   return snapshot;
 }
 
-/** 段階ログインを通常のブラウザセッションへ昇格させ、login の成功と同じ形の結果を返す。 */
+/**
+ * Promotes the stepwise login to a normal browser session and returns a result in the same form as
+ * a successful login.
+ */
 async function completeStepwise(
   session: StepwiseSession,
   stepsSkipped: boolean,
@@ -2690,8 +2770,9 @@ async function completeStepwise(
 }
 
 /**
- * settle の後の判定。success なら昇格し、failure なら入力した欄を空にして INVALID_CREDENTIAL とし、
- * どちらでもなければ検査済みのスナップショットを返す。
+ * The decision after settle. On success it promotes; on failure it empties the filled fields and
+ * returns INVALID_CREDENTIAL;
+ * otherwise it returns the checked snapshot.
  */
 async function concludeStepwise(
   session: StepwiseSession,
@@ -2744,7 +2825,8 @@ async function beginStepwise(
   return concludeStepwise(session, settled, restored > 0);
 }
 
-// 解決した要素が、解決の後に文書や frame ごと失われたことを表す Playwright のエラー。
+// A Playwright error indicating that the resolved element was lost, together with its document or
+// frame, after resolution.
 const STALE_ELEMENT_MESSAGES = [
   "Invalid frame in aria-ref selector",
   "Execution context was destroyed",
@@ -2758,7 +2840,10 @@ function isStaleElementError(error: unknown): boolean {
   );
 }
 
-/** 解決した要素への操作の、待機の超過と要素の喪失を SelectorNotFoundError とする。 */
+/**
+ * Treats a timeout or loss of the element on an operation against a resolved element as
+ * SelectorNotFoundError.
+ */
 async function onResolvedElement<T>(
   operation: () => Promise<T>,
   stepIndex?: number,
@@ -2774,8 +2859,10 @@ async function onResolvedElement<T>(
 }
 
 /**
- * 直前のスナップショットにある ref を、待たずに 1 回だけ ElementHandle へ解決する。以後の判定と操作は
- * この ElementHandle に対して行い、再解決しない（判定の後に frame が遷移しても、新しい文書へ入力しないため）。
+ * Resolves a ref in the previous snapshot to an ElementHandle exactly once, without waiting. Later
+ * decisions and operations are made
+ * on this ElementHandle and it is not resolved again (so that nothing is typed into a new document
+ * even if the frame navigates after the decision).
  */
 async function resolveRef(
   session: StepwiseSession,
@@ -2793,7 +2880,10 @@ async function resolveRef(
   return handle;
 }
 
-/** URL の origin を返す。opaque な origin（about:blank・srcdoc・data: 等）と読めない URL は undefined とする。 */
+/**
+ * Returns the origin of a URL. Returns undefined for an opaque origin (about:blank, srcdoc, data:,
+ * etc.) and for an unreadable URL.
+ */
 function tupleOrigin(url: string): string | undefined {
   try {
     const { origin } = new URL(url);
@@ -2808,8 +2898,10 @@ function mainFrameOrigin(page: Page): string | undefined {
 }
 
 /**
- * 要素の frame の URL の origin が、その時点の main frame の URL の origin と一致するかを返す。
- * frame の URL は CDP の frame tree に由来し、page の JS からは偽装できない。判定できない場合は一致しないとする。
+ * Returns whether the origin of the element's frame URL matches the origin of the main frame URL at
+ * that moment.
+ * The frame URL comes from the CDP frame tree and cannot be spoofed from the page's JS. If it
+ * cannot be determined, it is treated as a mismatch.
  */
 async function isSameOriginTarget(
   page: Page,
@@ -2827,8 +2919,10 @@ async function isSameOriginTarget(
 }
 
 /**
- * 値を入れずに欄を ElementHandle へ解決する。ref は待たずに 1 回だけ解決し、selector は従来どおり可視になるのを待って解決する。
- * selector も aria-ref や frame を辿る形をとりうるため、以後の判定と入力はこの ElementHandle に対して行う。
+ * Resolves a field to an ElementHandle without entering a value. A ref is resolved exactly once
+ * without waiting, and a selector is resolved after waiting for it to become visible, as before.
+ * A selector can also take a form that follows aria-ref or frames, so later decisions and filling
+ * are made on this ElementHandle.
  */
 async function resolveFillTarget(
   session: StepwiseSession,
@@ -2850,8 +2944,10 @@ async function resolveFillTarget(
 }
 
 /**
- * 値を入れる前に全ての欄を解決し、全ての欄の frame の origin を確かめる。1 つでも一致しなければ、どの欄にも値を入れずに
- * FillTargetRefusedError とする。戻り値は fills と同じ順の ElementHandle である。
+ * Before entering any value, resolves all fields and checks the frame origin of every field. If
+ * even one does not match, no value is entered in any field and
+ * FillTargetRefusedError is raised. The return value is the ElementHandles in the same order as
+ * fills.
  */
 async function prepareStepwiseFills(
   session: StepwiseSession,
@@ -2881,7 +2977,7 @@ async function prepareStepwiseFills(
   return handles;
 }
 
-/** 入力した欄を、失敗時の消去のために記録する。 */
+/** Records a filled field so that it can be cleared on failure. */
 function recordFilled(
   session: StepwiseSession,
   handle: ElementHandle,
@@ -2891,7 +2987,10 @@ function recordFilled(
   session.filled.push(handle);
 }
 
-/** 解決した欄が可視になるのを待ち、記録してから #43 の検査つきで値を入れる。 */
+/**
+ * Waits for the resolved field to become visible, records it, and then sets the value with the #43
+ * verification.
+ */
 async function fillStepwiseHandle(
   session: StepwiseSession,
   handle: ElementHandle,
@@ -2911,7 +3010,9 @@ async function fillStepwiseHandle(
   await fillHandle(handle, value, passwordOnly, stepIndex);
 }
 
-/** prepareStepwiseFills で確かめた欄へ、同じ ElementHandle に対して順に値を入れる。 */
+/**
+ * Sets values in order, on the same ElementHandles, on the fields checked by prepareStepwiseFills.
+ */
 async function fillStepwiseTargets(
   session: StepwiseSession,
   fills: ReadonlyArray<{
@@ -2939,12 +3040,12 @@ async function fillStepwiseTargets(
       );
     }
   } finally {
-    // 入力に至らなかった欄の ElementHandle を解放する。
+    // Releases the ElementHandles of fields that were never filled.
     await disposeHandles(handles.filter((handle) => !filled.includes(handle)));
   }
 }
 
-/** ref で解決した要素に対して操作を行い、その ElementHandle を解放する。 */
+/** Operates on an element resolved by ref and then releases its ElementHandle. */
 async function withRefElement(
   session: StepwiseSession,
   ref: string,
@@ -3019,15 +3120,18 @@ async function submitStepwise(
 }
 
 /**
- * fills を順に入れて submit し、settle までを 1 つの操作として行う。成否にかかわらず、入れた欄のうち
- * 文書に残って値が空でないものを空にしてから戻る。エラーの step は fills の添字（submit は fills の個数）とする。
+ * Fills fills in order, submits, and performs everything up to settle as one operation. Regardless
+ * of success or failure, the filled fields that remain
+ * in the document with a non-empty value are emptied before returning. The step of an error is the
+ * index into fills (for submit, the number of fills).
  */
 async function fillAndSubmit(
   session: StepwiseSession,
   action: Extract<StepwiseAction, { action: "fill_submit" }>,
   totp: string | null,
 ): Promise<boolean> {
-  // 入力の途中で MFA_REQUIRED とならないよう、欄に触れる前に確認する。
+  // Checked before touching any field so that the flow does not become MFA_REQUIRED midway through
+  // filling.
   const usesTotp = action.fills.some((fill) => fill.value === "{{totp}}");
   if (usesTotp && totp === null) throw new MfaRequiredError();
   if (usesTotp && totp !== null && !session.totpCodes.includes(totp)) {
@@ -3054,7 +3158,7 @@ async function fillAndSubmit(
   }
 }
 
-/** abort 以外の action を実行し、settle まで待って落ち着いたかを返す。 */
+/** Runs an action other than abort, waits until settle, and returns whether the page settled. */
 async function performStepwiseAction(
   session: StepwiseSession,
   request: LoginStepRequest,
@@ -3095,7 +3199,7 @@ async function stepStepwise(
   return concludeStepwise(session, settled, false);
 }
 
-/** `pageSecrets` には、失敗の時点で context が持っていた cookie の値を渡す。 */
+/** `pageSecrets` takes the cookie values the context held at the time of the failure. */
 type ExecutionErrorWriter = (
   stage: ExecutionStage,
   classified: ClassifiedExecutionError,
@@ -3107,11 +3211,14 @@ function throwIfDeviceAuthorizationAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new Error("device authorization was aborted");
 }
 
-// 既定のデバイス段（steps が null）が最初に入力する要素。
+// The element that the default device step (steps is null) fills first.
 const DEFAULT_FIRST_DEVICE_STEP_SELECTOR =
   'input[name="user_code"], input[autocomplete="one-time-code"]';
 
-/** デバイス段で最初に操作する要素の selector を返す。ステップが空の場合は undefined を返す。 */
+/**
+ * Returns the selector of the element the device step operates on first. Returns undefined if there
+ * are no steps.
+ */
 export function firstDeviceStepSelector(
   steps: DeviceStep[] | null,
 ): string | undefined {
@@ -3119,13 +3226,15 @@ export function firstDeviceStepSelector(
   return steps[0]?.selector;
 }
 
-// デバイス段の競争でログインフォームとみなす要素。先頭の password 欄が非表示でも後続の可視の欄を検出できるよう、
-// 可視の候補に限って待つ。
+// The element treated as a login form in the device step race. Only visible candidates are awaited,
+// so that a later visible field is detected
+// even if the first password field is hidden.
 const DEVICE_RACE_LOGIN_SELECTOR = 'input[type="password"]:visible';
 
 /**
- * デバイス段の最初の要素とログインフォーム（可視の password 欄）のどちらが先に可視になるかを返す。
- * どちらも上限までに現れない場合は undefined を返す。
+ * Returns which becomes visible first, the first element of the device step or the login form (a
+ * visible password field).
+ * Returns undefined if neither appears within the limit.
  */
 export async function raceDeviceStageAgainstLogin(
   page: Page,
@@ -3144,15 +3253,19 @@ export async function raceDeviceStageAgainstLogin(
 }
 
 /**
- * ログイン段を省略したデバイス段の失敗のうち、ログイン段からやり直す対象であるかを判定する。
- * 承認ページが未認証でも空の形で表示されるサイトでは、操作する要素が見つからない形で失敗するため、
- * failure_selector による拒否へ分類されなかった要素の不在のみを対象とする。
+ * Decides whether a device step failure that skipped the login step is one to redo from the login
+ * step.
+ * On sites where the approval page is displayed empty even when unauthenticated, the failure takes
+ * the form of a missing target element,
+ * so only the absence of an element not classified as a rejection by failure_selector is covered.
  */
 export function isLoginFallbackError(error: unknown): boolean {
   return error instanceof SelectorNotFoundError;
 }
 
-/** 実行中の段を記録しながら、中断の確認とガードの監視の下で各操作を行う。 */
+/**
+ * Performs each operation under abort checks and guard monitoring while recording the running step.
+ */
 type DeviceAuthorizationRunner = {
   page: Page;
   run: <T>(stage: ExecutionStage, action: () => Promise<T>) => Promise<T>;
@@ -3180,8 +3293,9 @@ async function runDeviceStage(
 }
 
 /**
- * 復元した cookie によって承認ページへ到達できるかを判定する。承認ページの要素が先に可視になった場合に限り
- * true を返し、このときページは承認ページに留まる。
+ * Decides whether the approval page is reachable with the restored cookies. Returns true only if
+ * the approval page's element
+ * became visible first, and the page then stays on the approval page.
  */
 async function isDevicePageReachedByRestoredCookies(
   runner: DeviceAuthorizationRunner,
@@ -3198,8 +3312,9 @@ async function isDevicePageReachedByRestoredCookies(
 }
 
 /**
- * ログイン段を省略して、表示中の承認ページでデバイス段を行う。要素の不在で失敗した場合に限り、
- * 1 回だけログイン段からやり直す。ログイン段を省略できたかを返す。
+ * Skips the login step and runs the device step on the displayed approval page. Only if it fails
+ * because an element is missing,
+ * redoes it once from the login step. Returns whether the login step could be skipped.
  */
 async function authorizeOnReachedDevicePage(
   runner: DeviceAuthorizationRunner,
@@ -3216,7 +3331,7 @@ async function authorizeOnReachedDevicePage(
   return false;
 }
 
-/** ログイン段とデバイス段を行い、ログイン段を省略できたかを返す。 */
+/** Runs the login step and the device step, and returns whether the login step could be skipped. */
 async function authorizeDevice(
   runner: DeviceAuthorizationRunner,
   request: AuthorizeDeviceRequest,
@@ -3242,20 +3357,27 @@ type DeviceAuthorizationResult =
   | ({ ok: true } & DeviceAuthorizationOutcome)
   | { ok: false; error: ClassifiedExecutionError };
 
-/** device 承認の成功応答に載せる cookie とログイン段の省略の有無を返す。 */
+/**
+ * Returns the cookies and whether the login step was skipped, to include in the success response of
+ * the device approval.
+ */
 export function formatDeviceAuthorizationFields(
   outcome: DeviceAuthorizationOutcome,
 ): { cookies: Cookie[]; steps_skipped: boolean } {
   return { cookies: outcome.cookies, steps_skipped: outcome.stepsSkipped };
 }
 
-// 診断行の秘匿のために、失敗の時点の context の cookie を読む上限。
+// Upper bound on cookies read from the context at the time of failure, to hide them in diagnostic
+// lines.
 const DIAGNOSTIC_COOKIE_READ_TIMEOUT_MS = 1_000;
 
 /**
- * 診断行の置換対象とするため、context が現に持つ cookie の値を読む。実行中にページが発行・更新した cookie は
- * 要求に含まれず、要求由来の置換では秘匿できないためである。context が無い場合、読めない場合、
- * 上限を超えた場合は空とし、元の失敗の報告を妨げない。
+ * Reads the cookie values the context currently holds, to use as replacement targets in diagnostic
+ * lines. Cookies the page issued or updated during the run
+ * are not part of the request and cannot be hidden by request-derived replacement. If there is no
+ * context, if reading fails,
+ * or if the upper bound is exceeded, the result is empty and does not hinder reporting the original
+ * failure.
  */
 async function readCookieValuesForRedaction(
   context: BrowserContext | undefined,
@@ -3281,8 +3403,10 @@ async function readCookieValuesForRedaction(
 }
 
 /**
- * device 承認をブラウザで行う。`signal` が中断された場合は、ブラウザ起動の後および各段の前で打ち切る。
- * 成功した場合は、ブラウザを閉じる前の context の cookie を返す。ブラウザの後始末は呼び出し側が行う。
+ * Performs the device approval in the browser. If `signal` is aborted, it stops after the browser
+ * launch and before each step.
+ * On success it returns the cookies of the context before the browser is closed. The caller handles
+ * browser cleanup.
  */
 async function executeAuthorizeDevice(
   request: AuthorizeDeviceRequest,
@@ -3350,7 +3474,8 @@ export function formatApiProxyEvent(record: ApiProxyRequestRecord): unknown {
 }
 
 function writeApiProxyEvent(record: ApiProxyRequestRecord): void {
-  // 応答行と同じく 1 回の write で 1 行を出力し、行単位の JSON を保つ。
+  // One line is written with a single write, like the response line, to keep the output as
+  // line-delimited JSON.
   process.stdout.write(`${JSON.stringify(formatApiProxyEvent(record))}\n`);
 }
 
@@ -3384,7 +3509,7 @@ function monitorGuardFailure(guard: CdpGuard): void {
 function killBrowserProcess(browserPid: number | undefined): void {
   if (browserPid === undefined) {
     process.stderr.write(
-      "ブラウザプロセスの PID を取得できないため、強制終了を実行できません。\n",
+      "Cannot force-kill the browser because its process ID is unavailable.\n",
     );
     return;
   }
@@ -3502,8 +3627,10 @@ async function handleRelease(request: ReleaseRequest): Promise<void> {
 }
 
 /**
- * login の context の cookie を全件返す。ブラウザまたは login の context が無い場合は空配列を返す。
- * 例外の文言は cookie の内容を含みうるため、失敗時も診断行を出力しない。
+ * Returns all cookies of the login context. Returns an empty array if there is no browser or login
+ * context.
+ * An exception's text may contain cookie contents, so no diagnostic line is emitted even on
+ * failure.
  */
 export async function handleExportCookies(
   request: ExportCookiesRequest,
@@ -3557,7 +3684,10 @@ export async function handleLogin(request: LoginRequest): Promise<void> {
   }
 }
 
-/** 段階ログインのエラーを応答する。継続できないエラーでは、ブラウザを破棄してから応答する。 */
+/**
+ * Answers a stepwise login error. For an error that cannot continue, the browser is discarded
+ * before answering.
+ */
 async function writeStepwiseError(
   request: LoginBeginRequest | LoginStepRequest,
   error: unknown,
@@ -3584,7 +3714,8 @@ export async function handleLoginBegin(
   try {
     writeResponse({ ok: true, ...(await beginStepwise(request)) }, request.id);
   } catch (error) {
-    // login_begin の時点では selector の操作が無く、エラーはすべて段階ログインを終了させる。
+    // At the time of login_begin there is no selector operation, so every error ends the stepwise
+    // login.
     await cleanupResources();
     await writeStepwiseError(request, error, []);
   }
@@ -3595,7 +3726,7 @@ export async function handleLoginStep(
 ): Promise<void> {
   const session = activeStepwise;
   if (session === undefined) {
-    // ハンドオフ後または終了後のブラウザは、段階ログインの操作の対象にしない。
+    // A browser after handoff or after termination is not a target of stepwise login operations.
     writeResponse(formatErrorResponse({ code: "INTERNAL" }), request.id);
     return;
   }
@@ -3671,11 +3802,14 @@ export async function handleApiProxyStart(
   }
 }
 
-// 応答は最初の要求から 80 秒以内（デーモンの初回要求の上限 90 秒の内側）に返す。grant の各段はこの期限で
-// 打ち切り、残りを後始末（打ち切った承認処理の完了待ち 5 秒・ブラウザの終了 5 秒、または token の失効 5 秒）と
-// 応答に充てる。
+// The response is returned within 80 seconds of the first request (inside the daemon's 90-second
+// limit for the first request). Each step of the grant is
+// aborted at this deadline, and the remainder is spent on cleanup (5 seconds to wait for the
+// aborted approval to finish, 5 seconds for the browser to exit, or 5 seconds for token revocation)
+// and the response.
 const OAUTH_GRANT_BUDGET_MS = 65_000;
-// 期限超過・中断で見切った承認処理が、起動し終えたブラウザを残さず終わるまで待つ上限。
+// Upper bound on waiting until an approval abandoned by a deadline overrun or abort finishes
+// without leaving a launched browser behind.
 const ORPHAN_AUTHORIZATION_WAIT_MS = 5_000;
 
 function toAuthorizeDeviceRequest(
@@ -3696,7 +3830,10 @@ function toAuthorizeDeviceRequest(
   };
 }
 
-/** `promise` の完了を最大 `ms` ミリ秒待つ。結果・失敗は問わない。 */
+/**
+ * Waits up to `ms` milliseconds for `promise` to complete. Neither its result nor its failure
+ * matters.
+ */
 async function waitAtMost(
   promise: Promise<unknown>,
   ms: number,
@@ -3712,9 +3849,12 @@ async function waitAtMost(
 }
 
 /**
- * device 承認をブラウザで行い、成否にかかわらずブラウザを閉じる。
- * 期限超過または中断の場合は承認処理を打ち切って OAuthGrantError とし、以後に届く遅れた診断行は出力しない。
- * 打ち切った承認処理がブラウザの起動を終える前に後始末すると、ブラウザが残るため、その完了を短く待ってから閉じる。
+ * Performs the device approval in the browser and closes the browser regardless of success or
+ * failure.
+ * On deadline overrun or abort, the approval is cut off and raised as OAuthGrantError, and late
+ * diagnostic lines that arrive afterward are not emitted.
+ * Cleaning up before the cut-off approval finishes launching the browser would leave the browser
+ * behind, so the cleanup waits briefly for it to finish before closing.
  */
 async function authorizeDeviceInBrowser(
   request: OAuthApiProxyStartRequest,
@@ -3737,7 +3877,8 @@ async function authorizeDeviceInBrowser(
   const authorization = executeAuthorizeDevice(
     toAuthorizeDeviceRequest(request, device),
     (stage, classified, cause, pageSecrets) => {
-      // 打ち切った後の失敗は、打ち切りの理由として別に報告するため出力しない。
+      // A failure after the cut-off is reported separately as the reason for the cut-off, so it is
+      // not emitted.
       if (!cancel.signal.aborted) {
         writeExecutorErrorLine(request, stage, classified, cause, [
           ...runtimeSecrets,
@@ -3765,8 +3906,10 @@ async function authorizeDeviceInBrowser(
 }
 
 /**
- * device-code grant で access token を得る。ブラウザ段の失敗は分類済みの結果として返す。
- * 成功時はブラウザ段で得た cookie とログイン段の省略の有無も返す。
+ * Obtains an access token with the device-code grant. A failure in the browser step is returned as
+ * a classified result.
+ * On success it also returns the cookies obtained in the browser step and whether the login step
+ * was skipped.
  */
 async function acquireOAuthTokens(
   request: OAuthApiProxyStartRequest,
@@ -3813,7 +3956,10 @@ async function acquireOAuthTokens(
   return { tokens, issuedAt: Date.now(), browser };
 }
 
-/** 取得した token でプロキシを起動する。起動できない場合は token を失効させてから例外を返す。 */
+/**
+ * Starts the proxy with the obtained token. If it cannot start, the token is revoked and then an
+ * exception is raised.
+ */
 async function startOAuthProxySession(
   request: OAuthApiProxyStartRequest,
   tokens: TokenSet,
@@ -3831,7 +3977,8 @@ async function startOAuthProxySession(
       onRequest: writeApiProxyEvent,
     });
   } catch (error) {
-    // 応答より前にイベント行を出すとデーモンが応答として読むため、ここでは失効のみ行う。
+    // The daemon reads an event line emitted before the response as the response, so only
+    // revocation is done here.
     await revokeTokens(request.oauth, tokens, postForm);
     throw error;
   }
@@ -3885,11 +4032,12 @@ async function runOAuthApiProxyStart(
       },
       request.id,
     );
-    // デーモンは初回要求の応答を最初の 1 行として読むため、イベント行は応答の後に出力する。
+    // The daemon reads the response to the first request as the first line, so event lines are
+    // emitted after the response.
     writeOAuthTokenEvent("issued");
   } catch (error) {
     const classified = classifyExecutionError(error, "oauth");
-    // shutdown による中断は grant の失敗ではないため、診断行を出さない。
+    // An abort by shutdown is not a grant failure, so no diagnostic line is emitted.
     if (!signal.aborted) {
       writeExecutorErrorLine(
         request,
@@ -3903,7 +4051,7 @@ async function runOAuthApiProxyStart(
   }
 }
 
-/** 実行中の grant を記録し、shutdown が中断と完了待ちを行えるようにする。 */
+/** Records the running grant so that shutdown can abort it and wait for it to finish. */
 async function handleOAuthApiProxyStart(
   request: OAuthApiProxyStartRequest,
 ): Promise<void> {
@@ -3933,7 +4081,8 @@ async function closeMcpServer(): Promise<void> {
 async function runMcpServerStart(
   request: McpServerStartRequest,
 ): Promise<void> {
-  // 1 executor が保持するリソースは 1 種類 1 個に限り、ブラウザ・注入プロキシとも併存させない。
+  // One executor holds at most one resource of one kind, and the browser and the injection proxy do
+  // not coexist.
   if (
     activeMcpServer !== undefined ||
     activeApiProxy !== undefined ||
@@ -3971,7 +4120,10 @@ async function runMcpServerStart(
   }
 }
 
-/** 起動中の要求を記録し、shutdown が起動の完了を待ってから後始末できるようにする。 */
+/**
+ * Records the request being started so that shutdown can wait for the start to finish before
+ * cleanup.
+ */
 async function handleMcpServerStart(
   request: McpServerStartRequest,
 ): Promise<void> {
@@ -4079,7 +4231,8 @@ async function main(): Promise<void> {
       }
       await handleLogin(request);
     } catch (error) {
-      // 段階ログイン中の不正な要求は INTERNAL として終了させるため、応答の前にブラウザを破棄する。
+      // A malformed request during a stepwise login ends it as INTERNAL, so the browser is
+      // discarded before the response.
       if (activeStepwise !== undefined) await cleanupResources();
       writeResponse(
         { ok: false, error: "INTERNAL" satisfies ErrorCode },

@@ -114,7 +114,7 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
     let result = unsafe {
-        // SAFETY: 両パスは NUL 終端であり、呼び出し中は有効です。
+        // SAFETY: Both paths are NUL-terminated and valid for the duration of the call.
         MoveFileExW(
             source.as_ptr(),
             destination.as_ptr(),

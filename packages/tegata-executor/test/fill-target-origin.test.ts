@@ -21,7 +21,8 @@ import { parseSnapshotLine } from "../src/snapshot.js";
 const USERNAME = "alice@example.test";
 const PASSWORD = "correct-horse-battery";
 
-// 入力の報告。欄の input イベントごとに、frame の名前と値の長さを同期的に送る。
+// Input report. For each input event on a field, synchronously sends the frame name and the length
+// of the value.
 const reports: Array<{ frame: string; length: number }> = [];
 
 const reportScript = `<script>
@@ -41,7 +42,8 @@ function framedForm(name: string): string {
     </form></body></html>`;
 }
 
-// 同じ origin・別 origin（localhost）・srcdoc・about:blank の iframe と、後から取り除かれる iframe を持つページ。
+// A page with iframes that are same-origin, cross-origin (localhost), srcdoc, and about:blank, and
+// an iframe that is removed later.
 function framesPage(port: number): string {
   return `<!doctype html><html><head><title>Frames</title></head><body>${reportScript}
     <h1>Frames</h1>
@@ -183,7 +185,7 @@ function refOf(response: Response, role: string, name: string): string {
 
 const refused = { ok: false, error: "FILL_TARGET_REFUSED", id: 2 };
 
-/** 拒否の後は段階ログインが終わり、ブラウザは破棄されている。 */
+/** After a refusal, the stepwise login is over and the browser has been discarded. */
 async function expectEnded(): Promise<void> {
   expect(await step({ action: "snapshot" })).toMatchObject({
     ok: false,

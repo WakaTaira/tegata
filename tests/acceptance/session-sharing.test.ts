@@ -47,15 +47,15 @@ async function logout(stack: Phase4Stack, sessionId: string): Promise<void> {
 }
 
 test("AC-56: a second login by the same principal joins the live browser", async () => {
-  // Given: mock provider の cred X と、同一 principal（テスト uid の UNIX socket）
+  // Given: cred X of the mock provider, and the same principal (the test uid on the UNIX socket)
   const stack = await startPhase4Stack();
   try {
-    // When: login(X) を 2 回呼ぶ（exclusive 省略）
+    // When: call login(X) twice (exclusive omitted)
     const first = await mcpLogin(stack);
     const second = await mcpLogin(stack);
 
-    // Then: 2 回目は同じ endpoint と異なる session_id を返し、ブラウザは
-    // 1 つ、fixture への POST /login は 1 回
+    // Then: the second call returns the same endpoint and a different session_id, there is
+    // one browser, and POST /login to the fixture happens once
     expect(second.channel.endpoint).toBe(first.channel.endpoint);
     expect(second.session_id).not.toBe(first.session_id);
     expect(countExecutors(stack.daemon.pid)).toBe(1);
@@ -66,17 +66,17 @@ test("AC-56: a second login by the same principal joins the live browser", async
 });
 
 test("AC-57: exclusive: true gets a private browser that nobody joins", async () => {
-  // Given: X の非 exclusive ブラウザが 1 つある
+  // Given: one non-exclusive browser for X
   const stack = await startPhase4Stack();
   try {
     const shared = await mcpLogin(stack);
 
-    // When: login(X, exclusive: true)、続いて login(X) を呼ぶ
+    // When: call login(X, exclusive: true), then login(X)
     const exclusive = await mcpLogin(stack, "mock:site", { exclusive: true });
     const joined = await mcpLogin(stack);
 
-    // Then: exclusive は別の endpoint、3 回目は 1 回目と同じ endpoint
-    // （exclusive には相乗りしない）、ブラウザは 2 つ
+    // Then: the exclusive login gets a different endpoint, and the third call gets the same
+    // endpoint as the first (it does not join the exclusive one), for two browsers
     expect(exclusive.channel.endpoint).not.toBe(shared.channel.endpoint);
     expect(joined.channel.endpoint).toBe(shared.channel.endpoint);
     expect(countExecutors(stack.daemon.pid)).toBe(2);
@@ -87,7 +87,7 @@ test("AC-57: exclusive: true gets a private browser that nobody joins", async ()
 });
 
 test("AC-59: logout returns one lease; the browser closes with the last one", async () => {
-  // Given: 同一 principal の 2 リース s1 / s2 が 1 ブラウザを共有している
+  // Given: two leases s1 / s2 of the same principal share one browser
   const stack = await startPhase4Stack();
   try {
     const s1 = await unixLogin(stack);
@@ -98,17 +98,17 @@ test("AC-59: logout returns one lease; the browser closes with the last one", as
     await logout(stack, s1.session_id);
     await sleep(1_500);
 
-    // Then: ブラウザは 1 つのまま、s2 の endpoint に接続できる
+    // Then: the browser count stays at one, and the endpoint of s2 is connectable
     expect(countExecutors(stack.daemon.pid)).toBe(1);
     const browser = await chromium.connectOverCDP(s2.channel.endpoint, {
       timeout: 5_000,
     });
     await browser.close();
 
-    // When: 続けて logout(s2)
+    // When: then logout(s2)
     await logout(stack, s2.session_id);
 
-    // Then: 5 s 以内にブラウザが 0 になる
+    // Then: the browser count becomes 0 within 5 s
     await waitUntil(
       "the browser to shut down after the last lease",
       () => countExecutors(stack.daemon.pid) === 0,
@@ -120,7 +120,7 @@ test("AC-59: logout returns one lease; the browser closes with the last one", as
 });
 
 test("AC-60: lease TTLs expire one by one; the browser survives until the last", async () => {
-  // Given: session_ttl_secs = 6、リース s1 の 3 s 後に同一鍵のリース s2
+  // Given: session_ttl_secs = 6, with lease s2 of the same key created 3 s after lease s1
   const stack = await startPhase4Stack({ sessionTtlSecs: 6 });
   try {
     const s1 = await unixLogin(stack);
@@ -132,25 +132,25 @@ test("AC-60: lease TTLs expire one by one; the browser survives until the last",
         .records.filter((r) => r.method === "session_expired")
         .map((r) => r.session_id);
 
-    // When: s1 の TTL が切れる
+    // When: the TTL of s1 expires
     await waitUntil(
       "session_expired for the first lease",
       () => expiredIds().includes(s1.session_id),
       15_000,
     );
 
-    // Then: session_expired は s1 だけで、ブラウザは 1 つのまま
+    // Then: session_expired is emitted for s1 only, and the browser count stays at one
     expect(expiredIds()).not.toContain(s2.session_id);
     expect(countExecutors(stack.daemon.pid)).toBe(1);
 
-    // When: s2 の TTL も切れる
+    // When: the TTL of s2 expires too
     await waitUntil(
       "session_expired for the second lease",
       () => expiredIds().includes(s2.session_id),
       15_000,
     );
 
-    // Then: ブラウザが 0 になる
+    // Then: the browser count becomes 0
     await waitUntil(
       "the browser to shut down after the last lease expired",
       () => countExecutors(stack.daemon.pid) === 0,
@@ -162,10 +162,10 @@ test("AC-60: lease TTLs expire one by one; the browser survives until the last",
 });
 
 test("AC-61: concurrent logins on the same key start exactly one browser", async () => {
-  // Given: X のブラウザが無い
+  // Given: no browser for X
   const stack = await startPhase4Stack();
   try {
-    // When: 同一 principal が login(X) を 3 本同時に呼ぶ
+    // When: the same principal calls login(X) three times concurrently
     const results = await Promise.all(
       [0, 1, 2].map(() =>
         rawRpc(
@@ -184,8 +184,8 @@ test("AC-61: concurrent logins on the same key start exactly one browser", async
     }
     const logins = results.map((r) => r.result as LoginResult);
 
-    // Then: 3 つの異なる session_id、同じ endpoint、POST /login は 1 回、
-    // ブラウザは 1 つ
+    // Then: three distinct session_ids, the same endpoint, POST /login happens once, and
+    // there is one browser
     expect(new Set(logins.map((l) => l.session_id)).size).toBe(3);
     expect(new Set(logins.map((l) => l.channel.endpoint)).size).toBe(1);
     expect(stack.fixture.loginPosts()).toBe(1);
@@ -196,15 +196,15 @@ test("AC-61: concurrent logins on the same key start exactly one browser", async
 });
 
 test("AC-69: each lease gets its own tab, closed when the lease ends", async () => {
-  // Given: 同一鍵の 2 リース s1 / s2
+  // Given: two leases s1 / s2 of the same key
   const stack = await startPhase4Stack();
   let client: CdpClient | undefined;
   try {
     const s1 = await unixLogin(stack);
     const s2 = await unixLogin(stack);
 
-    // When: login の結果とブラウザの target 一覧を見る
-    // Then: 両方に異なる target_id があり、どちらも page target として存在する
+    // When: inspect the login results and the browser's target list
+    // Then: each has a distinct target_id, and both exist as page targets
     expect(typeof s1.target_id).toBe("string");
     expect(typeof s2.target_id).toBe("string");
     expect(s2.target_id).not.toBe(s1.target_id);
@@ -216,7 +216,8 @@ test("AC-69: each lease gets its own tab, closed when the lease ends", async () 
     // When: logout(s2)
     await logout(stack, s2.session_id);
 
-    // Then: 2 s 以内に s2 の target が消え、s1 の target は残り、ブラウザは 1 つ
+    // Then: within 2 s the target of s2 disappears, the target of s1 remains, and the browser count
+    // is one
     const cdp = client;
     await waitUntil(
       "the second lease's tab to close",
@@ -232,7 +233,7 @@ test("AC-69: each lease gets its own tab, closed when the lease ends", async () 
 });
 
 test("AC-70: status reports the browser and lease counts", async () => {
-  // Given: ブラウザ 2 つ（X の共有ブラウザに 2 リース、Y に 1 リース）
+  // Given: two browsers (two leases on the shared browser for X, and one lease on Y)
   const stack = await startPhase4Stack();
   try {
     await unixLogin(stack, "mock:site");

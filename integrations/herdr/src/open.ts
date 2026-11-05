@@ -166,7 +166,7 @@ function findHerdr(): string {
       return path;
     }
   } catch {
-    // PATH 上の herdr が見つからない場合は下で理由を示します。
+    // If herdr is not found on PATH, the reason is reported below.
   }
   throw new Error("herdr was not found on PATH");
 }

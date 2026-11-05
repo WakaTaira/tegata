@@ -1,6 +1,8 @@
-//! 資格ごとの永続 cookie（Issue #45）のデーモン側の振る舞いを、偽の executor で確かめる。
-//! ブラウザを使わないため、executor とのプロトコル・保管・監査・管理コマンドを直接検証する。
-//! UNIX ドメインソケット経由で RPC を送るため、UNIX でのみ実行する。
+//! Verifies the daemon-side behavior of per-credential persistent cookies (Issue #45) with a fake
+//! executor.
+//! No browser is used, so the protocol with the executor, storage, audit, and admin commands are
+//! verified directly.
+//! RPCs are sent over a UNIX domain socket, so these tests run on UNIX only.
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -15,8 +17,10 @@ use uuid::Uuid;
 mod common;
 use common::{create_private_dir, rpc, try_rpc};
 
-/// login に保管対象の `device`（1 日）とセッション cookie の `sid` を返し、`export_cookies` にも応じる偽の executor。
-/// 受け取った要求の op と `cookies` を `executor.js.requests` に 1 行ずつ記録する。
+/// Fake executor that returns a storable `device` cookie (1 day) and a session cookie `sid` for
+/// login, and also answers `export_cookies`.
+/// It records the op and `cookies` of each request it receives in `executor.js.requests`, one per
+/// line.
 const COOKIE_EXECUTOR: &str = r#"
 const fs = require("node:fs");
 const readline = require("node:readline");
@@ -47,7 +51,8 @@ rl.on("line", (line) => {
 });
 "#;
 
-/// cookie を知らない古い executor。login 応答に `cookies` が無く、`export_cookies` には応答しない。
+/// Old executor that knows nothing about cookies. Its login response has no `cookies`, and it does
+/// not answer `export_cookies`.
 const LEGACY_EXECUTOR: &str = r#"
 const readline = require("node:readline");
 const reply = (id, body) => process.stdout.write(JSON.stringify({ id, ...body }) + "\n");
@@ -66,11 +71,14 @@ rl.on("line", (line) => {
 });
 "#;
 
-/// login に加えて `authorize_device` と `api_proxy_start` にも cookie を返す偽の executor（Issue #49）。
-/// 受け取った要求の op と、復元用に渡された cookie（`api_proxy_start` では `oauth.cookies`、
-/// 静的トークンのプロキシでは `"static"`）を `executor.js.requests` に 1 行ずつ記録する。
-/// user_code が `rejected-code` の `authorize_device` は `DEVICE_CODE_REJECTED` で失敗させる。
-/// 静的トークンのプロキシにも cookie を返し、デーモンがそれを捨てることを確かめられるようにする。
+/// Fake executor that returns cookies for `authorize_device` and `api_proxy_start` as well as login
+/// (Issue #49).
+/// It records the op of each request it receives and the cookies passed for restoration
+/// (`oauth.cookies` for `api_proxy_start`,
+/// `"static"` for a static-token proxy) in `executor.js.requests`, one per line.
+/// An `authorize_device` with user_code `rejected-code` fails with `DEVICE_CODE_REJECTED`.
+/// It also returns cookies for the static-token proxy, so tests can confirm that the daemon
+/// discards them.
 const DEVICE_EXECUTOR: &str = r#"
 const fs = require("node:fs");
 const readline = require("node:readline");
@@ -115,7 +123,8 @@ rl.on("line", (line) => {
 rl.on("close", () => process.exit(0));
 "#;
 
-/// OAuth の注入プロキシ `fx`（`mock:site` でログイン）と静的トークンのプロキシ `st`（`mock:site-b`）。
+/// OAuth injection proxy `fx` (logs in with `mock:site`) and static-token proxy `st`
+/// (`mock:site-b`).
 const API_PROXY_CONFIG: &str = r##"
 [[api_proxy]]
 name = "fx"
@@ -139,7 +148,7 @@ const PASSWORD: &str = "cookie-test-password-secret";
 
 struct Daemon {
     child: Option<Child>,
-    /// 最上位の表に追加する設定行。
+    /// Config lines added to the top-level table.
     extra_config: String,
     directory: PathBuf,
     state_dir: PathBuf,
@@ -177,7 +186,7 @@ impl Daemon {
         daemon
     }
 
-    /// 同じ state_dir のまま、`persist_cookies` を差し替えてデーモンを起動し直す。
+    /// Restarts the daemon with the same state_dir and a different `persist_cookies`.
     fn restart(&mut self, persist_cookies: &[&str]) {
         self.stop();
         let _ = std::fs::remove_file(&self.socket_path);
@@ -262,7 +271,8 @@ impl Daemon {
             .unwrap_or_else(|| panic!("no {method} record for {session_id}"))
     }
 
-    /// セッションを持たない行（`authorize_device` など）を、記録された順に返す。
+    /// Returns the lines without a session (such as `authorize_device`) in the order they were
+    /// recorded.
     fn records_of(&self, method: &str) -> Vec<Value> {
         self.audit_records()
             .into_iter()
@@ -270,7 +280,8 @@ impl Daemon {
             .collect()
     }
 
-    /// 偽の executor が受け取った `op` の要求の、復元用 cookie を順に返す。
+    /// Returns, in order, the restoration cookies of the requests with the given `op` that the fake
+    /// executor received.
     fn restored_cookies_of(&self, op: &str) -> Vec<Value> {
         self.executor_requests()
             .into_iter()
@@ -301,7 +312,8 @@ impl Daemon {
         (response, session_id)
     }
 
-    /// RPC 応答・監査・stderr のいずれにも cookie のカナリア値が現れないことを確かめる。
+    /// Verifies that the cookie canary value appears in none of the RPC responses, audit, or
+    /// stderr.
     fn assert_no_cookie_values(&self, responses: &[&Value]) {
         let audit = std::fs::read_to_string(self.audit_path()).expect("read audit log");
         let stderr = std::fs::read_to_string(self.directory.join("stderr.log")).unwrap_or_default();
@@ -315,7 +327,7 @@ impl Daemon {
         }
     }
 
-    /// 偽の executor が受け取った要求（op と cookies）。
+    /// Requests (op and cookies) that the fake executor received.
     fn executor_requests(&self) -> Vec<Value> {
         std::fs::read_to_string(self.directory.join("executor.js.requests"))
             .unwrap_or_default()
@@ -442,7 +454,7 @@ fn a_persisted_credential_restores_only_persistent_cookies_on_the_next_login() {
     assert_eq!(restored[0]["name"], "device");
     assert_eq!(restored[0]["value"], "device-canary-export");
 
-    // cookie の値は RPC 応答・監査・stderr・保管ファイル名のいずれにも現れない。
+    // The cookie value appears in none of the RPC responses, audit, stderr, or stored file names.
     let audit = std::fs::read_to_string(daemon.audit_path()).expect("read audit log");
     let stderr = std::fs::read_to_string(daemon.directory.join("stderr.log")).unwrap_or_default();
     for surface in [
@@ -654,7 +666,8 @@ fn an_expired_session_saves_its_cookies() {
     assert_eq!(daemon.store_files().len(), 1);
 }
 
-/// 復元用に渡された cookie が、永続 cookie `device` の 1 件だけで、その値が `value` であることを確かめる。
+/// Verifies that the cookies passed for restoration are exactly one persistent cookie, `device`,
+/// and that its value is `value`.
 fn assert_restored_device(cookies: &Value, value: &str) {
     let cookies = cookies
         .as_array()

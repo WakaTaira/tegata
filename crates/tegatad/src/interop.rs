@@ -48,9 +48,10 @@ impl AncestryTermination {
     }
 }
 
-/// 監査に記録する祖先走査の結末です。
+/// The outcome of the ancestor walk, recorded in the audit log.
 ///
-/// プロセス表を取得できず走査に至らなかった場合を、走査の終了理由と区別して表します。
+/// It distinguishes the case where the process table could not be obtained and no walk took place
+/// from the reasons a walk ends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OriginWalk {
     Terminated(AncestryTermination),
@@ -73,9 +74,11 @@ pub(crate) struct AncestryTrace<'a> {
 }
 
 pub(crate) fn trace_ancestry(client_pid: u32, table: &[ProcEntry]) -> AncestryTrace<'_> {
-    // Toolhelp の表には PID 0 の System Idle Process（ppid 0）が含まれる。PID 0 をそのまま
-    // 探すと Root で走査を終えて Native と判定され、PID を取得できなかった caller が
-    // 管理 RPC を通る（fail-open）。これを防ぐため、client が表に無い場合と同じく扱う。
+    // The Toolhelp table contains the System Idle Process (PID 0, ppid 0). Looking up PID 0 as is
+    // would end the walk at Root and classify it as Native, so a caller whose PID could not be
+    // obtained
+    // would pass the admin RPC (fail-open). To prevent this, treat it the same as a client missing
+    // from the table.
     if client_pid == 0 {
         return AncestryTrace {
             chain: Vec::new(),
@@ -104,8 +107,10 @@ pub(crate) fn trace_ancestry(client_pid: u32, table: &[ProcEntry]) -> AncestryTr
                 termination: AncestryTermination::Root,
             };
         }
-        // Windows は PID を再利用するため、終了済みの祖先の PID が別プロセスに割り当てられ、
-        // 親の連鎖が循環することがある。循環は正規の経路でも生じるため、終了条件として扱う。
+        // Windows reuses PIDs, so the PID of a terminated ancestor can be assigned to another
+        // process
+        // and the parent chain can become a cycle. A cycle also occurs on legitimate paths, so
+        // treat it as a termination condition.
         if chain.iter().any(|entry| entry.pid == current.ppid) {
             return AncestryTrace {
                 chain,
@@ -118,8 +123,9 @@ pub(crate) fn trace_ancestry(client_pid: u32, table: &[ProcEntry]) -> AncestryTr
                 termination: AncestryTermination::ParentMissing,
             };
         };
-        // 親が子より後に作成されている場合、その PID は再利用された別プロセスである。
-        // 以降の祖先は検証できないため、鎖に含めずに走査を終える。
+        // If the parent was created after the child, that PID belongs to a different, reused
+        // process.
+        // Later ancestors cannot be verified, so end the walk without including it in the chain.
         if let (Some(child_created), Some(parent_created)) = (current.created, parent.created)
             && parent_created > child_created
         {
@@ -137,10 +143,12 @@ pub(crate) fn trace_ancestry(client_pid: u32, table: &[ProcEntry]) -> AncestryTr
     }
 }
 
-/// 走査を終えるまでに検証した祖先鎖から caller の由来を判定する。
+/// Determines the origin of the caller from the ancestor chain verified before the walk ended.
 ///
-/// client 自身が表に無い場合のみ `Unknown` とする。親の終了や PID 再利用による
-/// 打ち切りは正規の経路でも常に生じるため、それまでの鎖で判定する。
+/// Only a client that is itself missing from the table is `Unknown`. A cut-off caused by a parent
+/// exiting
+/// or a PID being reused always occurs on legitimate paths too, so the chain gathered up to that
+/// point decides.
 pub(crate) fn classify_ancestry(trace: &AncestryTrace<'_>) -> Origin {
     if trace.termination == AncestryTermination::ClientMissing {
         return Origin::Unknown;

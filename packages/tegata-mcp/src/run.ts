@@ -2,33 +2,42 @@ import { connect as connectTcp } from "node:net";
 import { pathToFileURL } from "node:url";
 import { callDaemon, openBridgeTunnel, type RpcResponse } from "./index.js";
 
-/** open_mcp_server の応答から取り出した、中継に必要な値。 */
+/** Values extracted from the open_mcp_server response that are needed for relay. */
 type OpenMcpServerResult = {
   sessionId: string;
   port: number;
   streamSecret: string;
 };
 
-/** ランナーが読み書きするストリーム。テストから差し替え可能にするため引数として受け取る。 */
+/** The streams the runner reads and writes. Taken as an argument so that tests can replace them. */
 export type RunStreams = {
   stdin: NodeJS.ReadableStream;
   stdout: NodeJS.WritableStream;
   stderr: NodeJS.WritableStream;
 };
 
-/** 終了シグナルの購読元。テストから差し替え可能にするため引数として受け取る。 */
+/**
+ * The source of termination-signal subscriptions. Taken as an argument so that tests can replace
+ * it.
+ */
 export type SignalSource = {
   on(signal: NodeJS.Signals, listener: () => void): unknown;
   off(signal: NodeJS.Signals, listener: () => void): unknown;
 };
 
-/** 受けた場合に logout してから終了するシグナルと、その際の終了コード（128 + シグナル番号）。 */
+/**
+ * The signals that, when received, trigger logout and exit, and the exit code in that case (128 +
+ * signal number).
+ */
 const TERMINATION_SIGNALS = [
   ["SIGTERM", 143],
   ["SIGINT", 130],
 ] as const;
 
-/** 終了シグナルの受信を記録し、中継中であれば登録済みのハンドラへ即座に伝える。 */
+/**
+ * Records receipt of a termination signal and, if relaying, immediately notifies the registered
+ * handler.
+ */
 type SignalWatch = {
   received: () => number | undefined;
   onSignal: (handler: (exitCode: number) => void) => void;
@@ -58,20 +67,23 @@ function watchSignals(source: SignalSource): SignalWatch {
   };
 }
 
-/** 分類コードのみを stderr へ 1 行出し、失敗の終了コードを返す。 */
+/** Writes only the classification code to stderr as one line and returns the failure exit code. */
 function fail(streams: RunStreams, code: string): number {
   streams.stderr.write(`${code}\n`);
   return 1;
 }
 
-/** 応答に session_id があれば取り出す。形の不正な応答でも開いたセッションを閉じるために使う。 */
+/**
+ * Extracts session_id from the response if present. Used to close an opened session even for a
+ * malformed response.
+ */
 function sessionIdOf(result: unknown): string | undefined {
   if (typeof result !== "object" || result === null) return undefined;
   const sessionId = (result as { session_id?: unknown }).session_id;
   return typeof sessionId === "string" ? sessionId : undefined;
 }
 
-/** open_mcp_server の応答を検証して取り出す。形が合わなければ INTERNAL 扱いにする。 */
+/** Validates and extracts the open_mcp_server response. Treats a mismatched shape as INTERNAL. */
 function parseOpenMcpServerResult(result: unknown): OpenMcpServerResult {
   const sessionId = sessionIdOf(result);
   if (sessionId === undefined) {
@@ -92,19 +104,24 @@ function parseOpenMcpServerResult(result: unknown): OpenMcpServerResult {
   };
 }
 
-/** セッションを閉じる。stream secret やサーバーの出力を一切含まない best-effort な後始末。 */
+/**
+ * Closes the session. A best-effort cleanup that contains neither the stream secret nor any server
+ * output.
+ */
 async function logout(sessionId: string): Promise<void> {
   try {
-    // 旧版のデーモンと組み合わせても確実に閉じるよう、別名の廃止までは logout を呼ぶ。
+    // Call logout until the alias is retired, so that the session is reliably closed even with an
+    // older daemon.
     await callDaemon("logout", { session_id: sessionId });
   } catch {
-    // デーモンが既に失効させている等、ここでの失敗は中継の終了自体を妨げない。
+    // A failure here, such as the daemon having already revoked the session, does not prevent the
+    // relay itself from ending.
   }
 }
 
 /**
- * ポートへ接続し、先頭に stream secret を送ったうえで stdin / stdout をそのまま中継する。
- * stdin の EOF・接続断・終了シグナルのいずれかで logout を送って終了する。
+ * Connects to the port, sends the stream secret first, and then relays stdin / stdout as is.
+ * Sends logout and exits on any of stdin EOF, connection loss, or a termination signal.
  */
 async function connectAndRelay(
   port: number,
@@ -136,7 +153,7 @@ async function connectAndRelay(
   });
 }
 
-/** 開いたセッションについて、必要なら bridge のトンネルを開いてから中継する。 */
+/** For the opened session, opens a bridge tunnel if needed and then relays. */
 async function relaySession(
   opened: OpenMcpServerResult,
   streams: RunStreams,
@@ -165,7 +182,9 @@ async function relaySession(
   );
 }
 
-/** open_mcp_server でセッションを開いて中継する。開いたセッションはどの経路でも logout する。 */
+/**
+ * Opens a session with open_mcp_server and relays. The opened session is logged out on every path.
+ */
 async function openAndRelay(
   name: string,
   streams: RunStreams,
@@ -203,8 +222,10 @@ async function openAndRelay(
 }
 
 /**
- * `tegata-mcp-run <name>` の本体。呼び出しごとに分類コードのみを stderr へ出す。
- * 終了シグナルは open_mcp_server の応答を待ってから扱い、開いたセッションを logout してから終了する。
+ * The body of `tegata-mcp-run <name>`. Emits only the classification code to stderr on each
+ * invocation.
+ * A termination signal is handled after waiting for the open_mcp_server response, and the opened
+ * session is logged out before exiting.
  */
 export async function run(
   name: string | undefined,
@@ -224,8 +245,9 @@ if (
   process.argv[1] !== undefined &&
   pathToFileURL(process.argv[1]).href === import.meta.url
 ) {
-  // 終了シグナルや接続断で終えた場合も stdin の読み取りが残るため、破棄して自然終了させる。
-  // process.exit を使わないのは、stdout へ書き込み途中の応答を切り捨てないためである。
+  // Reading stdin remains even after finishing via a termination signal or connection loss, so
+  // destroy it to let the process exit naturally.
+  // process.exit is not used so that a response being written to stdout is not truncated.
   run(process.argv[2], {
     stdin: process.stdin,
     stdout: process.stdout,

@@ -39,13 +39,13 @@ import {
   REPO_ROOT,
 } from "./harness.js";
 
-/** 偽 MCP サーバーのスクリプト（ホスト側の絶対パス）。 */
+/** The fake MCP server script (an absolute path on the host). */
 export const FAKE_MCP_SERVER = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   "fake-mcp-server.mjs",
 );
 
-/** agent 側ランナー `tegata-mcp-run` の JavaScript entry。 */
+/** The JavaScript entry of the agent-side runner `tegata-mcp-run`. */
 export function runnerEntry(): string {
   return (
     process.env.TEGATA_MCP_RUN_ENTRY ??
@@ -53,7 +53,7 @@ export function runnerEntry(): string {
   );
 }
 
-/** `[[mcp_server]]` の受け入れテストで固定する設定形状。 */
+/** The config shape of `[[mcp_server]]`, fixed by the acceptance tests. */
 export interface McpServerSpec {
   name: string;
   cred_id: string;
@@ -66,7 +66,7 @@ function tomlString(value: string): string {
   return JSON.stringify(value);
 }
 
-/** `[[mcp_server]]` 群の TOML 断片を生成する。 */
+/** Generates the TOML fragment for the `[[mcp_server]]` entries. */
 export function renderMcpServers(servers: McpServerSpec[]): string {
   const lines: string[] = [];
   for (const server of servers) {
@@ -87,8 +87,8 @@ export function renderMcpServers(servers: McpServerSpec[]): string {
 }
 
 /**
- * 偽 MCP サーバーの `[[mcp_server]]` を返す。command は node の絶対パス、
- * args はスクリプトの絶対パスと受信ログのパスである。
+ * Returns the `[[mcp_server]]` of the fake MCP server. command is the absolute path of node,
+ * and args are the absolute path of the script and the path of the receive log.
  */
 export function fakeServerSpec(
   serverLog: string,
@@ -108,7 +108,7 @@ export type FakeServerLogRecord =
   | { event: "start"; pid: number }
   | { event: "request"; line: string };
 
-/** 偽サーバーの受信ログを読む（未作成なら undefined）。 */
+/** Reads the fake server's receive log (undefined if not yet created). */
 export function readServerLog(
   serverLog: string,
 ): FakeServerLogRecord[] | undefined {
@@ -120,7 +120,7 @@ export function readServerLog(
     .map((line) => JSON.parse(line) as FakeServerLogRecord);
 }
 
-/** 受信ログのうち JSON-RPC 要求（id を持つもの）を解析して返す。 */
+/** Parses and returns the JSON-RPC requests (those with an id) in the receive log. */
 export function receivedRequests(
   serverLog: string,
 ): Array<{ id?: unknown; method?: string }> {
@@ -150,7 +150,10 @@ export interface HostedMcpStack {
   guard: LeakGuard;
   canaries: CanarySet;
   daemon: ApiProxyDaemon;
-  /** 偽サーバーの受信ログ。サーバー側の資源であり agent 可視面ではない。 */
+  /**
+   * The fake server's receive log. It is a server-side resource, not a surface visible to the
+   * agent.
+   */
   serverLog: string;
   serverDir: string;
   agentDir: string;
@@ -169,7 +172,7 @@ export interface HostedMcpStackOptions {
   servers?: (serverLog: string) => McpServerSpec[];
 }
 
-/** 偽 MCP サーバーを `[[mcp_server]]` に持つ daemon と leak guard を構成する。 */
+/** Builds a daemon that has the fake MCP server in `[[mcp_server]]`, plus the leak guard. */
 export async function startHostedMcpStack(
   opts: HostedMcpStackOptions = {},
 ): Promise<HostedMcpStack> {
@@ -217,7 +220,7 @@ export async function startHostedMcpStack(
   }
 }
 
-/** daemon を停止し、leak guard の全走査を強制する。 */
+/** Stops the daemon and forces a full leak guard scan. */
 export async function stopHostedMcpStack(stack: HostedMcpStack): Promise<void> {
   await stack.daemon.stop().catch(() => {});
   try {
@@ -230,8 +233,8 @@ export async function stopHostedMcpStack(stack: HostedMcpStack): Promise<void> {
 }
 
 /**
- * ランナーの stdout に現れた全メッセージとエラーを observe へ渡す Transport。
- * Client は connect 時に onmessage を上書きするため、内側の transport を包む。
+ * A Transport that passes every message and error appearing on the runner's stdout to observe.
+ * The Client overwrites onmessage on connect, so the inner transport is wrapped.
  */
 class ObservedTransport implements Transport {
   onclose?: () => void;
@@ -271,24 +274,24 @@ class ObservedTransport implements Transport {
 }
 
 export interface RunnerSession {
-  /** ツールを呼ぶ。応答が無いまま timeoutMs を過ぎるか接続が切れると reject する。 */
+  /** Calls a tool. Rejects if no response arrives within timeoutMs or the connection drops. */
   callTool(
     name: string,
     args?: Record<string, unknown>,
     timeoutMs?: number,
   ): Promise<McpResult>;
-  /** ランナーのプロセスが終了した時点で解決する。 */
+  /** Resolves when the runner process has exited. */
   readonly exited: Promise<void>;
-  /** ランナー（または `docker exec`）の pid。 */
+  /** The pid of the runner (or of `docker exec`). */
   readonly pid: number | null;
   stderr(): string;
-  /** stdin を閉じ、SDK の既定手順でランナーを終了させる。 */
+  /** Closes stdin and shuts the runner down with the SDK's default procedure. */
   close(): Promise<void>;
 }
 
 /**
- * `tegata-mcp-run <name>` を SDK の stdio client で起動し、MCP の
- * initialize まで済ませる。`spawnAs` は container 内で起動する場合の置換である。
+ * Starts `tegata-mcp-run <name>` with the SDK's stdio client and completes the MCP
+ * initialize. `spawnAs` is the replacement used when starting inside a container.
  */
 export async function connectRunner(opts: {
   socketPath: string;
@@ -348,7 +351,7 @@ export async function connectRunner(opts: {
   };
 }
 
-/** Promise が timeoutMs 以内に解決すれば true を返す。 */
+/** Returns true if the Promise resolves within timeoutMs. */
 export async function settlesWithin(
   promise: Promise<unknown>,
   timeoutMs: number,
@@ -371,16 +374,16 @@ export async function settlesWithin(
 }
 
 export interface StreamExchange {
-  /** 相手から受け取った行。 */
+  /** The lines received from the peer. */
   lines: string[];
-  /** 相手が接続を閉じたか（timeoutMs 以内）。 */
+  /** Whether the peer closed the connection (within timeoutMs). */
   closed: boolean;
   socket: net.Socket;
 }
 
 /**
- * 127.0.0.1:<port> へ接続して `payload` を書き、`waitFor` が満たされるか
- * 相手が閉じるか timeoutMs が過ぎるまで行を集める。接続は閉じずに返す。
+ * Connects to 127.0.0.1:<port>, writes `payload`, and collects lines until `waitFor` is
+ * satisfied, the peer closes, or timeoutMs passes. The connection is returned without being closed.
  */
 export async function streamExchange(
   port: number,
@@ -393,7 +396,8 @@ export async function streamExchange(
   let buffer = "";
   let closed = false;
   socket.setEncoding("utf8");
-  // 切断後の書き込みで生じる EPIPE / ECONNRESET は「切断された」観測として扱う。
+  // EPIPE / ECONNRESET from a write after disconnection are treated as an observation that the
+  // connection was cut.
   socket.on("error", () => {});
   const done = new Promise<void>((resolve) => {
     socket.on("data", (chunk: string) => {

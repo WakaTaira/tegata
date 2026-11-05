@@ -1,5 +1,5 @@
 // AC-96, AC-97 — Windows operator approval is observable through the pipe.
-// Given / When / Then は各受け入れ条件と 1:1 で対応する。
+// Given / When / Then correspond 1:1 to each acceptance criterion.
 
 import { beforeEach, expect, test } from "vitest";
 import { fixtureSteps } from "../support/harness.js";
@@ -19,7 +19,7 @@ function context(response: unknown, daemon: ApprovalDaemon): string {
 }
 
 test("AC-96: login times out after approval timeout and is audited", async () => {
-  // Given: `approve_operator = true`、`approve_timeout_secs = 3` の foreground デーモン
+  // Given: a foreground daemon with `approve_operator = true` and `approve_timeout_secs = 3`
   const vault = await startApprovalVault();
   let daemon: ApprovalDaemon | undefined;
   try {
@@ -29,7 +29,7 @@ test("AC-96: login times out after approval timeout and is audited", async () =>
     });
     const credId = await daemon.credId();
 
-    // When: interop の pipe client から `login`
+    // When: `login` from the interop pipe client
     const started = Date.now();
     const response = await pipeRpc(daemon.pipeName, "login", {
       cred_id: credId,
@@ -38,7 +38,8 @@ test("AC-96: login times out after approval timeout and is audited", async () =>
     });
     const elapsed = Date.now() - started;
 
-    // Then: 3 s 以上経ってから `APPROVAL_TIMEOUT`、stderr に `approval pending` 行、監査の login 行の outcome が `APPROVAL_TIMEOUT`
+    // Then: `APPROVAL_TIMEOUT` after 3 s or more, an `approval pending` line in stderr, and the
+    // outcome of the audit login line is `APPROVAL_TIMEOUT`
     expect(response.error?.message, context(response, daemon)).toBe(
       "APPROVAL_TIMEOUT",
     );
@@ -59,7 +60,8 @@ test("AC-96: login times out after approval timeout and is audited", async () =>
 });
 
 test("AC-97: interop cannot approve a pending login", async () => {
-  // Given: `approve_operator = true`、`approve_timeout_secs = 20` のデーモンに interop から `login` が保留中
+  // Given: a daemon with `approve_operator = true` and `approve_timeout_secs = 20`, with a `login`
+  // from interop pending
   const vault = await startApprovalVault();
   let daemon: ApprovalDaemon | undefined;
   try {
@@ -73,22 +75,24 @@ test("AC-97: interop cannot approve a pending login", async () => {
       target_url: vault.fixture.url,
       ...fixtureSteps(),
     });
-    // 保留の登録を stderr の pending 行で確かめてから次へ進む。承認ゲートを
-    // 持たないデーモンでは login が先に決着するため、その場合も先へ進む。
+    // Confirm the pending registration through the pending line in stderr before moving on.
+    // A daemon without the approval gate settles the login first, so proceed in that case too.
     const pending = await Promise.race([
       daemon.waitForStderr(/approval pending (\d{6})/, 60_000),
       login.then(() => undefined),
     ]);
     const id = pending?.[1] ?? "000000";
 
-    // When: 別の interop pipe client から `admin_approval_list` と `admin_approval_decide {id, allow: true}`
+    // When: `admin_approval_list` and `admin_approval_decide {id, allow: true}` from another
+    // interop pipe client
     const listed = await pipeRpc(daemon.pipeName, "admin_approval_list", {});
     const decided = await pipeRpc(daemon.pipeName, "admin_approval_decide", {
       id,
       allow: true,
     });
 
-    // Then: どちらも `ADMIN_REQUIRED`、保留中の login は最終的に `APPROVAL_TIMEOUT`（interop は承認を偽造できない）
+    // Then: both are `ADMIN_REQUIRED`, and the pending login ends up as `APPROVAL_TIMEOUT` (interop
+    // cannot forge an approval)
     expect(listed.error?.message, context(listed, daemon)).toBe(
       "ADMIN_REQUIRED",
     );

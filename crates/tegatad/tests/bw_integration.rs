@@ -235,6 +235,84 @@ fn wait_for_daemon(socket_path: &PathBuf) {
     panic!("tegatad did not become ready");
 }
 
+/// An access token that expired in 1970 (`{"alg":"none"}` `{"exp":1}`). bw only decodes it locally to
+/// decide that it has to refresh.
+const EXPIRED_ACCESS_TOKEN: &str = "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.c2ln";
+const REJECTED_REFRESH_TOKEN: &str = "rejected-refresh-token";
+
+/// Sets every `utcDate` in the bw data file weeks into the past, which makes the cached server
+/// config stale.
+fn age_cached_server_config(node: &mut Value) {
+    match node {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if key == "utcDate" {
+                    *value = json!("2020-01-01T00:00:00.000Z");
+                } else {
+                    age_cached_server_config(value);
+                }
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(age_cached_server_config),
+        _ => {}
+    }
+}
+
+/// Puts the provider's bw appdata into the state an install reaches after weeks idle: a stale server
+/// config, an expired access token, and a refresh token the server does not accept.
+fn reject_stored_grant(data_file: &Path) {
+    let contents = std::fs::read_to_string(data_file).expect("read bw data file");
+    let mut data = serde_json::from_str::<Value>(&contents).expect("parse bw data file");
+    age_cached_server_config(&mut data);
+    let fields = data.as_object_mut().expect("bw data file object");
+    let mut replaced = 0;
+    for (key, value) in fields.iter_mut() {
+        if key.ends_with("_token_accessToken") {
+            *value = json!(EXPIRED_ACCESS_TOKEN);
+            replaced += 1;
+        } else if key.ends_with("_token_refreshToken") {
+            *value = json!(REJECTED_REFRESH_TOKEN);
+            replaced += 1;
+        }
+    }
+    assert_eq!(replaced, 2, "bw data file layout changed");
+    std::fs::write(data_file, data.to_string()).expect("write bw data file");
+}
+
+/// After the grant is rejected, the next resolve signs in again within the same request. The real
+/// bw crashes on `invalid_grant` here, which a fake cannot vouch for.
+#[ignore]
+#[test]
+fn bitwarden_cli_provider_logs_in_again_when_unlock_hits_a_rejected_grant() {
+    let stack = TestStack::start();
+    let list = rpc(&stack.socket_path, "list_credentials", json!({}));
+    let totp_id = list["result"]
+        .as_array()
+        .expect("credential list")
+        .iter()
+        .find(|item| item["name"] == "Canary TOTP")
+        .expect("Canary TOTP item")["id"]
+        .clone();
+    let locked = rpc(
+        &stack.socket_path,
+        "lock_vault",
+        json!({ "namespace": "vw" }),
+    );
+    assert_eq!(locked["result"], json!({ "ok": true }));
+    let data_file = stack.directory.join("state/bw-vw/data.json");
+    reject_stored_grant(&data_file);
+
+    let totp = rpc(
+        &stack.socket_path,
+        "get_totp",
+        json!({ "cred_id": totp_id }),
+    );
+
+    assert!(totp["result"]["code"].is_string(), "{totp}");
+    let contents = std::fs::read_to_string(&data_file).expect("read bw data file");
+    assert!(!contents.contains(REJECTED_REFRESH_TOKEN));
+}
+
 /// Every `lock_vault` followed by a resolve runs the full unlock ceremony again:
 /// `bw unlock`, the `bw status` verification and `bw sync`. bw before 2025.12.1
 /// lost its session-key persistence race in roughly a third of these.

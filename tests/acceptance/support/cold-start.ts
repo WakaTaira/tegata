@@ -7,10 +7,14 @@ import { bins, rawRpc } from "./harness.js";
 
 export type FakeBwMode =
   | "always-fail"
+  | "grant-rejected"
+  | "grant-rejected-relogin-fails"
+  | "grant-rejected-stays-logged-in"
   | "invalid-json"
   | "success"
   | "sync-fail"
   | "sync-hang"
+  | "unlock-fail"
   | `fail-until:${number}`;
 
 export interface ColdStartCanaries {
@@ -28,6 +32,7 @@ export interface ColdStartDaemon {
   setBwMode(mode: FakeBwMode): void;
   setBwItemName(name: string): void;
   callLog(): string[];
+  callsNamed(name: string): string[];
   loginCalls(): string[];
   syncCalls(): string[];
   listItemsCalls(): string[];
@@ -46,6 +51,12 @@ cached_items_file="\${FAKE_BW_CACHED_ITEMS_FILE:?}"
 
 printf '%s\\n' "$*" >> "$call_log"
 
+logged_out_marker="$state_file.logged-out"
+current_mode=success
+if [ -f "$state_file" ]; then
+  current_mode=$(sed -n '1p' "$state_file")
+fi
+
 if [ "\${1:-}" = "--version" ]; then
   printf '%s\\n' '2026.09.acceptance'
   exit 0
@@ -59,7 +70,43 @@ if [ "\${1:-}" = "config" ] && [ "\${2:-}" = "server" ]; then
 fi
 
 if [ "\${1:-}" = "login" ] && [ "\${2:-}" = "--check" ]; then
+  # These modes start from an existing login, as a daemon restart or a lock_vault does.
+  case "$current_mode" in
+    grant-rejected*|unlock-fail)
+      if [ ! -e "$logged_out_marker" ]; then
+        printf '%s\\n' 'You are logged in!'
+        exit 0
+      fi
+      ;;
+  esac
   printf 'You are not logged in as %s.\\n' "$FAKE_BW_EMAIL" >&2
+  exit 1
+fi
+
+if [ "\${1:-}" = "unlock" ]; then
+  case "$current_mode" in
+    grant-rejected|grant-rejected-relogin-fails)
+      # bw 2026.8.0 prints the session key, clears its login state, then crashes on the stale server
+      # config refresh, so the exit is 1 and a later logout answers "not logged in".
+      : > "$logged_out_marker"
+      printf '%s\\n' "$FAKE_BW_SESSION"
+      printf "Unable to fetch ServerConfig from %s ErrorResponse {\\n  response: { error: 'invalid_grant' },\\n  statusCode: 400\\n}\\n" "$FAKE_BW_SERVER_URL" >&2
+      exit 1
+      ;;
+    grant-rejected-stays-logged-in)
+      printf "Unable to fetch ServerConfig from %s ErrorResponse {\\n  response: { error: 'invalid_grant' },\\n  statusCode: 400\\n}\\n" "$FAKE_BW_SERVER_URL" >&2
+      exit 1
+      ;;
+    unlock-fail)
+      printf '%s\\n' 'Cryptography error, The decryption operation failed' >&2
+      exit 1
+      ;;
+  esac
+fi
+
+if [ "\${1:-}" = "login" ] && [ "$current_mode" = "grant-rejected-relogin-fails" ]; then
+  # The server answers a wrong password on login with invalid_grant as well.
+  printf '%s\\n' "Username or password is incorrect. invalid_grant" >&2
   exit 1
 fi
 
@@ -96,7 +143,16 @@ if [ "\${1:-}" = "sync" ]; then
   exit 0
 fi
 
-if [ "\${1:-}" = "logout" ] || [ "\${1:-}" = "lock" ]; then
+if [ "\${1:-}" = "logout" ]; then
+  if [ -e "$logged_out_marker" ]; then
+    printf '%s\\n' 'You are not logged in.' >&2
+    exit 1
+  fi
+  : > "$logged_out_marker"
+  exit 0
+fi
+
+if [ "\${1:-}" = "lock" ]; then
   exit 0
 fi
 
@@ -309,6 +365,8 @@ export async function startColdStartDaemon(opts: {
         const args = line.split(/\s+/);
         return args[0] === "login" && args[1] !== "--check";
       }),
+    callsNamed: (name) =>
+      readLines(callLogPath).filter((line) => line.split(/\s+/)[0] === name),
     syncCalls: () =>
       readLines(callLogPath).filter((line) => line.split(/\s+/)[0] === "sync"),
     listItemsCalls: () =>

@@ -175,11 +175,11 @@ Connect a Playwright client to that raw endpoint with `chromium.connectOverCDP` 
 drive the authenticated browser directly. CDP exposes the browser's post-login
 session state, including HttpOnly cookies through `Network.getAllCookies`; the RPC
 response leak scan does not inspect CDP traffic. Keep the `session_id`; it is what
-`logout` takes. `target_id` is the CDP target id of the lease's tab and is advisory.
+`disconnect` takes. `target_id` is the CDP target id of the lease's tab and is advisory.
 
 When a live, non-exclusive browser exists for the same principal (the UNIX socket
 uid, named token, or Windows SID), namespace, and `cred_id`, `login` issues a new
-lease with a new `session_id` and returns the same endpoint. `logout` returns only
+lease with a new `session_id` and returns the same endpoint. `disconnect` returns only
 the caller's lease; the browser closes when its last lease ends. TTL is fixed per
 lease at issuance and a fresh `login` is required to extend it. A shared browser
 also has an absolute lifetime controlled by `browser_max_lifetime_secs` (3600
@@ -492,7 +492,9 @@ finishes as `state: "done"` without ever building or returning a snapshot,
 the same shortcut `login` takes; its audit record carries `cookies:
 "restored"` and `steps_skipped: true`.
 
-## `logout`
+## `disconnect`
+
+Ends tegata's session. It does not sign out of the site.
 
 **Input**
 
@@ -507,9 +509,21 @@ An absent session or a session held by another principal returns `NOT_FOUND`, so
 the daemon does not disclose whether the session exists.
 
 Call it when finished. The caller's lease ends; the CDP endpoint and browser close
-only when that was the last lease. In either case, logout does not invalidate a
-site-side session. Cookies or other session state extracted through CDP remain
-usable until the site invalidates them.
+only when that was the last lease. `{"ok": true}` reports that the lease ended and
+says nothing about the site, because `disconnect` never visits the site:
+
+- The site-side session stays valid. Cookies or other session state extracted
+  through CDP remain usable until the site invalidates them.
+- For a credential in `persist_cookies`, closing the last lease saves the browser's
+  current cookies, so the next `login` or `login_begin` restores them and can finish
+  without signing in again. To make the next login start from the sign-in form, an
+  operator runs `tegatad cookies forget <cred_id>` after `disconnect`.
+
+### `logout`
+
+Deprecated alias of `disconnect`, kept so existing clients keep working, and
+removed in the next minor release. It takes the same input, returns the same
+output, and has the same effect. Its audit records carry `method: "logout"`.
 
 ## `authorize_device`
 
@@ -584,7 +598,7 @@ is relayed to the configured `upstream`'s `<path>` with the configured header
 replaced by the injected value; a request missing the secret, or carrying a
 different session's secret, gets a 404 and never reaches upstream, as does a
 request whose path contains a dot segment, `%2e`, or a backslash. `session_id`
-is what `logout` takes to close the relay.
+is what `disconnect` takes to close the relay.
 
 The proxy session ends at the earlier of its `session_ttl_secs` deadline and the
 `browser_max_lifetime_secs` deadline. The latter is measured from proxy launch.
@@ -596,7 +610,7 @@ Starts are rate-limited like `login`, per caller and `name`: during the backoff
 after a failed start, or after 3 starts in 10 minutes, the call returns
 `RATE_LIMITED`.
 
-The lease this opens behaves like any other session: it has a TTL, `logout`
+The lease this opens behaves like any other session: it has a TTL, `disconnect`
 ends it early, and `lock_vault` closes every proxy in the locked namespace.
 
 For an OAuth proxy whose credential is enabled in `persist_cookies`, the grant's

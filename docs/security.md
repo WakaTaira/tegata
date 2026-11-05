@@ -120,7 +120,7 @@ to container peers as well: sessions owned by another principal return
 
 Eleven methods exist: `status`, `list_credentials`, `login`, `login_begin`,
 `login_step`, `authorize_device`, `open_api_proxy`, `open_mcp_server`,
-`logout`, `get_totp`, `lock_vault`, plus the administrative
+`disconnect` (with its deprecated alias `logout`), `get_totp`, `lock_vault`, plus the administrative
 methods `admin_peer_issue`, `admin_peer_revoke`, `admin_peer_list`, and
 `admin_token_issue`, and on Windows `admin_seal`, `admin_approval_list`, and
 `admin_approval_decide`. Anything else is answered with a JSON-RPC method-not-found
@@ -249,7 +249,7 @@ which is the trade an operator should be making deliberately.
 
 `lock_vault` also terminates the tegata browser sessions in that namespace. This
 does not invalidate a site-side session already extracted by the agent. The same
-applies to `logout`, session TTL expiry, and `browser_max_lifetime_secs`; site-side
+applies to `disconnect`, session TTL expiry, and `browser_max_lifetime_secs`; site-side
 logout and invalidation remain a future concern.
 
 ## TOTP
@@ -348,7 +348,9 @@ audit record of an `authorize_device` or OAuth `open_api_proxy` call carries
 `cookies` (`"restored"` or `"none"`) and `steps_skipped`, as `login` does; cookie
 values never appear in the audit log.
 
-**`lock_vault` does not touch saved cookies.** Locking discards the *unlocked*
+**`disconnect` and `lock_vault` do not remove saved cookies.** Ending a session
+saves its current cookies rather than discarding them, so a later `login` is
+restored from them and the site still sees the same signed-in session. Locking discards the *unlocked*
 vault session material, not files on disk; a saved cookie is only ever read back
 during a `login`, `authorize_device`, or OAuth proxy start that has already
 passed the approval gate and the provider's unlock ceremony, so leaving the file
@@ -357,7 +359,7 @@ in place between locks does not widen what an agent can do with it. To remove sa
 --all` for every saved credential; both are administrative RPCs, gated the same
 way as `peer issue`. Because a live browser session re-exports its cookies when
 it ends, forgetting a credential while its session is still open only clears the
-file until that session's next save — run `logout` first if the intent is to
+file until that session's next save — run `disconnect` first if the intent is to
 remove the saved cookie for good.
 
 ## Stepwise login

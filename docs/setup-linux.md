@@ -338,7 +338,7 @@ forget --all` for every saved credential. `--socket` defaults to the same path a
 `peer issue`, and the RPC behind it (`admin_cookies_forget`) is reachable only to
 `operator_uids` and root, exactly like `peer issue`. It does not end a live
 browser session — that session re-saves its cookies when it closes, so forget a
-credential's cookies for good by running `logout` first.
+credential's cookies for good by running `disconnect` first.
 
 ### `[[providers]]`
 

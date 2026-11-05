@@ -2244,7 +2244,8 @@ async fn handle_request(
         "authorize_device" => authorize_device(request, state, peer).await,
         "open_api_proxy" => open_service::<ApiProxyConfig>(request, state, peer).await,
         "open_mcp_server" => open_service::<McpServerConfig>(request, state, peer).await,
-        "logout" => logout(request, state, peer).await,
+        // logout は disconnect の非推奨の別名であり、次のマイナーリリースで廃止する。
+        "disconnect" | "logout" => disconnect(request, state, peer).await,
         "get_totp" => get_totp(request, state).await,
         "lock_vault" => lock_vault(request, state).await,
         _ => HandledRequest {
@@ -3898,7 +3899,12 @@ async fn approve_by_operator(
         })
 }
 
-async fn logout(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) -> HandledRequest {
+/// 呼び出し元のリースを終え、最後のリースであればブラウザを閉じる。サイト側のセッションには触れない。
+async fn disconnect(
+    request: &RpcRequest,
+    state: SharedState,
+    peer: &PeerIdentity,
+) -> HandledRequest {
     let session_id = match required_string_param(&request.params, "session_id") {
         Ok(session_id) => session_id,
         Err(error) => return classified(request.id.clone(), error),
@@ -5276,8 +5282,8 @@ fn classify_mcp_server_event(
     }
 }
 
-/// サービスのリースを、logout と同じく停止要求と executor の停止で終え、`audit_method` で監査する。
-/// 既に logout などで終えられている場合は何もしない。
+/// サービスのリースを、disconnect と同じく停止要求と executor の停止で終え、`audit_method` で監査する。
+/// 既に disconnect などで終えられている場合は何もしない。
 async fn end_service_lease(state: &SharedState, browser_id: &str, audit_method: &'static str) {
     let browser = take_browser_locked(&mut *state.lock().await, browser_id);
     if let Some(browser) = browser {
@@ -5510,7 +5516,7 @@ fn audit_param_keys(method: &str) -> &'static [&'static str] {
     match method {
         "login" | "login_begin" => &["cred_id", "target_url"],
         "authorize_device" => &["cred_id", "verification_url"],
-        "logout" => &["session_id"],
+        "disconnect" | "logout" => &["session_id"],
         "get_totp" => &["cred_id"],
         "list_credentials" | "lock_vault" => &["namespace"],
         _ => &[],

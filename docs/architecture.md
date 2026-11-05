@@ -208,7 +208,7 @@ not one attempt per step.
 
 The daemon speaks newline-delimited JSON-RPC 2.0. Method dispatch is an explicit
 allowlist — `status`, `list_credentials`, `login`, `login_begin`, `login_step`,
-`authorize_device`, `logout`, `get_totp`,
+`authorize_device`, `disconnect` (and its deprecated alias `logout`), `get_totp`,
 `lock_vault`, `open_api_proxy`, `open_mcp_server`, plus the administrative methods `admin_peer_issue`,
 `admin_peer_revoke`, `admin_peer_list`, and `admin_token_issue`, and on Windows
 `admin_seal`, `admin_approval_list`, and `admin_approval_decide`. Anything else
@@ -290,8 +290,8 @@ has an absolute lifetime of `browser_max_lifetime_secs` (3600 seconds by default
 from its launch, and sharing never extends that deadline. Each lease expires at
 the earlier of its `session_ttl_secs` deadline and the browser deadline. The daemon
 audits all leases as `session_expired` and closes the browser at the absolute
-deadline. A login at or after the deadline starts a new browser. `logout` does the
-same on demand and is idempotent, and `lock_vault` takes down every session belonging
+deadline. A login at or after the deadline starts a new browser. `disconnect` does the
+same on demand, answering `NOT_FOUND` if the lease has already ended, and `lock_vault` takes down every session belonging
 to the namespaces it locks. These actions close tegata's browser only; they do not
 invalidate site-side sessions extracted through CDP. A daemon asked to stop — a service stop request, `SIGTERM`, or
 `SIGINT` — reaps every live executor on its way out, and the executor treats its
@@ -310,7 +310,7 @@ For a credential opted into `persist_cookies`, a saved cookie set travels only
 between the daemon and the executor, never through the broker or the agent. On a
 new, non-shared browser's `login` the daemon reads the saved file and hands the
 cookies to the executor alongside the secret; on a successful login the executor
-hands its current cookies back in the response, and on session end — `logout`,
+hands its current cookies back in the response, and on session end — `disconnect`,
 TTL expiry, or `lock_vault` — the daemon asks the executor to export cookies one
 last time before tearing the browser down. Either exchange is dropped from the
 RPC response, the audit log, and the daemon's stderr; only a `"restored"` /

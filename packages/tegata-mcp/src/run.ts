@@ -95,6 +95,7 @@ function parseOpenMcpServerResult(result: unknown): OpenMcpServerResult {
 /** セッションを閉じる。stream secret やサーバーの出力を一切含まない best-effort な後始末。 */
 async function logout(sessionId: string): Promise<void> {
   try {
+    // 旧版のデーモンと組み合わせても確実に閉じるよう、別名の廃止までは logout を呼ぶ。
     await callDaemon("logout", { session_id: sessionId });
   } catch {
     // デーモンが既に失効させている等、ここでの失敗は中継の終了自体を妨げない。

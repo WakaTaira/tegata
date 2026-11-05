@@ -74,7 +74,7 @@ optional. `login_cred_id` and `steps` use the same browser-login configuration a
 `authorize_device`; `success_selector` identifies successful approval and
 `failure_selector` can identify a rejected approval. tegata logs into the
 provider in a browser using the vault credential and approves the device grant.
-The grant lives exactly as long as the lease. On `logout`, `lock_vault`, or TTL
+The grant lives exactly as long as the lease. On `disconnect`, `lock_vault`, or TTL
 expiry, tegata best-effort revokes it when `revocation_url` is configured, then
 closes the lease. Grants are not persisted and every lease obtains a new grant.
 
@@ -154,8 +154,8 @@ during the 2, 5, then 15 second backoff after a failed start, returns
 ## Session lifetime
 
 `open_api_proxy` opens a lease exactly like `login` does: it has a TTL, it is
-torn down by `logout`, and `lock_vault` closes every proxy in the locked
-namespace along with everything else. Once the lease ends — by `logout`, TTL
+torn down by `disconnect`, and `lock_vault` closes every proxy in the locked
+namespace along with everything else. Once the lease ends — by `disconnect`, TTL
 expiry, or `lock_vault` — the relay stops accepting connections; the path
 secret that leaked into a log or a saved configuration is worthless once its
 session is gone.

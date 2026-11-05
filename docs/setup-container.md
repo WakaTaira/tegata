@@ -141,7 +141,7 @@ TEGATA_SOCKET=/run/tegata-bridge/bridge.sock TEGATA_BRIDGE=1 \
 Use the `tegata-mcp` Nix package, or run `node packages/tegata-mcp/dist/index.js`
 when using a checkout.
 
-The MCP tools (`list_credentials`, `login`, `logout`, `get_totp`, `lock_vault`)
+The MCP tools (`list_credentials`, `login`, `disconnect`, `get_totp`, `lock_vault`)
 behave exactly as for a host agent. `login` returns an endpoint such as
 `ws://127.0.0.1:<port>/...`; that `127.0.0.1` is inside the container and
 identifies the bridge's CDP tunnel.

@@ -159,7 +159,7 @@ Elevated only, over the same administrative RPC gate as `peer issue`. Removes
 the saved [persistent-cookie](security.md#persistent-cookies) file for one
 credential, or every saved credential with `--all`. It does not end a live
 browser session — that session re-saves its cookies when it closes, so forget a
-credential's cookies for good by running `logout` first.
+credential's cookies for good by running `disconnect` first.
 
 ### Seal the master password
 

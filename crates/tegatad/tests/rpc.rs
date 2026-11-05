@@ -785,7 +785,8 @@ fn sigterm_reaps_live_session_executors() {
     );
 }
 
-/// 指定 method の監査行が現れるまで短時間待ってから読む（ファイル I/O の遅延に対する保険）。
+/// Waits briefly until the audit line for the given method appears, then reads it (a safeguard
+/// against file I/O delay).
 fn read_audit_log(daemon: &Daemon, method: &str) -> String {
     let path = daemon.directory.join("state/audit.log");
     let needle = format!("\"method\":\"{method}\"");
@@ -802,8 +803,9 @@ fn read_audit_log(daemon: &Daemon, method: &str) -> String {
     }
 }
 
-/// 監査行は RPC 応答より前にファイルへ書き終わっていなければならない。応答を受け取った
-/// 直後に待たずに読み、その要求の行が必ず存在することを多数回の往復で確かめる。
+/// The audit line must be fully written to the file before the RPC response. Reading immediately
+/// after receiving the response without waiting, this verifies over many round trips that the line
+/// for that request always exists.
 #[test]
 fn audit_record_is_on_disk_before_the_response_arrives() {
     let daemon = Daemon::start();

@@ -1,7 +1,8 @@
-//! 操作者承認の保留キューである。
+//! Pending queue for operator approvals.
 //!
-//! 承認を要する要求はここに保留として登録され、管理 RPC 経由の決定か
-//! タイムアウトまで待機する。キュー自体はプラットフォームに依存しない。
+//! A request that needs approval is registered here as pending and waits for
+//! either a decision through the admin RPC or a timeout. The queue itself is
+//! platform independent.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,14 +11,15 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 
-/// 操作者が読み上げて入力できる長さに収めるため、保留 id は 6 桁の 10 進数とする。
+/// A pending id is a 6-digit decimal number so that an operator can read it aloud and type it.
 const ID_SPACE: u128 = 1_000_000;
 
-/// 保留ごとに一意な識別子の発番元である。id は決定後に再利用されうるため、
-/// 取り除く対象が自分の登録したエントリであることをこの値で確かめる。
+/// Source of identifiers unique to each pending entry. Ids can be reused after a
+/// decision, so this value confirms that the entry being removed is the one this
+/// waiter registered.
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(0);
 
-/// 承認を求める要求の内容である。
+/// The content of a request that asks for approval.
 pub(crate) struct ApprovalRequest {
     pub(crate) method: String,
     pub(crate) cred_id: String,
@@ -25,7 +27,7 @@ pub(crate) struct ApprovalRequest {
     pub(crate) principal: String,
 }
 
-/// `list` が返す保留の写しである。
+/// A copy of a pending entry as returned by `list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingSummary {
     pub(crate) id: String,
@@ -36,14 +38,14 @@ pub(crate) struct PendingSummary {
     pub(crate) age_secs: u64,
 }
 
-/// 待機が承認以外で終わった理由である。
+/// The reason a wait ended without approval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ApprovalError {
     Denied,
     Timeout,
 }
 
-/// `decide` に渡された id が保留中に存在しないことを表す。
+/// Indicates that the id passed to `decide` is not among the pending entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NotFound;
 
@@ -61,8 +63,8 @@ pub(crate) struct ApprovalQueue {
     entries: Entries,
 }
 
-/// 登録済みの保留である。破棄時にキューから取り除かれるため、待機側が
-/// 途中で打ち切られても保留が残らない。
+/// A registered pending entry. It is removed from the queue on drop, so no entry
+/// remains even if the waiting side is cancelled midway.
 pub(crate) struct Pending {
     id: String,
     token: u64,
@@ -75,7 +77,8 @@ impl ApprovalQueue {
         Self::default()
     }
 
-    /// 保留を登録する。id は同時保留の間で一意になるまで再生成する。
+    /// Registers a pending entry. The id is regenerated until it is unique among concurrent pending
+    /// entries.
     pub(crate) fn register(&self, request: ApprovalRequest) -> Pending {
         self.register_with(request, random_id)
     }
@@ -111,7 +114,7 @@ impl ApprovalQueue {
         }
     }
 
-    /// 保留中の要求を登録の古い順に返す。
+    /// Returns the pending requests in order of registration, oldest first.
     pub(crate) fn list(&self) -> Vec<PendingSummary> {
         let entries = lock(&self.entries);
         let mut pending = entries
@@ -123,8 +126,8 @@ impl ApprovalQueue {
         pending.into_iter().map(|(_, summary)| summary).collect()
     }
 
-    /// 保留に決定を与える。取り除きと通知を同じロック区間で行うことで、
-    /// 同時に起きたタイムアウト側が決定の有無を取りこぼさないようにする。
+    /// Gives a decision to a pending entry. Removal and notification happen within
+    /// the same lock scope so that a concurrent timeout cannot miss the decision.
     pub(crate) fn decide(&self, id: &str, allow: bool) -> Result<(), NotFound> {
         let mut entries = lock(&self.entries);
         let entry = entries.remove(id).ok_or(NotFound)?;
@@ -138,7 +141,8 @@ impl Pending {
         &self.id
     }
 
-    /// 決定を待つ。`limit` を過ぎた場合は保留を取り除いて `Timeout` を返す。
+    /// Waits for a decision. Once `limit` has passed, removes the pending entry and returns
+    /// `Timeout`.
     pub(crate) async fn wait(mut self, limit: Duration) -> Result<(), ApprovalError> {
         let Some(mut decision) = self.decision.take() else {
             return Err(ApprovalError::Denied);
@@ -146,13 +150,13 @@ impl Pending {
         match tokio::time::timeout(limit, &mut decision).await {
             Ok(Ok(true)) => Ok(()),
             Ok(Ok(false)) => Err(ApprovalError::Denied),
-            // 送信側が決定なしに失われた場合は承認されていないものとして扱う。
+            // If the sender is lost without a decision, treat the request as not approved.
             Ok(Err(_)) => Err(ApprovalError::Denied),
             Err(_) => {
                 if self.remove_own() {
                     return Err(ApprovalError::Timeout);
                 }
-                // 取り除く前に決定が確定していた場合は、その決定に従う。
+                // If a decision was already settled before the removal, follow that decision.
                 match decision.try_recv() {
                     Ok(true) => Ok(()),
                     Ok(false) => Err(ApprovalError::Denied),
@@ -162,8 +166,9 @@ impl Pending {
         }
     }
 
-    /// 自分が登録したエントリがまだ残っていれば取り除き、取り除いたかを返す。
-    /// 決定済みの id に後から登録された別の保留は取り除かない。
+    /// Removes the entry this waiter registered if it is still present, and returns
+    /// whether it was removed. A different pending entry registered later under an
+    /// already decided id is not removed.
     fn remove_own(&self) -> bool {
         let mut entries = lock(&self.entries);
         let own = entries
@@ -198,8 +203,9 @@ fn random_id() -> u128 {
 }
 
 fn lock(entries: &Entries) -> std::sync::MutexGuard<'_, HashMap<String, Entry>> {
-    // 表の更新は挿入・削除の単一操作のみで途中状態を残さないため、
-    // 他のスレッドのパニックで汚染されても中身をそのまま使う。
+    // Table updates are single insert or remove operations and leave no intermediate
+    // state, so the contents are used as they are even if another thread's panic has
+    // poisoned the lock.
     entries
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

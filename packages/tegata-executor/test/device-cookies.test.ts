@@ -39,7 +39,8 @@ const secret = {
 
 type RecordedRequest = { method: string; path: string; cookieNames: string[] };
 
-// device cookie または sid セッションでログイン状態を判定する、承認ページ付きの最小のサイト。
+// A minimal site with an approval page that decides the login state from a device cookie or an sid
+// session.
 const site = {
   posts: 0,
   approvals: 0,
@@ -70,7 +71,8 @@ const authorizationForm = `
   </form>
 `;
 
-// 実行中に cookie を発行し、既定のログイン段がユーザー名欄を探す評価の中で、その値を含む例外を投げるページ。
+// A page that issues a cookie during execution and throws an exception containing its value inside
+// the evaluation where the default login step looks for the username field.
 const leakingLoginForm = `
   ${loginForm}
   <script>
@@ -82,7 +84,8 @@ const leakingLoginForm = `
   </script>
 `;
 
-// 非表示の password 欄の後に可視のログインフォームがあり、承認の入力欄が遅れて現れる未認証のページ。
+// An unauthenticated page with a visible login form after a hidden password field, and an approval
+// input field that appears late.
 const hiddenPasswordFirstPage = `
   <input name="decoy" type="password" hidden>
   ${loginForm}
@@ -159,8 +162,8 @@ beforeAll(async () => {
       }
       return;
     }
-    // 完全版 Chromium はページ読み込み後に favicon を自動で取得するため、
-    // 遷移の順序を検査する記録から除外します。
+    // The full Chromium fetches the favicon automatically after the page loads,
+    // so it is excluded from the record used to check the navigation order.
     if (route !== "GET /favicon.ico") {
       site.requests.push({
         method: request.method ?? "",
@@ -241,7 +244,7 @@ afterEach(async () => {
   await cleanupResources();
 });
 
-/** 1 回の処理が標準出力へ書く応答行（イベント行を除く）を読み取る。 */
+/** Reads the response line (excluding event lines) that one run writes to standard output. */
 async function captureResponse(
   action: () => Promise<void>,
 ): Promise<Record<string, unknown>> {
@@ -267,7 +270,10 @@ async function captureResponse(
   return responses[0];
 }
 
-/** 1 回の処理が標準エラー出力へ書く内容を読み取る。標準出力の応答は captureResponse で読む。 */
+/**
+ * Reads what one run writes to standard error. The standard output response is read with
+ * captureResponse.
+ */
 async function captureStderr(action: () => Promise<unknown>): Promise<string> {
   const chunks: string[] = [];
   const spy = vi.spyOn(process.stderr, "write").mockImplementation(((
@@ -303,7 +309,7 @@ function cookieNames(response: Record<string, unknown>): string[] {
 }
 
 function persistentCookies(response: Record<string, unknown>): Cookie[] {
-  // デーモンと同じく、セッション cookie を除いたものを次回へ渡す。
+  // As the daemon does, pass the cookies minus the session cookies to the next run.
   return (response.cookies as Cookie[]).filter(({ expires }) => expires !== -1);
 }
 
@@ -422,7 +428,8 @@ describe("authorize_device with persistent cookies", {
     expect(site.posts).toBe(1);
     expect(site.approvals).toBe(1);
     expect(site.requests[0]).toMatchObject({ method: "GET", path: "/open" });
-    // 省略した承認ページと、ログイン段の後のやり直しで 2 回開く。
+    // Opened twice: once with the approval page skipped, and once for the retry after the login
+    // step.
     expect(
       site.requests.filter(
         ({ method, path }) => method === "GET" && path === "/open",
@@ -456,7 +463,8 @@ describe("authorize_device with persistent cookies", {
     expect(response).toMatchObject({ ok: true, steps_skipped: false });
     expect(site.posts).toBe(1);
     expect(site.approvals).toBe(1);
-    // 可視の password 欄が承認の入力欄より先に見つかり、省略を試みずにログイン段へ進む。
+    // The visible password field is found before the approval input field, so the flow proceeds to
+    // the login step without attempting to skip it.
     expect(site.requests.slice(0, 2)).toMatchObject([
       { method: "GET", path: "/mixed" },
       { method: "GET", path: "/login" },

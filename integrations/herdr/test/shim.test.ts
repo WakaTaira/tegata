@@ -421,7 +421,7 @@ async function waitForJson(
         return (await response.json()) as Record<string, unknown>;
       }
     } catch {
-      // ローカル endpoint の起動を待ちます。
+      // Wait for the local endpoint to start.
     }
     await sleep(50);
   }

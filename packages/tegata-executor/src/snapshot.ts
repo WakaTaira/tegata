@@ -1,18 +1,23 @@
-/** 段階ログインのスナップショット（値を除いた aria スナップショット）を組み立て、secret の検査と上限の適用を行う。 */
+/**
+ * Builds the stepwise login snapshot (an aria snapshot with values removed), checks it for secrets,
+ * and applies the size limit.
+ */
 
-/** 直列化したスナップショットの上限（バイト）。 */
+/** Upper bound on the serialized snapshot (bytes). */
 export const SNAPSHOT_MAX_BYTES = 64 * 1024;
-// page をすべて削っても上限を超える場合に、title と url を切り詰める長さ（文字数）。
+// Length (in characters) to which title and url are truncated when the limit is still exceeded
+// after dropping all of page.
 const FALLBACK_TITLE_CHARS = 256;
 const FALLBACK_URL_CHARS = 2048;
 
 export const USERNAME_MASK = "[username]";
-/** 値を除いた欄の見出し行に付ける印。 */
+/** Marker appended to the heading line of a field whose value was removed. */
 export const FILLED_MARK = " [filled]";
 
 /**
- * 値を持つ役割。Playwright は input・textarea の値を explicit role によらず出力するため、page から集めた
- * input・textarea の role 属性値と合わせて値の除去の対象とする。
+ * Roles that carry a value. Playwright emits the value of input and textarea regardless of explicit
+ * role, so these are combined with the
+ * role attribute values of input and textarea collected from the page as targets for value removal.
  */
 export const VALUE_ROLES: readonly string[] = [
   "textbox",
@@ -22,7 +27,7 @@ export const VALUE_ROLES: readonly string[] = [
   "combobox",
 ];
 
-/** ref の形式（`e<n>`、iframe 内は `f<n>e<n>`）。 */
+/** Format of a ref (`e<n>`, or `f<n>e<n>` inside an iframe). */
 export const REF_PATTERN = /^(?:f\d+)?e\d+$/u;
 export const MAX_REF_LENGTH = 32;
 
@@ -35,8 +40,9 @@ export type Snapshot = {
 };
 
 /**
- * page から受け取ったスナップショットの素材。roles は page から集めた input・textarea の role 属性値であり、
- * 集められなかった場合の "all" は全ての役割を値の除去の対象とすることを表す。
+ * Material for the snapshot received from the page. roles holds the role attribute values of input
+ * and textarea collected from the page,
+ * and "all", used when they could not be collected, means every role is a target for value removal.
  */
 export type RawAriaSnapshot = {
   url: string;
@@ -45,19 +51,24 @@ export type RawAriaSnapshot = {
   roles: readonly string[] | "all";
 };
 
-/** 検査済みのスナップショットと、その page の見出し行が持つ ref の集合。 */
+/** The checked snapshot, and the set of refs held by the heading lines of its page. */
 export type FinalizedSnapshot = {
   snapshot: Snapshot;
   refs: Set<string>;
 };
 
-/** スナップショットが既知の secret を含むか、未知の形式であるために返せないことを表す。 */
+/**
+ * Indicates that the snapshot contains a known secret, or cannot be returned because its format is
+ * unknown.
+ */
 export class SnapshotRejectedError extends Error {}
 
 /**
- * page 内で DOM の変更が `quietMs` 途切れるのを最大 `maxMs` 待つ。途切れた場合は true を返す。
- * page 側の組み込みオブジェクトの改変で例外が生じた場合は、落ち着いたと判定できないため false を返す。
- * page へシリアライズされるため、外部の識別子を参照してはならない。
+ * Waits inside the page for up to `maxMs` for DOM changes to stop for `quietMs`. Returns true if
+ * they stopped.
+ * Returns false if an exception caused by tampering with the page's built-in objects occurs,
+ * because settling cannot be determined.
+ * It is serialized into the page, so it must not reference external identifiers.
  */
 export function waitForDomQuietInPage({
   quietMs,
@@ -96,9 +107,11 @@ export function waitForDomQuietInPage({
 }
 
 /**
- * page 内で、入力した欄がまだ文書にあって値が空でなければ空にし、input / change を発火する。
- * 値や例外の文言を page の外へ持ち出さないよう、戻り値は持たず例外はすべて捕捉する。
- * page へシリアライズされるため、外部の識別子を参照してはならない。
+ * Inside the page, clears the entered field if it is still in the document and its value is not
+ * empty, then fires input / change.
+ * It has no return value and catches every exception, so that neither the value nor exception text
+ * is carried out of the page.
+ * It is serialized into the page, so it must not reference external identifiers.
  */
 export function clearFieldInPage(element: Element): void {
   try {
@@ -118,11 +131,14 @@ export function clearFieldInPage(element: Element): void {
     element.dispatchEvent(new view.Event("input", { bubbles: true }));
     element.dispatchEvent(new view.Event("change", { bubbles: true }));
   } catch {
-    // 欄の消去の失敗は、呼び出し側でブラウザの破棄または以後の検査に委ねる。
+    // A failure to clear the field is left to the caller's browser teardown or subsequent checks.
   }
 }
 
-/** aria スナップショットの 1 行。keyEnd は KEY の末尾（単引用符で包まれていれば閉じ `'` の位置）である。 */
+/**
+ * One line of the aria snapshot. keyEnd is the end of KEY (the position of the closing `'` if it is
+ * wrapped in single quotes).
+ */
 export type SnapshotLine = {
   raw: string;
   indent: number;
@@ -136,7 +152,7 @@ export type SnapshotLine = {
 };
 
 const LINE_PATTERN = /^( *)- ([\s\S]+)$/u;
-// KEY は role( NAME)?( [attr])* であり、NAME は JSON 文字列か、引用なしの /…/ である。
+// KEY is role( NAME)?( [attr])*, and NAME is a JSON string or an unquoted /…/.
 const ROLE_PATTERN = /^\/?[a-z][a-z0-9-]*/u;
 const JSON_NAME_PATTERN = /^ ("(?:[^"\\]|\\[\s\S])*")/u;
 const ATTRS_PATTERN = /^(?: \[[a-z]+(?:=[A-Za-z0-9-]+)?\])*/u;
@@ -145,12 +161,15 @@ const ATTR_PATTERN = /\[([^\]]*)\]/gu;
 type ParsedKey = { role: string; name?: string; attrs: string[] };
 type KeyMatch = ParsedKey & { length: number };
 
-/** KEY の後ろに続く部分が `: VALUE`・`:`・行末のいずれかであるかを返す。 */
+/** Returns whether what follows KEY is one of `: VALUE`, `:`, or end of line. */
 function isLineTail(tail: string): boolean {
   return tail === "" || tail === ":" || /^: [\s\S]+$/u.test(tail);
 }
 
-/** 名前の後ろ（at 以降）の属性部を読み、その後ろが isTail を満たす場合に KEY を返す。 */
+/**
+ * Reads the attribute section after the name (from at), and returns KEY if what follows satisfies
+ * isTail.
+ */
 function keyWithAttrs(
   text: string,
   role: string,
@@ -166,9 +185,12 @@ function keyWithAttrs(
 }
 
 /**
- * 引用なしの /…/ の名前を持つ KEY を読む。名前の終端は、その後ろが属性部と isTail に合う最初の `/` とする。
- * 引用なしの KEY では名前が `: ` を含まず（含めば KEY ごと単引用符で包まれる）、単引用符の KEY では後ろに何も続かないため、
- * 名前の内側の `/` を終端とすると、名前の末尾の `/` が属性部か isTail に掛かって合わない。よってこの終端は一意である。
+ * Reads a KEY whose name is an unquoted /…/. The name ends at the first `/` after which the
+ * attribute section and isTail match.
+ * In an unquoted KEY the name does not contain `: ` (if it did, the whole KEY would be wrapped in
+ * single quotes), and in a single-quoted KEY nothing follows it,
+ * so if a `/` inside the name were taken as the end, the trailing `/` of the name would fail to
+ * match the attribute section or isTail. This end is therefore unique.
  */
 function regexNameKey(
   text: string,
@@ -193,7 +215,10 @@ function regexNameKey(
   return undefined;
 }
 
-/** KEY を先頭から読み、読んだ長さとともに返す。KEY の後ろが isTail を満たさなければ undefined を返す。 */
+/**
+ * Reads KEY from the start and returns it with the length read. Returns undefined if what follows
+ * KEY does not satisfy isTail.
+ */
 function parseKeyPrefix(
   text: string,
   isTail: (tail: string) => boolean,
@@ -217,7 +242,10 @@ function parseKeyPrefix(
   return keyWithAttrs(text, role, undefined, role.length, isTail);
 }
 
-/** 単引用符で包まれた KEY の閉じ `'` の位置を返す。内側の `'` は `''` で表される。 */
+/**
+ * Returns the position of the closing `'` of a KEY wrapped in single quotes. An inner `'` is
+ * represented as `''`.
+ */
 function closingQuoteIndex(body: string): number | undefined {
   for (let index = 1; index < body.length; index += 1) {
     if (body[index] !== "'") continue;
@@ -230,7 +258,9 @@ function closingQuoteIndex(body: string): number | undefined {
   return undefined;
 }
 
-/** `^(I)- KEY(: VALUE)?$` の形の行を読む。形に合わなければ undefined を返す。 */
+/**
+ * Reads a line of the form `^(I)- KEY(: VALUE)?$`. Returns undefined if the line does not match.
+ */
 export function parseSnapshotLine(raw: string): SnapshotLine | undefined {
   const match = LINE_PATTERN.exec(raw);
   if (match === null) return undefined;
@@ -269,7 +299,10 @@ export function parseSnapshotLine(raw: string): SnapshotLine | undefined {
   };
 }
 
-/** ariaSnapshot の出力を行に分ける。形に合わない行が 1 行でもあれば SnapshotRejectedError を送出する。 */
+/**
+ * Splits the ariaSnapshot output into lines. Throws SnapshotRejectedError if even one line does not
+ * match the form.
+ */
 export function parseSnapshotLines(aria: string): SnapshotLine[] {
   if (aria === "") return [];
   return aria.split("\n").map((raw) => {
@@ -279,7 +312,10 @@ export function parseSnapshotLines(aria: string): SnapshotLine[] {
   });
 }
 
-/** ノードの見出し行ではない行（`- text:` と `- /url:` 等の属性行）かを返す。 */
+/**
+ * Returns whether the line is not a node heading line (an attribute line such as `- text:` or `-
+ * /url:`).
+ */
 function isPseudoLine(line: SnapshotLine): boolean {
   return line.role === "text" || line.role.startsWith("/");
 }
@@ -294,7 +330,10 @@ function isTextLine(line: SnapshotLine): boolean {
   );
 }
 
-/** 値を除いた見出し行を書き戻す。inline の値は削り、filled なら KEY の末尾に印を付ける。 */
+/**
+ * Writes back a heading line with its value removed. An inline value is dropped, and a filled field
+ * gets a marker at the end of KEY.
+ */
 function renderValueHeading(line: SnapshotLine, filled: boolean): string {
   return `${line.raw.slice(0, line.keyEnd)}${filled ? FILLED_MARK : ""}${
     line.quoted ? "'" : ""
@@ -302,8 +341,10 @@ function renderValueHeading(line: SnapshotLine, filled: boolean): string {
 }
 
 /**
- * 対象役割の見出し行から値を除く。inline の値を削り、子を持つ行では直下（インデント +2）の `- text:` 行を削る。
- * `- /…` の行・`- option` の行・それより深い行には触れない。空でない値を削った行に印を付ける。
+ * Removes values from the heading lines of target roles. Drops an inline value, and for a line with
+ * children drops the `- text:` line directly below (indent +2).
+ * Lines `- /…`, lines `- option`, and deeper lines are left untouched. A line whose non-empty value
+ * was dropped gets the marker.
  */
 export function removeValues(
   lines: readonly SnapshotLine[],
@@ -313,7 +354,7 @@ export function removeValues(
     !isPseudoLine(line) && isValueRole(line.role);
   const filled = new Set<number>();
   const dropped = new Set<number>();
-  // 子を持つ祖先の行の添字を、インデントの浅い順に積む。
+  // Stacks the indices of ancestor lines that have children, from shallowest indent.
   const ancestors: number[] = [];
   lines.forEach((line, index) => {
     while (
@@ -346,7 +387,10 @@ export function removeValues(
   });
 }
 
-/** page の見出し行の KEY の属性部にある ref を集める。名前・値・`- text:` の中の `[ref=…]` は数えない。 */
+/**
+ * Collects the refs in the attribute section of KEY on the heading lines of the page. A `[ref=…]`
+ * inside a name, value, or `- text:` is not counted.
+ */
 export function collectRefs(page: string): Set<string> {
   const refs = new Set<string>();
   if (page === "") return refs;
@@ -375,7 +419,7 @@ function tryEncodeURIComponent(value: string): string | undefined {
   try {
     return encodeURIComponent(value);
   } catch {
-    // 対になっていないサロゲートを含む値は符号化できないため、その形を検索しない。
+    // A value containing an unpaired surrogate cannot be encoded, so that form is not searched.
     return undefined;
   }
 }
@@ -391,8 +435,10 @@ function nonEmptyUnique(values: Array<string | undefined>): string[] {
 }
 
 /**
- * secret の検索に用いる形（生・HTML エスケープ・encodeURIComponent・全バイト percent 符号化・base64・hex）。
- * base64 は末尾の `=` を除いた形で検索し、padding の有無によらず一致させる。大小文字の区別がある符号化は両方を含める。
+ * Forms used to search for a secret (raw, HTML-escaped, encodeURIComponent, percent-encoding of
+ * every byte, base64, hex).
+ * base64 is searched without the trailing `=` so that it matches regardless of padding.
+ * Case-sensitive encodings include both cases.
  */
 export function secretForms(value: string): string[] {
   if (value === "") return [];
@@ -413,7 +459,10 @@ export function secretForms(value: string): string[] {
   ]);
 }
 
-/** Playwright の空白の正規化（U+200B・U+00AD の除去、前後の空白の除去、連続する空白の 1 個への置換）。 */
+/**
+ * Playwright's whitespace normalization (removing U+200B and U+00AD, trimming leading and trailing
+ * whitespace, and replacing runs of whitespace with one space).
+ */
 function normalizeWhitespace(value: string): string {
   return value
     .replace(/[\u200b\u00ad]/gu, "")
@@ -421,7 +470,8 @@ function normalizeWhitespace(value: string): string {
     .replace(/\s+/gu, " ");
 }
 
-// Playwright の YAML 二重引用符のエスケープ。namedControls が偽なら、改行とタブ以外の制御文字を \xNN とする。
+// Playwright's YAML double-quote escaping. If namedControls is false, control characters other than
+// newline and tab become \xNN.
 function yamlEscape(value: string, namedControls: boolean): string {
   const named: Record<string, string> = namedControls
     ? { "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t" }
@@ -443,9 +493,12 @@ function yamlEscape(value: string, namedControls: boolean): string {
 }
 
 /**
- * aria スナップショットに表示される形（表示形）。N は空白の正規化、J は名前の位置の JSON 文字列の内側、
- * Y は値と `- text:` の位置の YAML 二重引用符の内側であり、それぞれの `'` を `''` にした単引用符キーの形を加える。
- * Y は Playwright の実装（\b・\f・\r を名前付きで表す）と、制御文字を \xNN で表す形の両方を含める。
+ * Forms displayed in the aria snapshot (display forms). N is whitespace normalization, J is the
+ * inside of a JSON string in the name position,
+ * and Y is the inside of YAML double quotes in the value and `- text:` positions; the single-quoted
+ * key forms with each `'` doubled to `''` are added.
+ * Y includes both Playwright's implementation (which writes \b, \f, and \r by name) and the form
+ * that writes control characters as \xNN.
  */
 export function displayForms(value: string): string[] {
   const normalized = normalizeWhitespace(value);
@@ -462,7 +515,10 @@ export function displayForms(value: string): string[] {
   ]);
 }
 
-/** 検査に用いる形。従来の 8 形を生の値と正規化した値の両方に適用し、表示形を加える。 */
+/**
+ * Forms used for the check. The previous 8 forms are applied to both the raw and the normalized
+ * value, and the display forms are added.
+ */
 export function rejectionForms(value: string): string[] {
   if (value === "") return [];
   return nonEmptyUnique([
@@ -472,7 +528,10 @@ export function rejectionForms(value: string): string[] {
   ]);
 }
 
-/** username のマスク対象の形（生・HTML エスケープ・URL 符号化と表示形）を長い順に返す。 */
+/**
+ * Returns the forms to mask for the username (raw, HTML-escaped, URL-encoded, and display forms) in
+ * descending length.
+ */
 function usernameForms(username: string): string[] {
   if (username === "") return [];
   return nonEmptyUnique([
@@ -483,7 +542,7 @@ function usernameForms(username: string): string[] {
   ]).sort((left, right) => right.length - left.length);
 }
 
-/** username の完全一致を `[username]` に置換する。 */
+/** Replaces exact occurrences of the username with `[username]`. */
 export function maskUsername(value: string, username: string): string {
   return usernameForms(username).reduce(
     (masked, form) => masked.replaceAll(form, USERNAME_MASK),
@@ -497,7 +556,10 @@ export type SnapshotSecrets = {
   totpCodes: readonly string[];
 };
 
-/** 検査対象の secret のうち、いずれかの形が文字列のいずれかに完全一致で含まれるかを返す。 */
+/**
+ * Returns whether any form of any scanned secret is contained, as an exact match, in any of the
+ * strings.
+ */
 export function containsSecret(
   values: readonly string[],
   secrets: readonly string[],
@@ -516,8 +578,9 @@ function serializedBytes(snapshot: Snapshot): number {
 }
 
 /**
- * 64 KiB の上限を超える場合に、truncated を付けたうえで上限に収まるまで page を末尾から行単位で削る。
- * page をすべて削っても超える場合は title と url を切り詰める。
+ * When the 64 KiB limit is exceeded, sets truncated and drops page from the end line by line until
+ * it fits.
+ * If it still exceeds the limit after dropping all of page, title and url are truncated.
  */
 function fitSnapshot(snapshot: Snapshot): Snapshot {
   if (serializedBytes(snapshot) <= SNAPSHOT_MAX_BYTES) return snapshot;
@@ -527,7 +590,8 @@ function fitSnapshot(snapshot: Snapshot): Snapshot {
     page: lines.slice(0, count).join("\n"),
     truncated: true,
   });
-  // 行数に対して直列化の長さは単調に増えるため、収まる最大の行数を二分探索で求める。
+  // Serialized length grows monotonically with the line count, so the largest line count that fits
+  // is found by binary search.
   let low = 0;
   let high = lines.length;
   while (low < high) {
@@ -546,7 +610,10 @@ function fitSnapshot(snapshot: Snapshot): Snapshot {
   return fitted;
 }
 
-/** 値の除去の対象となる役割かを返す判定を作る。role 属性値は空白で区切られた個々の役割の名前に分ける。 */
+/**
+ * Creates a predicate for whether a role is a target for value removal. A role attribute value is
+ * split into individual role names by whitespace.
+ */
 function valueRoles(
   roles: RawAriaSnapshot["roles"],
 ): (role: string) => boolean {
@@ -561,10 +628,12 @@ function valueRoles(
 }
 
 /**
- * ariaSnapshot の出力から値を除き、username をマスクして上限を適用し、page の見出し行が持つ ref を集める。
- * 形に合わない行がある場合と、password または入力した TOTP コードのいずれかの形が、マスク前・マスク後
- * （いずれも切り詰め前の全文）・直列化結果のいずれかに完全一致で含まれる場合は SnapshotRejectedError を送出する。
- * 部分一致は判定しない。
+ * Removes values from the ariaSnapshot output, masks the username, applies the limit, and collects
+ * the refs held by the heading lines of the page.
+ * Throws SnapshotRejectedError if a line does not match the form, or if any form of the password or
+ * the entered TOTP code is contained as an exact match in the
+ * pre-mask text, the post-mask text (both before truncation, in full), or the serialized result.
+ * Partial matches are not checked.
  */
 export function finalizeSnapshot(
   raw: RawAriaSnapshot,

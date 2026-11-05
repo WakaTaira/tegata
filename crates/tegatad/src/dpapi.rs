@@ -80,7 +80,8 @@ pub(crate) fn unseal(path: &Path) -> Result<Secret, Error> {
     }
 }
 
-/// バイト列をサービスアカウントの DPAPI で封印する。入力の複製は封印後に消去する。
+/// Seals a byte string with the DPAPI of the service account. The copy of the input is wiped after
+/// sealing.
 pub(crate) fn protect(plaintext: &[u8]) -> Result<Vec<u8>, Error> {
     let mut plaintext = Zeroizing::new(plaintext.to_vec());
     let length = match u32::try_from(plaintext.len()) {
@@ -112,7 +113,7 @@ pub(crate) fn protect(plaintext: &[u8]) -> Result<Vec<u8>, Error> {
     output.copy()
 }
 
-/// `protect` で封印したバイト列を開封する。平文は破棄時に消去される。
+/// Opens a byte string sealed by `protect`. The plaintext is wiped on drop.
 pub(crate) fn unprotect(sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>, Error> {
     let mut sealed = Zeroizing::new(sealed.to_vec());
     let length = match u32::try_from(sealed.len()) {

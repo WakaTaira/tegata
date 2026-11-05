@@ -23,10 +23,11 @@ interface OAuthDeviceCode {
 const sessions = new Map<string, true>();
 const deviceCodes = new Map<string, boolean>();
 const oauthDeviceCodes = new Map<string, OAuthDeviceCode>();
-// 現在有効な token。access token は失効時刻、refresh token は対応する access token を値とする。
+// Currently valid tokens. An access token maps to its expiry time; a refresh token maps to its
+// access token.
 const activeAccessTokens = new Map<string, number>();
 const activeRefreshTokens = new Map<string, string>();
-// 失効・期限切れにかかわらず発行したすべての token の履歴（/oauth/state で公開する）。
+// History of every token issued, whether revoked or expired (exposed at /oauth/state).
 const issuedAccessTokens: string[] = [];
 const issuedRefreshTokens: string[] = [];
 const oauthRevokedTokens = new Set<string>();
@@ -1907,8 +1908,10 @@ function handleDeviceCookieRequest(
 }
 
 /**
- * /fingerprint/ の文書応答。ページの JS は読み込み完了後に観測値を記録 API へ送る。
- * 観測値は応答ごとの nonce で、サーバが記録した文書リクエストのヘッダと対応づける。
+ * Document response for /fingerprint/. After loading completes, the page's JS sends its observed
+ * values to the recording API.
+ * The observed values are matched to the headers of the document request that the server recorded,
+ * using a per-response nonce.
  */
 function fingerprintPage(
   nonce: string,
@@ -1965,7 +1968,7 @@ function headerValue(value: string | string[] | undefined): string | null {
   return Array.isArray(value) ? value.join(", ") : value;
 }
 
-/** /fingerprint/ への文書リクエストを記録し、対応づけ用の nonce を返す。 */
+/** Records a document request to /fingerprint/ and returns a nonce for matching. */
 function recordFingerprintRequest(
   request: IncomingMessage,
   loggedIn: boolean,
@@ -2027,9 +2030,11 @@ function handleFingerprintObservation(
 }
 
 /**
- * ブラウザの名乗りを観測する経路（Issue #60）を処理する。該当しない要求には false を返す。
- * 未ログインでもログインフォームとともに観測スクリプトを返すため、どの context で
- * 開かれたタブでも観測値が記録される。
+ * Handles the route that observes what the browser announces (Issue #60). Returns false for
+ * requests that do not match.
+ * The observation script is served together with the login form even when not logged in, so the
+ * observed values are recorded
+ * for a tab opened in any context.
  */
 function handleFingerprintRequest(
   request: IncomingMessage,
@@ -2057,7 +2062,10 @@ function handleFingerprintRequest(
   return true;
 }
 
-/** OAuth 認可サーバーと保護 API の経路を処理する。該当しない要求には false を返す。 */
+/**
+ * Handles the OAuth authorization server and protected API routes. Returns false for requests that
+ * do not match.
+ */
 function handleOAuthRequest(
   request: IncomingMessage,
   response: ServerResponse,

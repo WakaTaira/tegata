@@ -60,7 +60,10 @@ type Started = {
   close: () => Promise<void>;
 };
 
-/** release が false の場合、起動応答前の状態を再現するためイベントの保留を解かずに返す。 */
+/**
+ * When release is false, returns without releasing the held event, to reproduce the state before
+ * the startup response.
+ */
 async function start(mode = "serve", release = true): Promise<Started> {
   const logDir = await mkdtemp(path.join(os.tmpdir(), "tegata-mcp-test-"));
   const logPath = path.join(logDir, "received.log");
@@ -487,7 +490,8 @@ describe("startMcpServer", () => {
     await waitFor(() => server.events.length === 1);
     client.socket.end();
     await waitFor(() => server.events.length === 2);
-    // EOF による自発的な終了と SIGTERM のどちらが先に効くかは競合するため、終了の通知のみを確かめる。
+    // Whether a voluntary exit on EOF or SIGTERM takes effect first is a race, so only the exit
+    // notification is checked.
     expect(server.events[1]).toMatchObject({ action: "exit" });
   });
 

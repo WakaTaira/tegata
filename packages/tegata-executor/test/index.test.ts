@@ -316,7 +316,8 @@ describe("authorize_device protocol", () => {
       click: async (selector: string) => {
         actions.push(`click:${selector}`);
         if (selector === "#approve") {
-          // 拒否表示が遅れて描画され、次の操作のセレクタ待ちが先に timeout した状況を模す。
+          // Imitates a situation where the rejection display is rendered late and the selector wait
+          // of the next operation timed out first.
           rejectionRendered = true;
           const timeout = new Error("locator.click: Timeout 10000ms exceeded");
           timeout.name = "TimeoutError";

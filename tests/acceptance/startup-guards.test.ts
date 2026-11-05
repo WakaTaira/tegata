@@ -57,15 +57,15 @@ async function layOutDaemon(opts: { tcpBind?: string }): Promise<GuardDaemon> {
 }
 
 test("AC-74: a state_dir that is not 0700 refuses startup", async () => {
-  // Given: state_dir を 0755 にしたデーモン
+  // Given: a daemon whose state_dir is 0755
   const layout = await layOutDaemon({});
   try {
     fs.chmodSync(layout.stateDir, 0o755);
 
-    // When: 起動
+    // When: start
     const exit = await runDaemonUntilExit(layout.configPath, layout.daemonDir);
 
-    // Then: exit code 非ゼロ、stderr に state_dir の権限違反の理由
+    // Then: non-zero exit code, and stderr gives the state_dir permission violation as the reason
     expect(
       exit.code,
       `daemon kept running with a 0755 state_dir; stderr: ${exit.stderr}`,
@@ -79,13 +79,13 @@ test("AC-74: a state_dir that is not 0700 refuses startup", async () => {
 });
 
 test("AC-75: listen.tcp.bind = 0.0.0.0 refuses startup", async () => {
-  // Given: listen.tcp.bind = "0.0.0.0" の config
+  // Given: a config with listen.tcp.bind = "0.0.0.0"
   const layout = await layOutDaemon({ tcpBind: "0.0.0.0" });
   try {
-    // When: 起動
+    // When: start
     const exit = await runDaemonUntilExit(layout.configPath, layout.daemonDir);
 
-    // Then: exit code 非ゼロ、stderr に bind 拒否の理由
+    // Then: non-zero exit code, and stderr gives the bind rejection as the reason
     expect(
       exit.code,
       `daemon kept running bound to 0.0.0.0; stderr: ${exit.stderr}`,

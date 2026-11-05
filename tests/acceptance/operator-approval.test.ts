@@ -1,5 +1,5 @@
 // AC-95 — operator approval is a Windows-only configuration feature.
-// Given / When / Then は設計書の AC-95 と 1:1 で対応する。
+// Given / When / Then correspond 1:1 to AC-95 in the design document.
 
 import fs from "node:fs";
 import os from "node:os";
@@ -8,7 +8,7 @@ import { expect, test } from "vitest";
 import { runDaemonUntilExit } from "./support/phase4.js";
 
 test("AC-95: approve_operator is rejected on Linux because it is Windows-only", async () => {
-  // Given: `approve_operator = true` を含む config
+  // Given: a config containing `approve_operator = true`
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tegata-approval-"));
   const state = path.join(dir, "state");
   fs.mkdirSync(state, { mode: 0o700 });
@@ -27,10 +27,10 @@ test("AC-95: approve_operator is rejected on Linux because it is Windows-only", 
     ].join("\n") + "\n",
   );
   try {
-    // When: デーモンを起動
+    // When: start the daemon
     const exit = await runDaemonUntilExit(config, dir);
 
-    // Then: exit code 非ゼロ、stderr に `approve_operator` が Windows 専用である理由
+    // Then: non-zero exit code, and stderr gives the reason that `approve_operator` is Windows-only
     expect(exit.code).not.toBeNull();
     expect(exit.code).not.toBe(0);
     expect(exit.stderr).toMatch(/approve_operator/);

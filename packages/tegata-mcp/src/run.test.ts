@@ -9,7 +9,10 @@ import { PassThrough, Writable } from "node:stream";
 import { afterEach, describe, expect, test } from "vitest";
 import { run } from "./run.js";
 
-/** 書き込みを同期的に文字列へ蓄積する Writable。'data' イベントの非同期性を避けるために使う。 */
+/**
+ * A Writable that accumulates writes into a string synchronously. Used to avoid the asynchrony of
+ * the 'data' event.
+ */
 class CapturingWritable extends Writable {
   text = "";
   override _write(
@@ -33,9 +36,10 @@ afterEach(() => {
 });
 
 /**
- * テスト用のストリーム三つ組。stdout / stderr は書き込まれたテキストを蓄積する。
- * stderr は run.ts から write() のみ呼ばれるため、Writable の非同期な仕組みを介さない
- * 最小限のモックにして、書き込みを即座に観測できるようにする。
+ * A triple of streams for tests. stdout / stderr accumulate the written text.
+ * run.ts only calls write() on stderr, so it is a minimal mock that does not go through Writable's
+ * asynchronous machinery
+ * so that writes can be observed immediately.
  */
 function fakeStreams() {
   const stdin = new PassThrough();
@@ -59,12 +63,12 @@ function fakeStreams() {
   };
 }
 
-/** 偽デーモンが応答を返さずに接続を切ることを表す。 */
+/** Represents the fake daemon closing the connection without returning a response. */
 const DROP = Symbol("drop");
 
 /**
- * open_mcp_server（と、指定すれば logout / bridge_open_tunnel）に応答する偽デーモン。
- * extra が DROP を返したメソッドには応答せず接続を切る。
+ * A fake daemon that answers open_mcp_server (and logout / bridge_open_tunnel if specified).
+ * For a method for which extra returned DROP, it closes the connection without responding.
  */
 async function startFakeDaemon(
   openResult: unknown,
@@ -115,7 +119,7 @@ async function startFakeDaemon(
   };
 }
 
-/** 最初の行（stream secret）を受け取った時点で解決する中継先の TCP サーバー。 */
+/** A relay-target TCP server that resolves once it receives the first line (the stream secret). */
 async function startRelayTarget() {
   const tcpServer = createTcpServer();
   let firstLine = "";

@@ -79,7 +79,7 @@ async function startUpstream(
   return { url: `http://${urlHost}:${port}${basePath}`, received, close };
 }
 
-/** IPv6 を無効化した環境では ::1 へ bind できないため、事前に確かめる。 */
+/** ::1 cannot be bound in an environment with IPv6 disabled, so check beforehand. */
 function ipv6LoopbackAvailable(): Promise<boolean> {
   return new Promise((resolve) => {
     const probe = net.createServer();
@@ -103,7 +103,7 @@ async function startProxy(
   return { proxy, events };
 }
 
-/** fetch はヘッダを正規化するため、生の要求を送れる http.request を用いる。 */
+/** fetch normalizes headers, so use http.request, which can send a raw request. */
 function rawRequest(
   port: number,
   requestPath: string,
@@ -191,7 +191,7 @@ describe("API proxy secret path", () => {
     expect(wrong.status).toBe(404);
     expect(suffixed.status).toBe(404);
     expect(upstream.received).toEqual([]);
-    // secret を持たない要求は監査の増幅に使えないよう、イベントを出さない。
+    // A request without a secret emits no event so that it cannot be used to amplify the audit log.
     expect(events).toEqual([]);
   });
 
@@ -356,7 +356,7 @@ describe("API proxy forwarding", () => {
     expect(response.headers["x-upstream"]).toBe("kept");
     expect(response.headers["x-upstream-hop"]).toBeUndefined();
     expect(response.headers["proxy-authenticate"]).toBeUndefined();
-    // プロキシ自身の接続に対する Keep-Alive は Node が付与するため、上流の値だけを検査する。
+    // Node adds Keep-Alive to the proxy's own connection, so only the upstream value is checked.
     expect(response.headers["keep-alive"]).not.toBe("timeout=99");
   });
 

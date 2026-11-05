@@ -413,7 +413,7 @@ describe("limit", () => {
     const kept = snapshot.page.split("\n");
     expect(kept.length).toBeLessThan(rows.length);
     expect(kept).toEqual(rows.slice(0, kept.length));
-    // 1 行足すと上限を超える位置で切られている。
+    // Cut at a position where adding one more line would exceed the limit.
     const oneMore = {
       ...snapshot,
       page: rows.slice(0, kept.length + 1).join("\n"),
@@ -701,7 +701,7 @@ describe("capture from a page", { timeout: 60_000 }, () => {
       expect(parseSnapshotLine(raw), raw).toBeDefined();
     }
     expect(refs.size).toBeGreaterThan(5);
-    // 台帳の ref は、取得の直後に aria-ref で解決できる。
+    // A ref from the ledger can be resolved by aria-ref right after the snapshot is taken.
     for (const ref of refs) {
       expect(await page.locator(`aria-ref=${ref}`).count(), ref).toBe(1);
     }
@@ -745,7 +745,7 @@ describe("capture from a page", { timeout: 60_000 }, () => {
   });
 
   test("returns the unquoted /…/ names Playwright writes", async () => {
-    // Playwright は / で始まり / で終わる名前を、JSON 文字列にせず引用なしで出力する。
+    // Playwright emits a name that starts and ends with / unquoted, not as a JSON string.
     await page.setContent(
       '<a href="/x">/</a> <a href="/y">/root/</a> <input aria-label="/path/" value="typed-value-marker">',
     );

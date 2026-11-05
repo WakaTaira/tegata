@@ -1,4 +1,5 @@
-// 各テストバイナリが `mod common;` で取り込むため、使われないヘルパが出るバイナリでも警告にしない。
+// Each test binary pulls this in with `mod common;`, so unused helpers must not produce warnings in
+// binaries that do not use them.
 #![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Write};
@@ -10,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// デーモンが state_dir に 0700・自己所有・非 symlink を要求するため、テストの state dir はこのヘルパで作成する。
+/// The daemon requires state_dir to be 0700, self-owned, and not a symlink, so tests create their
+/// state dir with this helper.
 pub(crate) fn create_private_dir(path: &Path) {
     std::fs::create_dir_all(path).expect("create state directory");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
@@ -47,10 +49,12 @@ pub(crate) fn try_rpc(socket_path: &PathBuf, method: &str, params: Value) -> Opt
     serde_json::from_str(&response).ok()
 }
 
-/// 偽 executor の本文の前に置く JS。デーモンは spawn モードの起動時に executor を 1 回起動し、
-/// `hello` を送ってから `shutdown` で終了させる。各偽 executor は行ハンドラの先頭で
-/// `answerStartupProbe(request)` を呼び、真が返れば以降の処理を飛ばす。
-/// これにより、起動時検査の往復を偽 executor の本体の処理と記録へ混ぜない。
+/// JS placed before the body of a fake executor. In spawn mode the daemon starts the executor once
+/// at startup,
+/// sends `hello`, and then ends it with `shutdown`. Each fake executor calls
+/// `answerStartupProbe(request)` at the top of its line handler and skips the rest of the handling
+/// if it returns true.
+/// This keeps the startup-check round trip out of the fake executor's own handling and records.
 const STARTUP_PROBE_PRELUDE: &str = r#"
 let startupProbeActive = false;
 const answerStartupProbe = (request) => {
@@ -68,7 +72,8 @@ const answerStartupProbe = (request) => {
 };
 "#;
 
-/// 起動時検査にだけ答える偽 executor の本文。リース要求を受けないテストで、実際の executor を起動させないために用いる。
+/// Body of a fake executor that answers only the startup check. Used by tests that send no lease
+/// requests, to avoid starting the real executor.
 const PROBE_ONLY_EXECUTOR: &str = r#"
 const readline = require("node:readline");
 const rl = readline.createInterface({ input: process.stdin });
@@ -77,12 +82,12 @@ rl.on("line", (line) => {
 });
 "#;
 
-/// 偽 executor の本文の前に、起動時検査へ答える前置きを付けた JS を返す。
+/// Returns JS that prefixes the fake executor body with the preamble answering the startup check.
 pub(crate) fn fake_executor_source(script: &str) -> String {
     format!("{STARTUP_PROBE_PRELUDE}{script}")
 }
 
-/// 起動時検査にだけ答える偽 executor を `directory` に書き、そのパスを返す。
+/// Writes a fake executor that answers only the startup check to `directory` and returns its path.
 pub(crate) fn write_probe_only_executor(directory: &Path) -> PathBuf {
     let path = directory.join("probe-executor.js");
     std::fs::write(&path, fake_executor_source(PROBE_ONLY_EXECUTOR))
@@ -90,7 +95,7 @@ pub(crate) fn write_probe_only_executor(directory: &Path) -> PathBuf {
     path
 }
 
-/// `status` に結果が返るまで最大 5 秒待つ。
+/// Waits up to 5 seconds until `status` returns a result.
 pub(crate) fn wait_for_status(socket_path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {

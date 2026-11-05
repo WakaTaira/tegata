@@ -52,8 +52,8 @@ async function caught(promise: Promise<unknown>): Promise<unknown> {
   );
 }
 
-// フォーカス奪取型のサイト（Issue #43）を模す。パスワード欄がフォーカスを得ると
-// ユーザー名欄へフォーカスを戻すため、フォーカス経由の入力ではユーザー名欄へ秘密が追記される。
+// Imitates a focus-stealing site (Issue #43). When the password field gains focus,
+// focus returns to the username field, so input via focus appends the secret to the username field.
 const focusStealingForm = `
   <form onsubmit="event.preventDefault(); window.submitted = true;">
     <input id="user" type="text">

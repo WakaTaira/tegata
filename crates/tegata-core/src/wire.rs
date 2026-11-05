@@ -70,7 +70,8 @@ pub struct ExecutorHelloResponse {
     pub ok: bool,
     pub uid: Option<u32>,
     pub pid: u32,
-    /// `ok` が偽のときに executor が示す、人が読むための拒否理由。古い executor は送らない。
+    /// Human-readable refusal reason the executor reports when `ok` is false. Older executors do
+    /// not send it.
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -103,8 +104,8 @@ pub struct ExecutorAuthorizeDeviceRequest {
     pub success_selector: String,
     pub failure_selector: Option<String>,
     pub secret: ExecutorSecret,
-    /// ログイン段の前に復元する保管済みの永続 cookie（Playwright の `Cookie` 形）。
-    /// 永続化対象外の資格、または保管済みの cookie が無い場合は null とする。
+    /// Stored persistent cookies restored before the login steps (Playwright `Cookie` shape).
+    /// Null for credentials that are not persisted, or when no cookies are stored.
     pub cookies: Option<Vec<Value>>,
 }
 
@@ -128,14 +129,14 @@ pub struct ExecutorResponse {
     pub target_id: Option<String>,
 }
 
-/// Executor に新しいリース用タブを要求するメッセージ。
+/// Message asking the executor for a new lease tab.
 #[derive(Serialize)]
 pub struct ExecutorLeaseRequest {
     pub op: &'static str,
     pub id: u64,
 }
 
-/// Executor のタブを閉じるメッセージ。
+/// Message closing an executor tab.
 #[derive(Serialize)]
 pub struct ExecutorReleaseRequest {
     pub op: &'static str,
@@ -143,7 +144,7 @@ pub struct ExecutorReleaseRequest {
     pub target_id: String,
 }
 
-/// Executor のリース操作に対する応答。
+/// Response to an executor lease operation.
 #[derive(Deserialize)]
 pub struct ExecutorLeaseResponse {
     pub id: Option<u64>,
@@ -152,16 +153,18 @@ pub struct ExecutorLeaseResponse {
     pub error: Option<String>,
 }
 
-/// `open_api_proxy` RPC のパラメータ。agent は `[[api_proxy]]` の名前でのみ選び、上流は指定できない。
+/// Parameters of the `open_api_proxy` RPC. The agent selects only by the `[[api_proxy]]` name and
+/// cannot specify the upstream.
 #[derive(Deserialize)]
 pub struct OpenApiProxyParams {
     pub name: String,
 }
 
-/// 専用の executor 接続で注入プロキシのリスナーを起動する要求。
+/// Request to start the injection proxy listener on a dedicated executor connection.
 ///
-/// `header_value` は解決済みの秘密を含むため、executor へ書き込む以外の用途（ログ・監査）に出してはならない。
-/// 破棄時に消去されるよう `Zeroizing` で保持する。
+/// `header_value` contains a resolved secret, so it must not be used for anything other than
+/// writing to the executor (no logging or auditing).
+/// It is held in `Zeroizing` so that it is erased on drop.
 #[derive(Serialize)]
 pub struct ExecutorApiProxyStartRequest {
     pub op: &'static str,
@@ -179,7 +182,7 @@ pub struct ExecutorApiProxyStartRequest {
     pub oauth: Option<ExecutorApiProxyOAuth>,
 }
 
-/// `api_proxy_start` の OAuth 設定。
+/// OAuth settings of `api_proxy_start`.
 #[derive(Serialize)]
 pub struct ExecutorApiProxyOAuth {
     pub client_id: String,
@@ -192,16 +195,18 @@ pub struct ExecutorApiProxyOAuth {
     pub success_selector: String,
     pub failure_selector: Option<String>,
     pub secret: ExecutorApiProxyOAuthSecret,
-    /// ブラウザログインの前に復元する保管済みの永続 cookie（Playwright の `Cookie` 形）。
-    /// 永続化対象外の資格、または保管済みの cookie が無い場合は null とする。
+    /// Stored persistent cookies restored before the browser login (Playwright `Cookie` shape).
+    /// Null for credentials that are not persisted, or when no cookies are stored.
     pub cookies: Option<Vec<Value>>,
 }
 
-/// OAuth のブラウザログイン資格。直列化後も秘密の保持領域をゼロ化する。
+/// OAuth browser login credential. The secret storage is zeroized even after serialization.
 ///
-/// `login` の `ExecutorSecret` は、executor への書き込みの直前に要求を組み立てる閉包の中で作られる。
-/// これに対しこちらは、デーモンが解決済み資格を破棄した後も executor の起動を待つ間保持されるため、
-/// `Zeroizing` で持つ。
+/// The `ExecutorSecret` of `login` is created inside the closure that builds the request,
+/// immediately before writing to the executor.
+/// This one, in contrast, is kept while waiting for the executor to start, even after the daemon
+/// has discarded the resolved credential,
+/// so it is held in `Zeroizing`.
 #[derive(Serialize)]
 pub struct ExecutorApiProxyOAuthSecret {
     #[serde(serialize_with = "serialize_zeroizing")]
@@ -212,7 +217,8 @@ pub struct ExecutorApiProxyOAuthSecret {
     pub totp: Option<Zeroizing<String>>,
 }
 
-/// `Zeroizing<String>` を文字列として直列化する。zeroize の serde 機能に依存しないための変換である。
+/// Serializes a `Zeroizing<String>` as a string. This conversion avoids depending on the serde
+/// feature of zeroize.
 fn serialize_zeroizing<S: serde::Serializer>(
     value: &Zeroizing<String>,
     serializer: S,
@@ -220,7 +226,7 @@ fn serialize_zeroizing<S: serde::Serializer>(
     serializer.serialize_str(value.as_str())
 }
 
-/// `Option<Zeroizing<String>>` を、値があれば文字列、無ければ null として直列化する。
+/// Serializes an `Option<Zeroizing<String>>` as a string if present, or null if absent.
 fn serialize_optional_zeroizing<S: serde::Serializer>(
     value: &Option<Zeroizing<String>>,
     serializer: S,
@@ -231,7 +237,7 @@ fn serialize_optional_zeroizing<S: serde::Serializer>(
     }
 }
 
-/// `api_proxy_start` への応答。成功時は loopback のポートと path secret を持つ。
+/// Response to `api_proxy_start`. On success it carries the loopback port and the path secret.
 #[derive(Deserialize)]
 pub struct ExecutorApiProxyStartResponse {
     pub id: Option<u64>,
@@ -241,16 +247,19 @@ pub struct ExecutorApiProxyStartResponse {
     pub error: Option<String>,
 }
 
-/// executor 接続 1 本を占有するサービスを止める要求。`op` は `api_proxy_stop`（注入プロキシのリスナーを
-/// 閉じる）または `mcp_server_stop`（MCP サーバーを終了させ、中継のリスナーと一時ディレクトリを片付ける）である。
+/// Request to stop a service that occupies one executor connection. `op` is `api_proxy_stop`
+/// (closes the injection proxy listener)
+/// or `mcp_server_stop` (terminates the MCP server and cleans up the relay listener and the
+/// temporary directory).
 #[derive(Serialize)]
 pub struct ExecutorServiceStopRequest {
     pub op: &'static str,
     pub id: u64,
 }
 
-/// プロキシ経由の要求 1 件ごとに executor が書くイベント行。`id` を持たないため、
-/// 応答待ちの要求と照合されることはない。`path` は path secret と query を除去済みである。
+/// Event line the executor writes for each request that passes through the proxy. It has no `id`,
+/// so it is never matched against a request awaiting a response. `path` has the path secret and the
+/// query removed.
 #[derive(Deserialize)]
 pub struct ExecutorApiProxyRequestEvent {
     pub event: String,
@@ -259,24 +268,27 @@ pub struct ExecutorApiProxyRequestEvent {
     pub status: u16,
 }
 
-/// OAuth トークンの状態変化を executor が書くイベント行。
+/// Event line the executor writes when the state of an OAuth token changes.
 #[derive(Deserialize)]
 pub struct ExecutorApiProxyOAuthTokenEvent {
     pub event: String,
     pub action: String,
 }
 
-/// `open_mcp_server` RPC のパラメータ。agent は `[[mcp_server]]` の名前でのみ選び、コマンド・引数・環境変数は指定できない。
+/// Parameters of the `open_mcp_server` RPC. The agent selects only by the `[[mcp_server]]` name and
+/// cannot specify the command, arguments, or environment variables.
 #[derive(Deserialize)]
 pub struct OpenMcpServerParams {
     pub name: String,
 }
 
-/// 専用の executor 接続で stdio MCP サーバーを起動する要求。
+/// Request to start a stdio MCP server on a dedicated executor connection.
 ///
-/// `env` はプレースホルダを置換済みの値であり、`scan` は漏洩検査の対象文字列である。いずれも解決済みの
-/// 秘密を含むため、executor へ書き込む以外の用途（ログ・監査）に出してはならない。破棄時に消去されるよう
-/// `Zeroizing` で保持し、`Debug` は導出しない。
+/// `env` holds values with placeholders already substituted, and `scan` holds the strings subject
+/// to leak scanning. Both contain resolved
+/// secrets, so they must not be used for anything other than writing to the executor (no logging or
+/// auditing). They are held in
+/// `Zeroizing` so that they are erased on drop, and `Debug` is not derived.
 #[derive(Serialize)]
 pub struct ExecutorMcpServerStartRequest {
     pub op: &'static str,
@@ -289,10 +301,11 @@ pub struct ExecutorMcpServerStartRequest {
     pub scan: Vec<Zeroizing<String>>,
 }
 
-/// `mcp_server_start` への応答。成功時は loopback のポートと stream secret を持つ。
+/// Response to `mcp_server_start`. On success it carries the loopback port and the stream secret.
 ///
-/// デーモンは失敗を分類せず一律に `INTERNAL` とするため、executor が添える `error` は読まない
-/// （未知のフィールドとして無視される）。
+/// The daemon does not classify failures and uniformly reports `INTERNAL`, so the `error` that the
+/// executor attaches is not read
+/// (it is ignored as an unknown field).
 #[derive(Deserialize)]
 pub struct ExecutorMcpServerStartResponse {
     pub id: Option<u64>,
@@ -301,8 +314,10 @@ pub struct ExecutorMcpServerStartResponse {
     pub stream_secret: Option<String>,
 }
 
-/// MCP サーバーの状態変化を executor が書くイベント行。`id` を持たないため、応答待ちの要求と照合されることはない。
-/// `exit_code` は `exit` でのみ意味を持ち、シグナルで終了した場合は null となる。
+/// Event line the executor writes when the state of an MCP server changes. It has no `id`, so it is
+/// never matched against a request awaiting a response.
+/// `exit_code` is meaningful only for `exit`, and is null when the process was terminated by a
+/// signal.
 #[derive(Deserialize)]
 pub struct ExecutorMcpServerEvent {
     pub event: String,
@@ -311,7 +326,7 @@ pub struct ExecutorMcpServerEvent {
     pub exit_code: Option<i64>,
 }
 
-/// 値が `Zeroizing<String>` の対応表を、文字列の対応表として直列化する。
+/// Serializes a map whose values are `Zeroizing<String>` as a map of strings.
 fn serialize_zeroizing_map<S: serde::Serializer>(
     value: &BTreeMap<String, Zeroizing<String>>,
     serializer: S,
@@ -319,7 +334,7 @@ fn serialize_zeroizing_map<S: serde::Serializer>(
     serializer.collect_map(value.iter().map(|(key, value)| (key, value.as_str())))
 }
 
-/// `Zeroizing<String>` の列を、文字列の配列として直列化する。
+/// Serializes a sequence of `Zeroizing<String>` as an array of strings.
 fn serialize_zeroizing_list<S: serde::Serializer>(
     value: &[Zeroizing<String>],
     serializer: S,

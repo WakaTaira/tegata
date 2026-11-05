@@ -22,7 +22,7 @@ import readline from "node:readline";
 const logPath = process.argv[2];
 const token = process.env.TOKEN ?? "";
 
-// ログは受信確認（AC-139 / AC-140）のためだけに用い、TOKEN を含めない。
+// The log is used only to confirm receipt (AC-139 / AC-140) and does not contain TOKEN.
 function log(record) {
   if (logPath === undefined || logPath === "") return;
   fs.appendFileSync(logPath, `${JSON.stringify(record)}\n`);
@@ -92,7 +92,7 @@ input.on("line", (line) => {
     send({ id: null, error: { code: -32700, message: "parse error" } });
     return;
   }
-  // id を持たない通知（notifications/initialized 等）には応答しない。
+  // Do not respond to notifications without an id (such as notifications/initialized).
   if (request === null || typeof request !== "object" || !("id" in request))
     return;
   send({ id: request.id, ...handle(request) });

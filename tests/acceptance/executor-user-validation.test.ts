@@ -24,10 +24,10 @@ interface ForegroundResult {
 }
 
 /**
- * デーモンをフォアグラウンドで起動し、終了（成功・失敗いずれか）まで待つ。
- * `startDaemon`（harness.ts）はソケット出現までの成功前提のため、起動失敗を
- * 検証したいここでは使えない。10 秒以内に終了しなければタイムアウト失敗と
- * みなして kill する。
+ * Starts the daemon in the foreground and waits until it exits (success or failure).
+ * `startDaemon` (harness.ts) assumes the socket eventually appears, so it cannot be
+ * used here, where startup failure is the subject. If the daemon does not exit within
+ * 10 seconds, it is treated as a timeout failure and killed.
  */
 async function runForeground(configPath: string): Promise<ForegroundResult> {
   const child: ChildProcess = spawn(bins().tegatad, ["--config", configPath], {
@@ -49,7 +49,7 @@ async function runForeground(configPath: string): Promise<ForegroundResult> {
   }
 }
 
-/** `executor_socket` を足した config.toml を書き、そのパスを返す。 */
+/** Writes a config.toml with `executor_socket` added and returns its path. */
 function writeConfigWithExecutorSocket(executorSocket: string): {
   daemonDir: string;
   configPath: string;
@@ -76,8 +76,8 @@ function writeConfigWithExecutorSocket(executorSocket: string): {
 }
 
 /**
- * `{"op":"hello"}` に対して、指定した uid で応答するダミー executor サーバー
- * を UDS 上に立てる。1 行読み、1 行返して接続を閉じる。
+ * A dummy executor server on a UDS that answers `{"op":"hello"}` with the given uid.
+ * It reads one line, returns one line, and closes the connection.
  */
 function startHelloServer(uid: number): {
   socketPath: string;
@@ -109,7 +109,10 @@ function startHelloServer(uid: number): {
   };
 }
 
-/** executor entry の解決。`bins()` と同じ流儀（env 優先、無ければ既定パス）。 */
+/**
+ * Resolves the executor entry. Follows the same convention as `bins()` (env first, otherwise the
+ * default path).
+ */
 function executorEntry(): string {
   return (
     process.env.TEGATA_EXECUTOR_ENTRY ??
@@ -118,17 +121,17 @@ function executorEntry(): string {
 }
 
 test("AC-55a: executor_socket whose hello reports the daemon's own uid is refused at startup", async () => {
-  // Given: hello にテスト実行 uid で応答する UDS サーバーがあり、config の
-  // executor_socket がそれを指す
+  // Given: a UDS server answers hello with the test-runner uid, and the config's
+  // executor_socket points to it
   const hello = startHelloServer(os.userInfo().uid);
   const { daemonDir, configPath } = writeConfigWithExecutorSocket(
     hello.socketPath,
   );
   try {
-    // When: デーモンを起動する
+    // When: start the daemon
     const result = await runForeground(configPath);
 
-    // Then: 非ゼロで終了し、stderr に該当文言を含む
+    // Then: exits non-zero, and stderr contains the expected message
     expect(
       result.code,
       `expected a non-zero exit; stderr: ${result.stderr}`,
@@ -144,15 +147,15 @@ test("AC-55a: executor_socket whose hello reports the daemon's own uid is refuse
 });
 
 test("AC-55b: executor_socket pointing at a nonexistent path is refused at startup", async () => {
-  // Given: executor_socket に存在しないパスを書いた config
+  // Given: a config whose executor_socket is a nonexistent path
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tegata-no-socket-"));
   const noSuchSocket = path.join(dir, "no-such.sock");
   const { daemonDir, configPath } = writeConfigWithExecutorSocket(noSuchSocket);
   try {
-    // When: デーモンを起動する
+    // When: start the daemon
     const result = await runForeground(configPath);
 
-    // Then: 非ゼロで終了し、stderr に該当文言を含む
+    // Then: exits non-zero, and stderr contains the expected message
     expect(
       result.code,
       `expected a non-zero exit; stderr: ${result.stderr}`,
@@ -165,7 +168,7 @@ test("AC-55b: executor_socket pointing at a nonexistent path is refused at start
 });
 
 test("AC-55c: the executor answers hello with its own uid and pid", async () => {
-  // Given: 実 executor entry を stdio パイプで起動した
+  // Given: the real executor entry started over stdio pipes
   const child = spawn(process.execPath, [executorEntry()], {
     stdio: ["pipe", "pipe", "inherit"],
   });
@@ -178,10 +181,11 @@ test("AC-55c: the executor answers hello with its own uid and pid", async () => 
       );
     });
 
-    // When: {"op":"hello"} を 1 行送る
+    // When: send one line {"op":"hello"}
     child.stdin.write(`${JSON.stringify({ op: "hello" })}\n`);
 
-    // Then: 1 行の応答が ok: true、uid はテスト実行 uid、pid は子プロセスの pid
+    // Then: the one-line response has ok: true, the uid is the test-runner uid, and the pid is the
+    // child process pid
     const line = await responseLine;
     const response = JSON.parse(line) as {
       ok: boolean;
@@ -197,16 +201,16 @@ test("AC-55c: the executor answers hello with its own uid and pid", async () => 
 });
 
 test("AC-55d: the executor exits cleanly on stdin EOF", async () => {
-  // Given: 実 executor entry を stdio パイプで起動した
+  // Given: the real executor entry started over stdio pipes
   const child = spawn(process.execPath, [executorEntry()], {
     stdio: ["pipe", "ignore", "inherit"],
   });
   const timer = setTimeout(() => child.kill("SIGKILL"), 2_000);
   try {
-    // When: stdin を閉じる
+    // When: close stdin
     child.stdin.end();
 
-    // Then: 2 秒以内に終了コード 0 で終了する
+    // Then: exits with exit code 0 within 2 seconds
     const [code] = (await once(child, "exit")) as [number | null];
     expect(code).toBe(0);
   } finally {

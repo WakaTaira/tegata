@@ -1,5 +1,6 @@
-//! spawn モード（`executor_socket` 未設定）の起動時の executor 検査を確かめる。
-//! デーモンは listen の前に executor を 1 回起動し、`hello` を送ってから `shutdown` で終了させる。
+//! Verifies the executor check at startup in spawn mode (`executor_socket` unset).
+//! Before listening, the daemon starts the executor once, sends `hello`, and then ends it with
+//! `shutdown`.
 
 #![cfg(unix)]
 
@@ -13,7 +14,8 @@ use common::{create_private_dir, wait_for_status};
 
 const REASON: &str = "Full Chromium is required; a browser installed with --only-shell cannot be used (PLAYWRIGHT_BROWSERS_PATH=/nowhere)";
 
-/// 受けた要求の op と自身の pid を `executor.js.log` に記録し、hello には `__HELLO__` を返す偽 executor の雛形。
+/// Template for a fake executor that records the op of each request and its own pid in
+/// `executor.js.log` and answers hello with `__HELLO__`.
 const RECORDING_EXECUTOR_TEMPLATE: &str = r#"
 const fs = require("node:fs");
 const readline = require("node:readline");
@@ -31,7 +33,7 @@ rl.on("line", (line) => {
 });
 "#;
 
-/// hello に答えずに終了する偽 executor。
+/// Fake executor that exits without answering hello.
 const SILENT_EXECUTOR: &str = "process.exit(0);\n";
 
 fn recording_executor(hello: &str) -> String {
@@ -107,9 +109,10 @@ fn process_is_alive(pid: i64) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
-/// Given: hello に `ok: true` を返す spawn モードの executor
-/// When: デーモンを起動する
-/// Then: listen の前に executor を 1 回起動して hello と shutdown を送り、その executor は終了している
+/// Given: a spawn-mode executor that answers hello with `ok: true`
+/// When: the daemon is started
+/// Then: the executor is started once before listening and sent hello and shutdown, and it has
+/// exited
 #[test]
 fn checks_the_spawned_executor_once_and_shuts_it_down() {
     let layout = Layout::new(&recording_executor("{ ok: true }"));
@@ -132,9 +135,10 @@ fn checks_the_spawned_executor_once_and_shuts_it_down() {
     assert!(!process_is_alive(pid), "the startup executor still runs");
 }
 
-/// Given: hello に `ok: false` と拒否理由を返す spawn モードの executor
-/// When: デーモンを起動する
-/// Then: 非 0 で終了し、標準エラーに拒否理由を含め、ソケットを作らず、executor には shutdown を送る
+/// Given: a spawn-mode executor that answers hello with `ok: false` and a rejection reason
+/// When: the daemon is started
+/// Then: it exits non-zero, stderr contains the rejection reason, no socket is created, and the
+/// executor is sent shutdown
 #[test]
 fn refuses_to_start_when_the_spawned_executor_reports_not_ok() {
     let hello = format!("{{ ok: false, reason: {REASON:?} }}");
@@ -150,9 +154,9 @@ fn refuses_to_start_when_the_spawned_executor_reports_not_ok() {
     assert_eq!(logged_ops(&layout.executor_log()), ["hello", "shutdown"]);
 }
 
-/// Given: hello に答えずに終了する spawn モードの executor
-/// When: デーモンを起動する
-/// Then: 非 0 で終了し、検査に失敗したことを標準エラーに示す
+/// Given: a spawn-mode executor that exits without answering hello
+/// When: the daemon is started
+/// Then: it exits non-zero and stderr indicates that the check failed
 #[test]
 fn refuses_to_start_when_the_spawned_executor_does_not_answer() {
     let layout = Layout::new(SILENT_EXECUTOR);

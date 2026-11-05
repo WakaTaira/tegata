@@ -19,14 +19,15 @@ import {
 } from "./support/docker.js";
 import { agentMounts, IN_CONTAINER, NODE } from "./support/stack.js";
 
-/** agent コンテナ内のランナー entry（`packages/tegata-mcp` の mount 先）。 */
+/** Runner entry inside the agent container (the mount target of `packages/tegata-mcp`). */
 const IN_CONTAINER_RUNNER = `${IN_CONTAINER.mcpPackage}/dist/run.js`;
 
 describe("AC-141 (docker)", () => {
   test("AC-141: Given tegata-bridge in the agent container with TEGATA_BRIDGE=1 / When tegata-mcp-run fake calls whoami inside the container / Then the result is the sha256 of the credential password", async () => {
     if (!dockerAvailable())
       throw new Error("Docker daemon is unavailable for AC-141");
-    // Given: gateway へ bind した daemon（偽 MCP サーバー "fake"）と、peer の token で動く agent コンテナの bridge
+    // Given: a daemon bound to the gateway (with the fake MCP server "fake"), and a bridge in the
+    // agent container running with the peer token
     let network: TestNetwork | undefined;
     let stack: HostedMcpStack | undefined;
     let agent: Container | undefined;
@@ -46,7 +47,7 @@ describe("AC-141 (docker)", () => {
       agent = runContainer({ network: network.name, mounts: agentMounts() });
       await startBridge(agent, peer, `${network.gateway}:${tcpPort}`);
 
-      // When: コンテナ内でランナーを bridge 経由で起動し whoami を呼ぶ
+      // When: start the runner inside the container through the bridge and call whoami
       runner = await connectRunner({
         socketPath: IN_CONTAINER.bridgeSocket,
         name: "fake",
@@ -58,7 +59,7 @@ describe("AC-141 (docker)", () => {
       });
       const whoami = await runner.callTool("whoami", {}, 30_000);
 
-      // Then: 結果は password の sha256 で、password そのものは現れない
+      // Then: the result is the sha256 of the password, and the password itself does not appear
       expect(whoami.isError, whoami.text).toBe(false);
       expect(whoami.text).toBe(sha256Hex(stack.canaries.password));
       expect(whoami.text).not.toContain(stack.canaries.password);

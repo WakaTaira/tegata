@@ -53,7 +53,7 @@ pub(crate) enum Accepted<S> {
         operator_uids: Vec<u32>,
     },
     #[cfg(unix)]
-    /// 通常 RPC 用の許可 uid 集合を持つ認証済み UNIX クライアントです。
+    /// An authenticated UNIX client that carries the set of uids allowed for normal RPC.
     UnixRpc {
         peer: PeerIdentity,
         stream: S,
@@ -85,7 +85,7 @@ pub(crate) enum PeerIdentity {
     },
     /// TCP client that presented a valid preamble token.
     Peer { peer_id: String, label: String },
-    /// リース失効など、デーモンが起点となる活動を表す身元です。
+    /// The identity that represents daemon-initiated activity such as lease expiry.
     System,
 }
 

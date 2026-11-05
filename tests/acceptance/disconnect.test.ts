@@ -1,7 +1,7 @@
-// AC-206, AC-207, AC-208 — `logout` を `disconnect` へ改名する。
-// 旧名はサイトからサインアウトしたように読めるが、実際は tegata のブラウザ
-// セッションを閉じるだけで、サイト側のセッションと保存 cookie は残る。
-// `logout` は非推奨の別名として残る。
+// AC-206, AC-207, AC-208 — rename `logout` to `disconnect`.
+// The old name reads as if it signed out of the site, but it only closes the tegata
+// browser session; the site-side session and the stored cookies remain.
+// `logout` remains as a deprecated alias.
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -20,7 +20,10 @@ interface LoginResult {
   channel: { kind: string; endpoint: string };
 }
 
-/** CDP endpoint へ接続できるかを返す。接続できた場合は直ちに切断する。 */
+/**
+ * Returns whether the CDP endpoint accepts a connection. A successful connection is closed
+ * immediately.
+ */
 async function canConnectCdp(endpoint: string): Promise<boolean> {
   try {
     const browser = await chromium.connectOverCDP(endpoint, { timeout: 2_000 });
@@ -31,7 +34,7 @@ async function canConnectCdp(endpoint: string): Promise<boolean> {
   }
 }
 
-/** デーモン不要のツール一覧取得。AC-183 と同じく TEGATA_SOCKET はダミーとする。 */
+/** Lists tools without needing a daemon. As in AC-183, TEGATA_SOCKET is a dummy. */
 async function listToolDescriptions(): Promise<Map<string, string>> {
   const transport = new StdioClientTransport({
     command: "node",

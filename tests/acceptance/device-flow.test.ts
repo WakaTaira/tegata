@@ -120,13 +120,14 @@ function assertNoDeviceCodeLeak(userCode: string, surface: string): void {
 test("AC-82: authorize_device approves an issued device code", async () => {
   const stack = await startDeviceFlowStack();
   try {
-    // Given: fixture の POST /device/issue で code C を発行
+    // Given: code C issued through the fixture's POST /device/issue
     const userCode = await issueDeviceCode(stack.fixture.url);
 
-    // When: authorize_device {cred_id: X, verification_url: <fixture>/device, user_code: C, success_selector: "#device-ok"}（steps 省略）
+    // When: authorize_device {cred_id: X, verification_url: <fixture>/device, user_code: C,
+    // success_selector: "#device-ok"} (steps omitted)
     const response = await authorizeDevice(stack, userCode);
 
-    // Then: {ok: true}、fixture 側で C が承認済み
+    // Then: {ok: true}, and C is approved on the fixture side
     expect(response.error).toBeUndefined();
     expect(response.result).toEqual({ ok: true });
     await expect(deviceStatus(stack.fixture.url, userCode)).resolves.toEqual({
@@ -140,7 +141,7 @@ test("AC-82: authorize_device approves an issued device code", async () => {
 test("AC-83: authorize_device returns no browser channel and closes its browser", async () => {
   const stack = await startDeviceFlowStack();
   try {
-    // Given: AC-82 の直後
+    // Given: right after AC-82
     const userCode = await issueDeviceCode(stack.fixture.url);
     const response = await authorizeDevice(stack, userCode);
     expect(response.error).toBeUndefined();
@@ -149,10 +150,10 @@ test("AC-83: authorize_device returns no browser channel and closes its browser"
       approved: true,
     });
 
-    // When: ブラウザ数を数える
+    // When: count the browsers
     const result = response.result as Record<string, unknown>;
 
-    // Then: 5 s 以内に 0。応答に channel / endpoint / target_id が含まれない
+    // Then: 0 within 5 s. The response does not contain channel / endpoint / target_id
     expect(Object.keys(result)).not.toContain("channel");
     expect(Object.keys(result)).not.toContain("endpoint");
     expect(Object.keys(result)).not.toContain("target_id");
@@ -175,13 +176,14 @@ test("AC-84: approve_cmd receives the device-flow and login method names", async
   const approveCmd = `if [ "$TEGATA_METHOD" = authorize_device ]; then ${writeEnv(authorizeEnvFile)}; else ${writeEnv(loginEnvFile)}; fi`;
   const stack = await startDeviceFlowStack({ approveCmd });
   try {
-    // Given: approve_cmd が環境変数をファイルに書くスクリプト
+    // Given: a script for approve_cmd that writes the environment variables to a file
     const userCode = await issueDeviceCode(stack.fixture.url);
 
     // When: authorize_device
     const authorization = await authorizeDevice(stack, userCode);
 
-    // Then: ファイルに TEGATA_TARGET_URL=<verification_url> と TEGATA_METHOD=authorize_device
+    // Then: the file contains TEGATA_TARGET_URL=<verification_url> and
+    // TEGATA_METHOD=authorize_device
     expect(authorization.error).toBeUndefined();
     expect(authorization.result).toEqual({ ok: true });
     const authorizeEnv = fs.readFileSync(authorizeEnvFile, "utf8");
@@ -193,7 +195,7 @@ test("AC-84: approve_cmd receives the device-flow and login method names", async
     // When: login
     const loginResponse = await login(stack);
 
-    // Then: ファイルに TEGATA_METHOD=login
+    // Then: the file contains TEGATA_METHOD=login
     expect(loginResponse.error).toBeUndefined();
     expect(loginResponse.result).toBeDefined();
     const loginEnv = fs.readFileSync(loginEnvFile, "utf8");
@@ -216,7 +218,7 @@ test("AC-85: authorize_device audit and observation surfaces exclude the user co
       approved: true,
     });
 
-    // When: 監査ログと leak guard の走査
+    // When: audit log and leak guard scan
     const verificationUrl = `${stack.fixture.url}/device`;
     const { records } = readAuditRecords(stack.daemon.auditLogPath);
     const auditText = fs.readFileSync(stack.daemon.auditLogPath, "utf8");
@@ -226,7 +228,9 @@ test("AC-85: authorize_device audit and observation surfaces exclude the user co
     const leaks = await stack.guard.collectLeaks();
     assertNoDeviceCodeLeak(userCode, JSON.stringify(observed));
 
-    // Then: 監査行は method: "authorize_device"、target_url = verification_url、user_code の値が監査・stdout・エージェント観測面に 0 件
+    // Then: the audit line has method: "authorize_device" and target_url = verification_url, and
+    // the user_code value appears 0 times in the audit log, stdout, and the surfaces the agent can
+    // observe
     const auditRecord = records.find(
       (record) => record.method === "authorize_device",
     );
@@ -248,7 +252,7 @@ test("AC-85: authorize_device audit and observation surfaces exclude the user co
 test("AC-86: an unissued device code is rejected and its browser closes", async () => {
   const stack = await startDeviceFlowStack();
   try {
-    // Given: 未発行の code
+    // Given: an unissued code
     const userCode = "UNISSUED-DEVICE-CODE";
     await expect(deviceStatus(stack.fixture.url, userCode)).resolves.toEqual({
       approved: false,
@@ -259,7 +263,7 @@ test("AC-86: an unissued device code is rejected and its browser closes", async 
       failure_selector: "#device-error",
     });
 
-    // Then: DEVICE_CODE_REJECTED、ブラウザは 5 s 以内に 0
+    // Then: DEVICE_CODE_REJECTED, and the browser count is 0 within 5 s
     expect(response.result).toBeUndefined();
     expect(response.error?.message).toBe("DEVICE_CODE_REJECTED");
     await waitUntil(

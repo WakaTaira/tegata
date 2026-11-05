@@ -15,7 +15,9 @@ import {
   rawRpc,
 } from "./harness.js";
 
-/** `[[api_proxy]]` 内の `[api_proxy.oauth]` の受け入れテストで固定する設定形状。 */
+/**
+ * The config shape of `[api_proxy.oauth]` inside `[[api_proxy]]`, fixed by the acceptance tests.
+ */
 export interface ApiProxyOAuthSpec {
   client_id: string;
   device_authorization_url: string;
@@ -27,7 +29,7 @@ export interface ApiProxyOAuthSpec {
   failure_selector?: string;
 }
 
-/** `[[api_proxy]]` の受け入れテストで固定する設定形状。 */
+/** The config shape of `[[api_proxy]]`, fixed by the acceptance tests. */
 export interface ApiProxySpec {
   name: string;
   cred_id?: string;
@@ -63,13 +65,13 @@ export interface ApiProxyDaemonOptions {
   approveCmd?: string;
   approveTimeoutSecs?: number;
   auditLogMaxBytes?: number;
-  /** `listen` は UNIX と TCP の両方を使うコンテナ試験用である。 */
+  /** `listen` is for container tests that use both UNIX and TCP. */
   transport?: "legacy" | "listen";
   tcpBind?: string;
   tcpPort?: number;
   operatorUids?: number[];
   captureStderr?: boolean;
-  /** config の末尾へそのまま連結する TOML 断片（`[[mcp_server]]` など）である。 */
+  /** A TOML fragment appended as-is to the end of the config (such as `[[mcp_server]]`). */
   extraToml?: string;
 }
 
@@ -119,7 +121,7 @@ function renderEntry(lines: string[], entry: MockEntry): void {
     lines.push(`totp_exposable = ${entry.totpExposable}`);
 }
 
-/** 既存の daemon config に `[[api_proxy]]` を加えた文字列を生成する。 */
+/** Generates a string that adds `[[api_proxy]]` to an existing daemon config. */
 export function renderApiProxyConfig(
   opts: ApiProxyDaemonOptions & {
     socketPath: string;
@@ -223,7 +225,8 @@ async function waitForDaemonSocket(
           const response = await rawRpc(socketPath, "status", {});
           if (response.result !== undefined) return;
         } catch {
-          // ソケット作成直後の接続失敗は起動待ちとして扱う。
+          // A connection failure right after the socket is created is treated as waiting for
+          // startup.
         }
       }
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -273,7 +276,7 @@ function writeDaemonConfig(
   );
 }
 
-/** `[[api_proxy]]` を含む config で daemon を起動し、UNIX RPC を待つ。 */
+/** Starts the daemon with a config containing `[[api_proxy]]` and waits for the UNIX RPC. */
 export async function startApiProxyDaemon(
   opts: ApiProxyDaemonOptions,
 ): Promise<ApiProxyDaemon> {
@@ -311,7 +314,7 @@ export async function startApiProxyDaemon(
   };
 }
 
-/** 起動拒否条件を、終了コードと stderr を保持したまま確認する。 */
+/** Checks a startup-rejection condition while retaining the exit code and stderr. */
 export async function runApiProxyDaemonUntilExit(
   opts: ApiProxyDaemonOptions,
   timeoutMs = 2_000,
@@ -347,7 +350,10 @@ export async function runApiProxyDaemonUntilExit(
   return { ...outcome, stderr };
 }
 
-/** Bearer 値を検証し、`/api/whoami` の到達数を HTTP で照会できる fixture。 */
+/**
+ * A fixture that validates the Bearer value and lets the arrival count of `/api/whoami` be queried
+ * over HTTP.
+ */
 async function closeApiProxyFixture(server: http.Server): Promise<void> {
   if (!server.listening) return;
   server.closeIdleConnections();
@@ -435,7 +441,7 @@ export async function startApiProxyFixture(
   };
 }
 
-/** API proxy の host-side stack を構成し、終了時に leak guard まで実行する。 */
+/** Builds the host-side stack of the API proxy and runs the leak guard at teardown. */
 export async function startApiProxyStack(
   opts: ApiProxyStackOptions,
 ): Promise<ApiProxyStack> {
@@ -481,7 +487,7 @@ export async function startApiProxyStack(
   }
 }
 
-/** host-side API proxy stack を逆順に停止する。 */
+/** Stops the host-side API proxy stack in reverse order. */
 export async function stopApiProxyStack(stack: ApiProxyStack): Promise<void> {
   await stack.mcp.close().catch(() => {});
   await stack.fixture.stop().catch(() => {});

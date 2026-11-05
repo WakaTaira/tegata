@@ -1,6 +1,6 @@
 import type { ApiProxy } from "./api-proxy.js";
 
-/** OAuth クライアント（公開クライアント）としての endpoint 群。 */
+/** Endpoints for acting as an OAuth client (public client). */
 export type OAuthEndpoints = {
   client_id: string;
   device_authorization_url: string;
@@ -53,8 +53,9 @@ const SLOW_DOWN_INCREMENT_MS = 5_000;
 const MAX_POLL_WINDOW_MS = 45_000;
 const REFRESH_MARGIN_CAP_MS = 60_000;
 export const OAUTH_REQUEST_TIMEOUT_MS = 10_000;
-// デーモンの API_PROXY_STOP_TIMEOUT（8 秒、crates/tegatad/src/main.rs）はこの値に余裕を足したものである。
-// 変更する場合は両方を揃える。
+// The daemon's API_PROXY_STOP_TIMEOUT (8 seconds, crates/tegatad/src/main.rs) is this value plus
+// some margin.
+// When changing one, keep both aligned.
 export const REVOCATION_TIMEOUT_MS = 5_000;
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
@@ -85,8 +86,9 @@ function isHttpUrl(value: string): boolean {
 }
 
 /**
- * 通信失敗を秘密を含まない短い理由へ変換する。
- * 例外メッセージは相手先の応答や URL を含みうるため、名前と Node のエラーコードのみを用いる。
+ * Converts a communication failure into a short reason that contains no secrets.
+ * Exception messages may include the peer's response or URL, so only the name and the Node error
+ * code are used.
  */
 export function networkFailureReason(error: unknown): string {
   if (!(error instanceof Error)) return typeof error;
@@ -99,7 +101,7 @@ function safeErrorCode(value: string): string {
   return /^[a-z_]{1,64}$/u.test(value) ? value : "an unrecognized error";
 }
 
-/** form 形式で POST し、JSON 応答を読む。リダイレクトは追わない。 */
+/** POSTs in form format and reads the JSON response. Redirects are not followed. */
 export const postForm: PostForm = async (url, params, timeoutMs, signal) => {
   if (!isHttpUrl(url)) {
     throw new OAuthGrantError("unsupported endpoint protocol");
@@ -126,7 +128,10 @@ export const postForm: PostForm = async (url, params, timeoutMs, signal) => {
   return { status: response.status, body };
 };
 
-/** device authorization 応答を検証する。`verification_uri_complete` があればそれを優先する。 */
+/**
+ * Validates the device authorization response. `verification_uri_complete` is preferred when
+ * present.
+ */
 export function parseDeviceAuthorization(
   response: FormResponse,
 ): DeviceAuthorization {
@@ -210,7 +215,10 @@ function parseTokenSet(body: unknown): TokenSet | null {
   };
 }
 
-/** token endpoint の応答をポーリングの状態へ分類する。継続不能な応答は例外とする。 */
+/**
+ * Classifies a token endpoint response into a polling state. A response that cannot continue
+ * throws.
+ */
 export function classifyTokenResponse(response: FormResponse): TokenPollResult {
   const body = response.body;
   if (isRecord(body) && typeof body.error === "string") {
@@ -230,8 +238,9 @@ export function classifyTokenResponse(response: FormResponse): TokenPollResult {
 }
 
 /**
- * ポーリングの期限を求める。device code 自体の寿命（応答受信から expires_in）、
- * ポーリング開始から 45 秒、応答全体の期限のうち最も早いものとする。
+ * Computes the polling deadline: the earliest of the device code lifetime itself (expires_in from
+ * receipt of the response),
+ * 45 seconds from the start of polling, and the deadline for the whole response.
  */
 export function tokenPollDeadline(options: {
   receivedAt: number;
@@ -275,8 +284,9 @@ export type PollDependencies = {
 };
 
 /**
- * token endpoint を interval ごとにポーリングする。
- * 最後の要求（初回は device authorization 応答の受信）から interval 経過するまで次の要求を送らない。
+ * Polls the token endpoint every interval.
+ * The next request is not sent until interval has elapsed since the last request (for the first,
+ * receipt of the device authorization response).
  */
 export async function pollForToken(
   endpoints: OAuthEndpoints,
@@ -347,12 +357,16 @@ export async function refreshTokens(
   }
   return {
     ...result.tokens,
-    // refresh 応答が新しい refresh token を含まない場合、従来の refresh token が引き続き有効である（RFC 6749 6 節）。
+    // If the refresh response contains no new refresh token, the previous refresh token remains
+    // valid (RFC 6749 section 6).
     refreshToken: result.tokens.refreshToken ?? current.refreshToken,
   };
 }
 
-/** 発行から refresh までの待ち時間。残りが min(60 秒, expires_in / 2) を切る時点とする。 */
+/**
+ * Wait from issuance until refresh. The refresh happens when the remaining lifetime drops below
+ * min(60 seconds, expires_in / 2).
+ */
 export function refreshDelayMs(expiresIn: number): number {
   const lifetimeMs = expiresIn * 1000;
   return Math.max(
@@ -362,16 +376,18 @@ export function refreshDelayMs(expiresIn: number): number {
 }
 
 /**
- * value template の `{{secret}}` を token へ置換する。
- * String.prototype.replace の置換文字列は `$&` 等を解釈するため、token を文字どおり埋めるよう分割して結合する。
+ * Replaces `{{secret}}` in the value template with the token.
+ * The replacement string of String.prototype.replace interprets `$&` and the like, so the template
+ * is split and joined to embed the token literally.
  */
 export function renderValueTemplate(template: string, token: string): string {
   return template.split("{{secret}}").join(token);
 }
 
 /**
- * RFC 7009 の revocation を best effort で行う。各要求は 5 秒で打ち切る。
- * 対象の失効要求がすべて 2xx で応答した場合のみ true を返す。revocation endpoint が無い場合は false とする。
+ * Performs RFC 7009 revocation on a best-effort basis. Each request is aborted after 5 seconds.
+ * Returns true only if all revocation requests for the target answered 2xx. Returns false when
+ * there is no revocation endpoint.
  */
 export async function revokeTokens(
   endpoints: OAuthEndpoints,
@@ -413,8 +429,8 @@ export type OAuthProxySessionOptions = {
 };
 
 /**
- * 1 つの注入プロキシに紐づく token の寿命（refresh と revocation）を管理する。
- * token は外部へ公開せず、プロキシの注入値としてのみ用いる。
+ * Manages the token lifetime (refresh and revocation) tied to one injection proxy.
+ * The token is never exposed externally and is used only as the proxy's injected value.
  */
 export class OAuthProxySession {
   readonly #options: OAuthProxySessionOptions;
@@ -458,7 +474,8 @@ export class OAuthProxySession {
         controller.signal,
       );
       const issuedAt = this.#now();
-      // 注入値の差し替えに失敗しても新しい token を失効対象に含めるため、先に保持する。
+      // The new token is held first so that it is included for revocation even if replacing the
+      // injected value fails.
       this.#tokens = tokens;
       this.#options.proxy.setHeaderValue(
         renderValueTemplate(this.#options.valueTemplate, tokens.accessToken),
@@ -475,9 +492,10 @@ export class OAuthProxySession {
   }
 
   /**
-   * refresh を止め、revocation endpoint があれば token を失効させてからリスナーを閉じる。
-   * 進行中の refresh は中断し、その完了を待ってから最新の token を失効させる。
-   * `revoked` は失効要求がすべて成功した場合のみ通知する。
+   * Stops refreshing, revokes the token if a revocation endpoint exists, and then closes the
+   * listener.
+   * An in-progress refresh is interrupted, and the latest token is revoked after it completes.
+   * `revoked` is reported only when all revocation requests succeed.
    */
   close(): Promise<void> {
     this.#closing ??= (async () => {

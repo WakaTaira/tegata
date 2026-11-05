@@ -1,9 +1,12 @@
-//! 資格ごとの永続 cookie の保管。
+//! Storage of persistent cookies per credential.
 //!
-//! 保管単位は (principal, namespace, cred_id) であり、`<state_dir>/cookies/` に 1 単位 1 ファイルで置く。
-//! ファイル名は単位の SHA-256 の 16 進表記とし、資格や呼び出し元の名前をディレクトリ一覧に出さない。
-//! executor は信頼境界の外側にあるため、executor から受け取った cookie はここで検証・絞り込みを行ってから保存する。
-//! cookie の値はエラー・ログのいずれにも出さない。
+//! The storage unit is (principal, namespace, cred_id), kept as one file per unit under
+//! `<state_dir>/cookies/`.
+//! The file name is the hexadecimal SHA-256 of the unit, so no credential or caller name appears in
+//! a directory listing.
+//! The executor is outside the trust boundary, so cookies received from it are validated and
+//! filtered here before they are stored.
+//! Cookie values appear in neither errors nor logs.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -21,18 +24,19 @@ use crate::sessions::BrowserKey;
 
 const STORE_DIR: &str = "cookies";
 const STORE_VERSION: u32 = 1;
-/// 保存する cookie 数の上限。超える場合は保存しない。
+/// Upper limit on the number of cookies to store. Nothing is stored beyond it.
 const MAX_COOKIES: usize = 3000;
-/// 保存する文書（封印前の JSON）の大きさの上限。超える場合は保存しない。
+/// Upper limit on the size of the document to store (JSON before sealing). Nothing is stored beyond
+/// it.
 const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
-/// `persist_cookies` でその provider の全資格を表す要素。
+/// The element of `persist_cookies` that stands for all credentials of that provider.
 const ALL_CREDENTIALS: &str = "*";
 #[cfg(not(windows))]
 const STORE_EXTENSION: &str = "json";
 #[cfg(windows)]
 const STORE_EXTENSION: &str = "bin";
 
-/// Playwright の `Cookie` 形。値を含むため `Debug` は値を伏せて出力する。
+/// The Playwright `Cookie` shape. It contains values, so `Debug` prints them redacted.
 #[derive(Clone, Deserialize, PartialEq, Serialize)]
 pub(crate) struct Cookie {
     name: String,
@@ -68,8 +72,9 @@ impl fmt::Debug for Cookie {
 }
 
 impl Cookie {
-    /// 有効期限を持ち、`now`（UNIX 秒）より後に失効する、形の整った cookie であるかを判定する。
-    /// セッション cookie（`expires` が -1）と期限切れの cookie は偽となる。
+    /// Returns whether the cookie is well formed, has an expiry, and expires after `now` (UNIX
+    /// seconds).
+    /// Session cookies (`expires` of -1) and expired cookies yield false.
     fn is_persistent_at(&self, now: f64) -> bool {
         !self.name.is_empty()
             && !self.domain.is_empty()
@@ -79,8 +84,9 @@ impl Cookie {
     }
 }
 
-/// executor から受け取った cookie の配列から、保存してよいものだけを取り出す。
-/// 配列でなければ `None` を返す。形が不正な要素・セッション cookie・期限切れの cookie は捨てる。
+/// Extracts only the cookies that may be stored from the array received from the executor.
+/// Returns `None` if the value is not an array. Malformed elements, session cookies and expired
+/// cookies are dropped.
 fn persistent_cookies(raw: &Value, now: f64) -> Option<Vec<Cookie>> {
     let elements = raw.as_array()?;
     Some(
@@ -92,7 +98,7 @@ fn persistent_cookies(raw: &Value, now: f64) -> Option<Vec<Cookie>> {
     )
 }
 
-/// 現在時刻を UNIX 秒で返す。
+/// Returns the current time in UNIX seconds.
 pub(crate) fn unix_now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -111,7 +117,7 @@ struct StoredCookies {
 }
 
 impl StoredCookies {
-    /// 文書の版と保管単位が `key` と一致するかを判定する。
+    /// Returns whether the document version and storage unit match `key`.
     fn matches(&self, key: &BrowserKey) -> bool {
         self.version == STORE_VERSION
             && self.principal == key.principal
@@ -128,17 +134,18 @@ impl StoredCookies {
     }
 }
 
-/// provider ごとの `persist_cookies` から、資格が永続化対象であるかを判定する。
+/// Decides from each provider's `persist_cookies` whether a credential is a persistence target.
 #[derive(Default)]
 pub(crate) struct CookiePolicy {
     by_namespace: HashMap<String, Vec<String>>,
 }
 
 impl CookiePolicy {
-    /// namespace の `persist_cookies` を登録する。
-    /// 資格の解決（同じ namespace の provider が複数あるとき先頭を採用する）と優先順位を
-    /// 一致させるため、リストが空であっても最初に現れた provider のものを採用し、
-    /// 同じ namespace への以降の登録は無視する。
+    /// Registers the `persist_cookies` of a namespace.
+    /// To keep precedence consistent with credential resolution (the first provider wins when
+    /// several
+    /// providers share a namespace), the first provider seen is adopted even if its list is empty,
+    /// and later registrations for the same namespace are ignored.
     pub(crate) fn insert(&mut self, namespace: String, backend_ids: Vec<String>) {
         self.by_namespace.entry(namespace).or_insert(backend_ids);
     }
@@ -147,7 +154,7 @@ impl CookiePolicy {
         self.by_namespace.values().all(Vec::is_empty)
     }
 
-    /// `cred_id`（`<namespace>:<backend id>`）が永続化対象であるかを判定する。
+    /// Returns whether `cred_id` (`<namespace>:<backend id>`) is a persistence target.
     pub(crate) fn persists(&self, cred_id: &str) -> bool {
         let Some((namespace, backend_id)) = cred_id.split_once(':') else {
             return false;
@@ -159,7 +166,7 @@ impl CookiePolicy {
     }
 }
 
-/// 保存を見送った理由。
+/// The reason a save was skipped.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SaveRejected {
     NotAnArray,
@@ -192,14 +199,14 @@ impl fmt::Display for SaveError {
     }
 }
 
-/// `forget` の対象。
+/// The target of `forget`.
 pub(crate) enum ForgetTarget<'a> {
-    /// その cred_id の全 principal 分。
+    /// All principals of that cred_id.
     Credential(&'a str),
     All,
 }
 
-/// `<state_dir>/cookies/` の保管庫。
+/// The store under `<state_dir>/cookies/`.
 pub(crate) struct CookieStore {
     dir: PathBuf,
     policy: CookiePolicy,
@@ -217,8 +224,10 @@ impl CookieStore {
         self.policy.persists(cred_id)
     }
 
-    /// 起動時の準備。永続化対象があれば保管ディレクトリを用意し、既存のディレクトリは現在の構成で掃除する。
-    /// 永続化対象が無くディレクトリも無い既定の構成では何もしない。
+    /// Startup preparation. If there are persistence targets, creates the storage directory, and
+    /// sweeps an existing directory according to the current configuration.
+    /// Does nothing in the default configuration, which has no persistence targets and no
+    /// directory.
     pub(crate) fn prepare(&self) -> io::Result<()> {
         let exists = std::fs::symlink_metadata(&self.dir).is_ok();
         if self.policy.is_empty() && !exists {
@@ -228,10 +237,10 @@ impl CookieStore {
         self.sweep()
     }
 
-    /// 保管済みの cookie を読み出す。期限切れは捨て、残りが無ければ `None` を返す。
-    /// ファイルの読み込み自体に失敗した場合は、stderr に 1 行記録したうえで `None` を返す
-    /// （ファイルは削除しない）。復号・パースに失敗した場合、または保管単位が `key` と
-    /// 一致しない場合は、ファイルを削除したうえで stderr に 1 行記録し `None` を返す。
+    /// Reads the stored cookies. Expired ones are dropped, and `None` is returned if none remain.
+    /// If reading the file itself fails, logs one line to stderr and returns `None`
+    /// (the file is not deleted). If decryption or parsing fails, or the storage unit
+    /// does not match `key`, deletes the file, logs one line to stderr and returns `None`.
     pub(crate) fn load(&self, key: &BrowserKey, now: f64) -> Option<Vec<Cookie>> {
         let path = self.path_for(key);
         let bytes = match std::fs::read(&path) {
@@ -258,8 +267,8 @@ impl CookieStore {
         (!cookies.is_empty()).then_some(cookies)
     }
 
-    /// executor から受け取った cookie の配列を検証・絞り込みのうえで保存する。
-    /// 上限を超える場合は保存せず、既存のファイルを残す。
+    /// Validates and filters the cookie array received from the executor, then stores it.
+    /// If a limit is exceeded, nothing is stored and the existing file is kept.
     pub(crate) fn save(&self, key: &BrowserKey, raw: &Value, now: f64) -> Result<(), SaveError> {
         let cookies =
             persistent_cookies(raw, now).ok_or(SaveError::Rejected(SaveRejected::NotAnArray))?;
@@ -274,7 +283,8 @@ impl CookieStore {
             saved_at: now as u64,
             cookies,
         };
-        // serde_json のエラー表示は値を含みうるため、分類だけを返す。
+        // The error display of serde_json can contain values, so only the classification is
+        // returned.
         let plaintext = Zeroizing::new(
             serde_json::to_vec(&document)
                 .map_err(|_| SaveError::Io(io::Error::other("cookie serialization failed")))?,
@@ -287,13 +297,19 @@ impl CookieStore {
         secure_fs::write_private_file_atomic(&self.path_for(key), &sealed).map_err(SaveError::Io)
     }
 
-    /// 保管済みのファイルを削除し、削除した件数を返す。保管ディレクトリが無ければ 0 件とする。
-    /// cred_id 指定では、読めない（壊れた）ファイルは cred_id への帰属を判定できないため残す。
-    /// 誤って別の資格のファイルや、一時的な I/O 失敗・権限不足で読めない正常ファイルまで
-    /// 削除してしまわないようにするための判断であり、`forget` の目的（その資格の cookie が
-    /// 以後復元されないこと）は、読めないファイルから cookie を復元できない以上、変わらず
-    /// 満たされる。これらの読めないファイルは `--all` 指定時、次回の読み出し時、または
-    /// 起動時の掃除（`sweep`）で改めて削除の対象になる。
+    /// Deletes stored files and returns the number of files deleted. If the storage directory does
+    /// not exist, the count is 0.
+    /// When a cred_id is given, an unreadable (corrupt) file is kept because its attribution to the
+    /// cred_id cannot be determined.
+    /// This avoids deleting a file of another credential by mistake, or a healthy file that is
+    /// unreadable because of a
+    /// transient I/O failure or insufficient permissions. The purpose of `forget` (that the cookies
+    /// of that credential
+    /// are not restored afterwards) is still met, since cookies cannot be restored from an
+    /// unreadable file.
+    /// These unreadable files become deletion targets again with `--all`, on the next read, or in
+    /// the
+    /// startup sweep (`sweep`).
     pub(crate) fn forget(&self, target: ForgetTarget<'_>) -> io::Result<usize> {
         let mut removed = 0;
         for path in self.store_files()? {
@@ -310,7 +326,8 @@ impl CookieStore {
         Ok(removed)
     }
 
-    /// 現在の構成で永続化対象でないファイル・読めないファイル・書き込み途中の一時ファイルを削除する。
+    /// Deletes files that are not persistence targets in the current configuration, unreadable
+    /// files, and temporary files left from an interrupted write.
     fn sweep(&self) -> io::Result<()> {
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
@@ -387,7 +404,8 @@ impl CookieStore {
     }
 }
 
-/// `sha256(principal \0 namespace \0 cred_id)` の 16 進表記に拡張子を付けたファイル名。
+/// The file name: the hexadecimal form of `sha256(principal \0 namespace \0 cred_id)` plus an
+/// extension.
 fn store_file_name(key: &BrowserKey) -> String {
     let mut hasher = Sha256::new();
     hasher.update(key.principal.as_bytes());
@@ -432,7 +450,8 @@ fn remove_if_present(path: &Path) -> io::Result<bool> {
     }
 }
 
-/// Linux では平文のまま置き、保護はディレクトリとファイルの権限に委ねる。
+/// On Linux the document is stored as plain text, and protection is left to directory and file
+/// permissions.
 #[cfg(not(windows))]
 fn seal_bytes(plaintext: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
     Ok(Zeroizing::new(plaintext.to_vec()))
@@ -443,7 +462,7 @@ fn unseal_bytes(sealed: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
     Ok(Zeroizing::new(sealed.to_vec()))
 }
 
-/// Windows では文書全体をサービスアカウントの DPAPI で封印する。
+/// On Windows the whole document is sealed with the DPAPI of the service account.
 #[cfg(windows)]
 fn seal_bytes(plaintext: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
     crate::dpapi::protect(plaintext)
@@ -547,8 +566,8 @@ mod tests {
 
     #[test]
     fn insert_keeps_the_first_providers_list_for_a_namespace() {
-        // 資格の解決は同じ namespace の先頭 provider を採用するため、ポリシーも
-        // 先頭 provider のリスト（空を含む）を採用しなければならない。
+        // Credential resolution adopts the first provider of a namespace, so the policy
+        // must also adopt the list of the first provider (including an empty one).
         let mut leading_empty = CookiePolicy::default();
         leading_empty.insert("mock".to_owned(), Vec::new());
         leading_empty.insert("mock".to_owned(), vec!["site".to_owned()]);
@@ -656,7 +675,8 @@ mod tests {
             store.save(&key, &many, NOW),
             Err(SaveError::Rejected(SaveRejected::TooManyCookies))
         ));
-        // セッション cookie は数えないため、上限を超えても絞り込み後に収まれば保存する。
+        // Session cookies are not counted, so the cookies are stored if they fit after filtering
+        // even when the raw count exceeds the limit.
         let mut mostly_session = vec![cookie("persistent", NOW + 60.0)];
         mostly_session.extend((0..MAX_COOKIES).map(|index| cookie(&format!("s{index}"), -1.0)));
         let loaded = store.load(&key, NOW).expect("kept file");
@@ -813,8 +833,10 @@ mod tests {
             .expect("save other");
         let corrupt = store.dir.join(store_file_name(&key("uid:1000", "mock:x")));
         std::fs::write(&corrupt, b"garbage").expect("write corrupt file");
-        // cred_id への帰属が確定できるファイルだけが消え、別資格の正常ファイルと、
-        // 読めない（帰属不明の）ファイルは forget では残ることを確認する。
+        // Verifies that only files whose attribution to the cred_id can be determined are deleted,
+        // and that
+        // healthy files of other credentials and unreadable (unattributable) files are kept by
+        // forget.
         assert_eq!(
             store
                 .forget(ForgetTarget::Credential("mock:site"))

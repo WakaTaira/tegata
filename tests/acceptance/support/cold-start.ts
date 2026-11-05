@@ -196,7 +196,7 @@ async function waitForDaemon(
         const response = await rawRpc(socketPath, "status", {});
         if (response.result !== undefined) return;
       } catch {
-        // 起動途中のソケット接続失敗は、次の試行で確認します。
+        // Failures to connect to the socket during startup are rechecked on the next attempt.
       }
     }
     await new Promise((resolve) => setTimeout(resolve, 50));

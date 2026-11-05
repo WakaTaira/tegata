@@ -54,18 +54,20 @@ const loginStep = z.union([
   }),
 ]);
 
-// Issue #57: 要素の指し方。ref（スナップショットの `[ref=…]`）と selector はどちらか一方だけを受け付ける。
+// Issue #57: how to point at an element. Exactly one of ref (the snapshot's `[ref=…]`) and selector
+// is accepted.
 const stepRef = z
   .string()
   .regex(/^(f\d+)?e\d+$/)
   .max(32);
 
-// fills[] の要素と submit の値で共有する、ref / selector 排他の対象指定。
+// Target specification with ref / selector exclusivity, shared by elements of fills[] and the
+// submit value.
 const refTarget = z.strictObject({ ref: stepRef });
 const selectorTarget = z.strictObject({ selector: z.string() });
 const stepTarget = z.union([refTarget, selectorTarget]);
 
-// click / wait_for / fill 用のフラットな対象 field。排他は xorTarget で検査する。
+// Flat target fields for click / wait_for / fill. Exclusivity is checked by xorTarget.
 const targetFields = {
   ref: stepRef.optional(),
   selector: z.string().optional(),
@@ -77,7 +79,7 @@ function xorTarget(args: { ref?: string; selector?: string }): boolean {
 
 const xorMessage = "Exactly one of ref or selector is required.";
 
-// fill_submit の fills / submit の定義。loginStepParams と公開用スキーマで共有する。
+// Definitions of fills / submit for fill_submit. Shared by loginStepParams and the public schema.
 const stepwiseValue = z.enum(["{{username}}", "{{password}}", "{{totp}}"]);
 
 const stepwiseFills = z
@@ -90,16 +92,18 @@ const stepwiseFills = z
   .min(1)
   .max(3);
 
-// 文字列形は selector の省略形。
+// The string form is shorthand for selector.
 const stepwiseSubmit = z.union([
   z.object({ click: z.union([z.string(), stepTarget]) }),
   z.object({ press_enter: z.union([z.string(), stepTarget]) }),
 ]);
 
-// Issue #46: login_step のフラット形パラメータ。action ごとに許される field を discriminated
-// union で表現し、単独 fill を {{username}} のみに、fill_submit の secret プレースホルダを
-// 3 種のみに制限する（デーモン側の再検査と合わせた二重防御）。テストからスキーマ単体を
-// 検証できるよう export する。
+// Issue #46: flat-form parameters of login_step. The fields allowed for each action are expressed
+// with a discriminated
+// union, restricting a standalone fill to {{username}} only and the secret placeholders of
+// fill_submit
+// to three kinds (double defense together with the re-check on the daemon side). Exported so that
+// tests can verify the schema on its own.
 export const loginStepParams = z.discriminatedUnion("action", [
   z
     .object({
@@ -193,7 +197,7 @@ function errorResult(message: string, data?: unknown) {
   };
 }
 
-// run.ts（tegata-mcp-run）が同じデーモン呼び出し規則を共用するために export する。
+// Exported so that run.ts (tegata-mcp-run) shares the same daemon-call rules.
 export async function callDaemon(
   method: string,
   params: unknown,
@@ -263,7 +267,9 @@ function successResult(result: unknown) {
   };
 }
 
-/** デーモンが返す loopback の URL を検証する。bridge はこのポートへのトンネルのみを開く。 */
+/**
+ * Validates the loopback URL returned by the daemon. The bridge opens a tunnel only to this port.
+ */
 function parseLoopbackUrl(value: string, protocol: "ws:" | "http:"): URL {
   const url = new URL(value);
   if (
@@ -323,8 +329,9 @@ type BridgeTunnel =
   | { failure: ReturnType<typeof internalError | typeof errorResult> };
 
 /**
- * bridge にセッションのポートへのトンネルを開かせ、bridge 側のローカルポートを得る。
- * run.ts（tegata-mcp-run）が MCP サーバー中継の bridge トンネルにも同じ手順を使うため export する。
+ * Has the bridge open a tunnel to the session's port and obtains the bridge-side local port.
+ * Exported because run.ts (tegata-mcp-run) uses the same procedure for the bridge tunnel of MCP
+ * server relay.
  */
 export async function openBridgeTunnel(
   sessionId: string,
@@ -382,9 +389,9 @@ export async function loginHandler(params: unknown) {
 }
 
 /**
- * Issue #46: login_begin / login_step の中継。応答が `state: "done"` のハンドオフの
- * ときだけ、既存の login と同じ bridge トンネル書き換えを適用する。`pending` /
- * `aborted` にはまだ CDP endpoint が無いため、そのまま中継する。
+ * Issue #46: relay of login_begin / login_step. Only for a handoff response with `state: "done"`
+ * is the same bridge tunnel rewrite as the existing login applied. `pending` /
+ * `aborted` do not have a CDP endpoint yet, so they are relayed as is.
  */
 export async function stepwiseHandler(
   method: "login_begin" | "login_step",
@@ -442,7 +449,7 @@ function parseApiProxyResult(result: unknown): ParsedApiProxyResult {
   return { result: proxyResult, sessionId: proxyResult.session_id, baseUrl };
 }
 
-/** ポートだけを bridge のローカルポートへ差し替え、path secret はそのまま残す。 */
+/** Replaces only the port with the bridge's local port and leaves the path secret as is. */
 function rewriteBaseUrl(proxy: ParsedApiProxyResult, localPort: number) {
   const baseUrl = new URL(proxy.baseUrl);
   baseUrl.port = String(localPort);
@@ -472,7 +479,7 @@ export async function openApiProxyHandler(params: unknown) {
   }
 }
 
-// Issue #55: 段階ログインを既定経路へ誘導する server instructions。
+// Issue #55: server instructions that steer clients to stepwise login as the default path.
 const INSTRUCTIONS = [
   "tegata logs the agent into sites with stored credentials without handing over the secrets; the agent gets a signed-in browser (CDP) or an API proxy.",
   "For an unfamiliar or multi-screen login, use login_begin / login_step. If the client has a `tegata-login` subagent, delegate the login to it.",
@@ -483,9 +490,9 @@ const INSTRUCTIONS = [
   "If a stepwise login was aborted and the success_selector looks wrong, retry once with a corrected selector, and no more.",
 ].join("\n");
 
-// Issue #54: MCP クライアントへ一覧されるのは JSON Schema の object である必要があるため、
-// discriminatedUnion（トップレベルが anyOf になる）ではなくフラットな object を公開する。
-// action ごとの厳密な検査は loginStepParams に委ね、その issue を転記する。
+// Issue #54: what is listed to MCP clients must be a JSON Schema object, so
+// a flat object is published instead of a discriminatedUnion (whose top level becomes anyOf).
+// Strict per-action checking is left to loginStepParams, and its issues are transcribed.
 const loginStepInputSchema = z
   .object({
     login_id: z
@@ -586,8 +593,8 @@ export function createServer(): McpServer {
         "Drive one step of a stepwise login started with login_begin. Point at elements by the [ref=…] on a line of the latest snapshot's page (refs from older snapshots are invalid), or by selector. fill_submit is the only action that may use the {{password}} / {{totp}} placeholders.",
       inputSchema: loginStepInputSchema,
     },
-    // Issue #54: flat な一覧用スキーマを通過した入力を union で再構文解析し、
-    // action に無関係な field を落としてからデーモンへ渡す。
+    // Issue #54: re-parse the input that passed the flat list schema with the union,
+    // drop fields irrelevant to the action, and then pass it to the daemon.
     (args) => stepwiseHandler("login_step", loginStepParams.parse(args)),
   );
 

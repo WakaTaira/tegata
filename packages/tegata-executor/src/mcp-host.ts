@@ -6,15 +6,18 @@ import os from "node:os";
 import path from "node:path";
 import { closeServer, listenLoopback } from "./loopback.js";
 
-/** 起動直後にこの時間内で終了したサーバーは起動失敗とみなす。 */
+/** A server that exits within this time right after launch is treated as a startup failure. */
 export const MCP_STARTUP_GRACE_MS = 1_000;
-/** 接続の最初の行（stream secret）を待つ上限。 */
+/** Upper bound on waiting for the first line of a connection (the stream secret). */
 export const MCP_HANDSHAKE_TIMEOUT_MS = 5_000;
-/** stream secret 行の上限（改行を含む）。 */
+/** Upper bound on the stream secret line (including the newline). */
 export const MCP_HANDSHAKE_MAX_BYTES = 256;
-/** サーバー出力 1 行の上限（改行を除く）。超過は漏洩と同じ扱いとする。 */
+/**
+ * Upper bound on one line of server output (excluding the newline). Exceeding it is treated the
+ * same as a leak.
+ */
 export const MCP_MAX_LINE_BYTES = 16 * 1024 * 1024;
-/** SIGTERM から SIGKILL までの猶予。 */
+/** Grace period from SIGTERM to SIGKILL. */
 export const MCP_KILL_GRACE_MS = 2_000;
 
 const NEWLINE = 0x0a;
@@ -36,16 +39,20 @@ export type McpServerOptions = {
 export type McpServerHost = {
   port: number;
   /**
-   * 起動応答を書き終えた後に呼ぶ。それまでに生じたイベントは保留されており、ここで発生順に出す。
-   * 応答より先にイベント行が出ると、デーモンが未確立のリースへのイベントとして扱えないためである。
+   * Call after the startup response has been written. Events that occurred until then are held and
+   * emitted here in order of occurrence.
+   * If an event line appeared before the response, the daemon could not treat it as an event for a
+   * lease not yet established.
    */
   releaseEvents: () => void;
   close: () => Promise<void>;
 };
 
 /**
- * 起動失敗を表す。メッセージには env の値・引数・spawn の例外文言を含めない。
- * Node の引数検査の例外は値を引用するため、そのまま診断行へ流すと秘密が漏れうるからである。
+ * Represents a startup failure. The message includes none of the env values, arguments, or spawn
+ * exception text.
+ * Node's argument validation exceptions quote the values, so passing them straight to a diagnostic
+ * line could leak secrets.
  */
 export class McpServerStartError extends Error {
   override name = "McpServerStartError";
@@ -54,8 +61,9 @@ export class McpServerStartError extends Error {
 export type LineInspection = { lines: Buffer[]; leaked: boolean };
 
 /**
- * 値と、JSON 文字列として escape した形（元の値と異なる場合のみ）を返す。
- * MCP の出力は JSON であるため、`"` や `\` を含む値は escape された形で現れうる。
+ * Returns the value and its form escaped as a JSON string (only when it differs from the original
+ * value).
+ * MCP output is JSON, so a value containing `"` or `\` can appear in escaped form.
  */
 function withJsonEscaped(value: string): string[] {
   const escaped = JSON.stringify(value).slice(1, -1);
@@ -63,9 +71,10 @@ function withJsonEscaped(value: string): string[] {
 }
 
 /**
- * サーバー出力を改行で区切り、完結した行だけを検査して返す。
- * 検査対象の値を含む行、または上限を超える行を検出した場合は、同じ chunk の行も含めて何も返さない。
- * 未完行は内部に保持し、検査前に外へ出さない。
+ * Splits server output on newlines and returns only complete lines after scanning them.
+ * If a line containing a scanned value or a line exceeding the limit is detected, nothing is
+ * returned, including other lines in the same chunk.
+ * An incomplete line is kept internally and is not emitted before scanning.
  */
 export class LineInspector {
   private readonly needles: Buffer[];
@@ -77,7 +86,7 @@ export class LineInspector {
     scan: readonly string[],
     private readonly maxLineBytes: number = MCP_MAX_LINE_BYTES,
   ) {
-    // 空文字はあらゆる行に一致するため、検査対象から除く。
+    // An empty string matches every line, so it is excluded from the scan targets.
     const values = scan.filter((value) => value !== "");
     this.needles = [...new Set(values.flatMap(withJsonEscaped))].map((value) =>
       Buffer.from(value, "utf8"),
@@ -125,7 +134,7 @@ export class LineInspector {
 }
 
 function bytesEqual(candidate: Buffer, expected: Buffer): boolean {
-  // secret の長さは公開情報であるため、長さの不一致は即座に拒否してよい。
+  // The secret length is public, so a length mismatch may be rejected immediately.
   if (candidate.length !== expected.length) return false;
   return timingSafeEqual(candidate, expected);
 }
@@ -136,7 +145,7 @@ function hasExited(child: ChildProcess): boolean {
 
 function ignoreError(): void {}
 
-/** 起動から猶予時間が過ぎるまでに spawn が失敗するか終了した場合は reject する。 */
+/** Rejects if spawn fails or the process exits before the grace period after launch has passed. */
 function waitForStartup(child: ChildProcess): Promise<void> {
   return new Promise((resolve, reject) => {
     const cleanup = () => {
@@ -170,8 +179,8 @@ function waitForStartup(child: ChildProcess): Promise<void> {
 }
 
 /**
- * SIGTERM を送り、猶予後も残っていれば SIGKILL を送る。
- * Windows では `kill()` がどちらのシグナルでも強制終了となるため、分岐を要しない。
+ * Sends SIGTERM, and sends SIGKILL if the process is still alive after the grace period.
+ * On Windows, `kill()` force-terminates for either signal, so no branching is needed.
  */
 function terminateChild(child: ChildProcess): Promise<void> {
   if (child.pid === undefined || hasExited(child)) return Promise.resolve();
@@ -187,12 +196,16 @@ function terminateChild(child: ChildProcess): Promise<void> {
   });
 }
 
-/** Windows でのみ引き継ぐ変数。Node などのランタイムは SYSTEMROOT が無いと起動・通信に失敗する。 */
+/**
+ * Variables inherited only on Windows. Runtimes such as Node fail to start or communicate without
+ * SYSTEMROOT.
+ */
 const WINDOWS_INHERITED_ENV = ["SYSTEMROOT", "WINDIR"] as const;
 
 /**
- * サーバーへ渡す環境変数を組み立てる。executor の環境変数は PATH と、Windows の場合の
- * SYSTEMROOT・WINDIR（存在する場合のみ）以外引き継がず、HOME はセッション用ディレクトリとする。
+ * Builds the environment variables passed to the server. The executor's environment variables are
+ * inherited only for PATH and,
+ * on Windows, SYSTEMROOT and WINDIR (only if present); HOME is the session directory.
  */
 export function serverEnvironment(
   env: Record<string, string>,
@@ -229,8 +242,8 @@ function spawnServer(options: McpServerOptions, dir: string): ChildProcess {
 }
 
 /**
- * 起動済みのサーバープロセスと loopback リスナーを結ぶ中継の状態を持つ。
- * 1 セッションにつき成立させる接続は 1 本のみであり、切断後も再成立させない。
+ * Holds the state of the relay that connects the launched server process to the loopback listener.
+ * Only one connection is established per session, and it is not re-established after disconnection.
  */
 class McpRelay {
   private connection: net.Socket | undefined;
@@ -257,7 +270,8 @@ class McpRelay {
     child.on("error", ignoreError);
     child.stdin?.on("error", ignoreError);
     child.stdout?.on("error", ignoreError);
-    // 接続が無いまま終了した場合も stdout を読み切り、close を発火させる。
+    // Even when the process exits with no connection, stdout is read to the end so that close
+    // fires.
     child.once("exit", () => this.startReading());
     child.once("close", (code: number | null) => this.handleExit(code));
   }
@@ -303,7 +317,7 @@ class McpRelay {
     });
   }
 
-  /** 起動応答の前はイベントを保留し、releaseEvents 以後は即座に出す。 */
+  /** Events are held before the startup response, and emitted immediately after releaseEvents. */
   private emit(event: McpServerEvent): void {
     if (this.heldEvents !== undefined) {
       this.heldEvents.push(event);
@@ -332,9 +346,10 @@ class McpRelay {
     socket.once("close", () => {
       this.connection = undefined;
       if (stdin !== null && !stdin.writableEnded) stdin.end();
-      // 切断後の出力は捨てるため、backpressure で止めた読み取りを再開する。
+      // Output after disconnection is discarded, so reading paused by backpressure is resumed.
       this.child.stdout?.resume();
-      // 接続は再成立しないため、EOF を無視するサーバーも残さず終了させる。終了は exit イベントとして通知される。
+      // The connection is not re-established, so even a server that ignores EOF is made to exit.
+      // The exit is notified as an exit event.
       void this.terminate();
     });
     this.startReading();
@@ -379,7 +394,8 @@ class McpRelay {
   private handleExit(code: number | null): void {
     if (this.finished) return;
     this.finished = true;
-    // 完結した行はすでに書き込み済みであり、end により送り切ってから閉じる。未完行は破棄される。
+    // Complete lines have already been written and are flushed by end before closing. An incomplete
+    // line is discarded.
     this.connection?.end();
     for (const socket of this.handshakes) socket.destroy();
     this.handshakes.clear();
@@ -416,13 +432,15 @@ class McpRelay {
 }
 
 /**
- * config で許可された stdio MCP サーバーを起動し、stream secret で守った loopback TCP で中継する。
- * env の値・scan・stream secret は例外メッセージを含めどこにも出力しない。
+ * Launches a stdio MCP server permitted by config and relays it over loopback TCP protected by the
+ * stream secret.
+ * The env values, the scan, and the stream secret are never emitted anywhere, including exception
+ * messages.
  */
 export async function startMcpServer(
   options: McpServerOptions,
 ): Promise<McpServerHost> {
-  // mkdtemp は 0700 で作成する。
+  // mkdtemp creates the directory with 0700.
   const dir = await mkdtemp(path.join(os.tmpdir(), "tegata-mcp-"));
   let child: ChildProcess | undefined;
   try {

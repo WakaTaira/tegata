@@ -37,7 +37,7 @@ const explicitSteps = [
 
 type RecordedRequest = { method: string; cookieNames: string[] };
 
-// ログイン状態を device cookie で判定する最小のサイト。
+// A minimal site that decides the login state from a device cookie.
 const site = {
   posts: 0,
   deviceValid: true,
@@ -128,7 +128,7 @@ afterEach(async () => {
   await cleanupResources();
 });
 
-/** 1 回の処理が標準出力へ書く応答行を読み取る。 */
+/** Reads the response line that one run writes to standard output. */
 async function captureResponse(
   action: () => Promise<void>,
 ): Promise<Record<string, unknown>> {
@@ -202,7 +202,7 @@ describe("login with persistent cookies", { timeout: 60_000 }, () => {
     expect(site.posts).toBe(1);
     await cleanupResources();
 
-    // デーモンと同じく、セッション cookie を除いたものを次回へ渡す。
+    // As the daemon does, pass the cookies minus the session cookies to the next run.
     const persistent = (first.cookies as Cookie[]).filter(
       ({ expires }) => expires !== -1,
     );
@@ -386,8 +386,8 @@ describe("toExportedCookie", () => {
   });
 
   test("drops a cookie that does not match the expected shape", () => {
-    // context.cookies() が形の不正な値を返した場合でも、export_cookies や
-    // ログイン応答全体を失敗させず、その要素だけを捨てる。
+    // Even if context.cookies() returns a malformed value, only that element is dropped
+    // without failing the whole of export_cookies or the login response.
     const malformed = { ...deviceCookie(), domain: "" };
     expect(toExportedCookie(malformed)).toBeUndefined();
   });

@@ -210,7 +210,7 @@ describe.sequential("login bridge", () => {
 
 const baseUrl = "http://127.0.0.1:9002/path-secret_1";
 
-/** open_api_proxy と bridge_open_tunnel に順に応答する偽デーモンを起動する。 */
+/** Starts a fake daemon that responds in turn to open_api_proxy and bridge_open_tunnel. */
 async function startFakeApiProxyServer() {
   const socketPath = join(process.cwd(), `.tegata-mcp-${randomUUID()}.sock`);
   const methods: unknown[] = [];
@@ -292,7 +292,10 @@ describe.sequential("open_api_proxy bridge", () => {
   });
 });
 
-/** Issue #46: どの method でも同じ結果を返す偽デーモン。呼ばれた method / params を記録する。 */
+/**
+ * Issue #46: a fake daemon that returns the same result for any method. Records the method / params
+ * it receives.
+ */
 async function startFakeStepwiseServer(response: {
   result?: unknown;
   error?: { message: string; data?: unknown };
@@ -327,9 +330,9 @@ async function startFakeStepwiseServer(response: {
 }
 
 /**
- * Issue #46: 段階ログインの bridge 経路を検証する偽デーモン。1 回目は
- * `firstMethod`（`login_begin` / `login_step`）に `doneResult` を返し、bridge
- * 有効時にのみ来る 2 回目の `bridge_open_tunnel` に応答する。
+ * Issue #46: a fake daemon that verifies the bridge path of stepwise login. The first call
+ * returns `doneResult` for `firstMethod` (`login_begin` / `login_step`) and answers the second
+ * `bridge_open_tunnel`, which arrives only when the bridge is enabled.
  */
 async function startFakeStepwiseBridgeServer(
   firstMethod: "login_begin" | "login_step",
@@ -780,7 +783,7 @@ async function connectClient() {
   return { client, server };
 }
 
-// Issue #54 / #55: MCP クライアントから見える一覧スキーマと instructions。
+// Issue #54 / #55: the list schema and instructions as seen from an MCP client.
 describe("createServer tool listing", () => {
   test("lists every tool with a non-empty object inputSchema and a full login_step schema", async () => {
     const { client, server } = await connectClient();

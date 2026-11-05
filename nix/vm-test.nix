@@ -214,10 +214,10 @@ pkgs.testers.runNixOSTest {
         # Given: the AC-18 session is still within the daemon's TTL window
         # When: the Chromium process owner is inspected
         # Then: it is owned by the executor user, never by the daemon's own user
-        # ログイン用ブラウザは完全版 Chromium（新ヘッドレス）である。nix の
-        # chrome は bash ラッパで、プロセスの cmdline は
-        # `.../chrome-linux64/.chrome-wrapped --headless ...` となる。comm は
-        # 15 文字で切り詰められるため、-f で cmdline 全体を照合する。
+        # The login browser is the full Chromium (new headless mode). The nix
+        # chrome is a bash wrapper, so the process cmdline is
+        # `.../chrome-linux64/.chrome-wrapped --headless ...`. comm is
+        # truncated to 15 characters, so -f matches against the whole cmdline.
         machine.succeed("pgrep -u tegata-browser -f 'chrome-linux64/'")
         machine.fail("pgrep -u tegata -f 'chrome-linux64/'")
 
@@ -235,13 +235,16 @@ pkgs.testers.runNixOSTest {
 
     with subtest("AC-205: the full Chromium build runs as the browser worker"):
         # Traceability: docs/secret/briefs/tegata-issue60-browser-not-announcing.md AC-205.
-        # Given: services.tegata が有効な NixOS VM
-        # When: login を 1 回行う（AC-18 の login。そのセッションは TTL 内で生きている）
-        # Then: chrome-linux64/ を含むプロセスが tegata-browser の uid で動き、tegata の uid
-        # では動いていない。chrome-headless-shell のプロセスはどの uid でも動いていない。
-        # nix の chrome はラッパのためプロセス名は .chrome-wrapped になるので、-f で
-        # コマンドライン中のパスを照合する。uid を絞らない検査は、検査コマンド自身を
-        # 含む親プロセスの argv に一致しないよう、文字クラスで表記する。
+        # Given: a NixOS VM with services.tegata enabled
+        # When: one login is performed (the login from AC-18; that session is alive within its TTL)
+        # Then: a process containing chrome-linux64/ runs under the tegata-browser uid and not under
+        # the tegata uid.
+        # No chrome-headless-shell process runs under any uid.
+        # The nix chrome is a wrapper, so the process name is .chrome-wrapped; -f matches
+        # the path in the command line. The check that does not restrict the uid is written with a
+        # character class
+        # so that it does not match the argv of parent processes, including the check command
+        # itself.
         machine.succeed("pgrep -u tegata-browser -f 'chrome-linux64/'")
         machine.fail("pgrep -u tegata -f 'chrome-linux64/'")
         machine.fail("pgrep -f 'chrome-headless-shel[l]'")

@@ -98,9 +98,9 @@ fn refuses_executor_socket_that_reports_not_ok() {
     assert!(stderr.contains("executor socket \"") && stderr.contains("executor reported ok=false"));
 }
 
-/// Given: ソケットの executor が hello に `ok: false` と拒否理由を返す
-/// When: デーモンを起動する
-/// Then: 起動を中止し、標準エラーに拒否理由をそのまま含める
+/// Given: the socket executor answers hello with `ok: false` and a rejection reason
+/// When: the daemon is started
+/// Then: startup is aborted and stderr contains the rejection reason verbatim
 #[test]
 fn refuses_executor_socket_and_reports_its_reason() {
     let reason = "Full Chromium is required; a browser installed with --only-shell cannot be used (PLAYWRIGHT_BROWSERS_PATH=/nowhere)";

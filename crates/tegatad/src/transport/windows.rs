@@ -434,7 +434,7 @@ fn valid_sid(sid: &str) -> bool {
 
 fn client_process_id(pipe: &NamedPipeServer) -> io::Result<u32> {
     let mut pid = 0_u32;
-    // SAFETY: 接続済みのパイプハンドルおよび有効な出力ポインターを渡します。
+    // SAFETY: Passes a connected pipe handle and a valid output pointer.
     if unsafe { GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid) } == 0 || pid == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -442,7 +442,8 @@ fn client_process_id(pipe: &NamedPipeServer) -> io::Result<u32> {
 }
 
 fn process_origin(client_pid: u32) -> (Origin, OriginWalk) {
-    // PID を取得できなかった場合はプロセス表を取らず、空の表で走査して client_missing とする。
+    // If the PID could not be obtained, do not take the process table; walk an empty table and
+    // report client_missing.
     let mut table = Vec::new();
     if client_pid != 0 {
         table = match process_table() {
@@ -459,7 +460,7 @@ fn process_origin(client_pid: u32) -> (Origin, OriginWalk) {
 }
 
 fn process_table() -> io::Result<Vec<ProcEntry>> {
-    // SAFETY: 出力ポインターを使わず、システム全体のプロセス表を要求します。
+    // SAFETY: Requests the system-wide process table without using an output pointer.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
@@ -469,7 +470,7 @@ fn process_table() -> io::Result<Vec<ProcEntry>> {
         dwSize: size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
     };
-    // SAFETY: `snapshot` は有効なプロセススナップショットであり、`process` は必要なサイズです。
+    // SAFETY: `snapshot` is a valid process snapshot, and `process` has the required size.
     if unsafe { Process32FirstW(snapshot.get(), &mut process) } == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -479,15 +480,15 @@ fn process_table() -> io::Result<Vec<ProcEntry>> {
         table.push(ProcEntry {
             pid: process.th32ProcessID,
             ppid: process.th32ParentProcessID,
-            // SAFETY: `szExeFile` はスナップショットが保持する固定長の NUL 終端フィールドです。
+            // SAFETY: `szExeFile` is a fixed-length NUL-terminated field held by the snapshot.
             exe: unsafe { wide_string(process.szExeFile.as_ptr()) },
             created: None,
         });
-        // SAFETY: `snapshot` は有効なプロセススナップショットであり、`process` は有効な出力バッファーです。
+        // SAFETY: `snapshot` is a valid process snapshot, and `process` is a valid output buffer.
         if unsafe { Process32NextW(snapshot.get(), &mut process) } != 0 {
             continue;
         }
-        // SAFETY: 直前の API 呼び出しが設定したエラー値を読み取ります。
+        // SAFETY: Reads the error value set by the preceding API call.
         if unsafe { GetLastError() } != ERROR_NO_MORE_FILES {
             return Err(io::Error::last_os_error());
         }
@@ -511,14 +512,14 @@ fn fill_creation_times(client_pid: u32, table: &mut [ProcEntry]) {
 }
 
 fn process_creation_time(pid: u32) -> Option<u64> {
-    // SAFETY: 要求するアクセス権はプロセス情報の照会に限定されています。
+    // SAFETY: The requested access rights are limited to querying process information.
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
     let process = OwnedHandle::new(process).ok()?;
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();
     let mut kernel = FILETIME::default();
     let mut user = FILETIME::default();
-    // SAFETY: プロセス時刻の全出力ポインターは初期化済み領域を参照します。
+    // SAFETY: All output pointers for the process times refer to initialized memory.
     if unsafe {
         GetProcessTimes(
             process.get(),

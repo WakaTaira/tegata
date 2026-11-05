@@ -44,7 +44,7 @@ function startRunner(stack: HostedMcpStack): Promise<RunnerSession> {
   });
 }
 
-/** ランナーを閉じ、その stderr を leak guard の観測面へ加える。 */
+/** Closes the runner and adds its stderr to the leak guard's observation surface. */
 async function closeRunner(
   stack: HostedMcpStack,
   runner: RunnerSession | undefined,
@@ -94,15 +94,15 @@ test(
   "AC-135: Given [[mcp_server]] fake / When tegata-mcp-run fake is driven by an MCP stdio client and whoami is called / Then the result is the sha256 of the credential password",
   TIMEOUT,
   async () => {
-    // Given: 資格 mock:site の password を TOKEN に入れる偽サーバー "fake"
+    // Given: a fake server "fake" that puts the password of credential mock:site into TOKEN
     const stack = await startHostedMcpStack();
     let runner: RunnerSession | undefined;
     try {
-      // When: ランナーを通常の stdio MCP サーバーとして起動し whoami を呼ぶ
+      // When: start the runner as a regular stdio MCP server and call whoami
       runner = await startRunner(stack);
       const whoami = await runner.callTool("whoami");
 
-      // Then: 結果は password の sha256 で、password そのものは現れない
+      // Then: the result is the sha256 of the password, and the password itself does not appear
       expect(whoami.isError, whoami.text).toBe(false);
       expect(whoami.text).toBe(sha256Hex(stack.canaries.password));
       expect(whoami.text).not.toContain(stack.canaries.password);
@@ -117,7 +117,7 @@ test(
   "AC-136: Given an AC-135 runner session / When the leak tool is called / Then no response arrives, the runner exits, the audit log records mcp_action leak, and the password is on no observed surface",
   TIMEOUT,
   async () => {
-    // Given: AC-135 と同じセッション
+    // Given: the same session as AC-135
     const stack = await startHostedMcpStack();
     let runner: RunnerSession | undefined;
     try {
@@ -125,7 +125,7 @@ test(
       const whoami = await runner.callTool("whoami");
       expect(whoami.isError, whoami.text).toBe(false);
 
-      // When: TOKEN をそのまま出力するツールを呼ぶ
+      // When: call a tool that outputs TOKEN verbatim
       let callError: unknown;
       try {
         const leaked = await runner.callTool("leak", {}, 10_000);
@@ -134,7 +134,7 @@ test(
         callError = error;
       }
 
-      // Then: 応答は届かずクライアントはエラーとなり、ランナーは終了する
+      // Then: no response arrives, the client gets an error, and the runner exits
       expect(callError, "leak returned a response").toBeDefined();
       stack.observe("runner:leak-error", String(callError));
       expect(await settlesWithin(runner.exited, 10_000)).toBe(true);
@@ -142,7 +142,7 @@ test(
       expect(String(callError)).not.toContain(stack.canaries.password);
       expect(runner.stderr()).not.toContain(stack.canaries.password);
 
-      // Then: 監査に mcp_server の leak イベントが残り、password は含まれない
+      // Then: the audit log retains a leak event for mcp_server and does not contain the password
       await waitUntil("mcp_server leak audit record", () =>
         readAuditRecords(stack.daemon.auditLogPath).records.some(
           (record) =>
@@ -158,7 +158,7 @@ test(
       expect(typeof leakRecord?.session_id).toBe("string");
       expect(JSON.stringify(records)).not.toContain(stack.canaries.password);
 
-      // Then: テストが観測できる全ての面で password が 0 件である
+      // Then: the password appears 0 times on every surface the test can observe
       expect(await stack.guard.collectLeaks()).toEqual([]);
     } finally {
       await closeRunner(stack, runner);
@@ -171,7 +171,7 @@ test(
   "AC-137: Given an AC-135 runner session and the server pid / When the runner's stdin is closed / Then within 5 seconds the server process is gone and status reports zero leases",
   TIMEOUT,
   async () => {
-    // Given: AC-135 と同じセッションで、pid ツールから子プロセスの pid を得る
+    // Given: the same session as AC-135, with the child process pid obtained from the pid tool
     const stack = await startHostedMcpStack();
     let runner: RunnerSession | undefined;
     try {
@@ -183,11 +183,11 @@ test(
       expect(processExists(serverPid)).toBe(true);
       expect(await leaseCount(stack.daemon.socketPath)).toBe(1);
 
-      // When: クライアントを閉じ、ランナーの stdin を閉じる
+      // When: close the client and close the runner's stdin
       await closeRunner(stack, runner);
       runner = undefined;
 
-      // Then: 5 秒以内にサーバーのプロセスが消え、リースが 0 になる
+      // Then: within 5 seconds the server process is gone and the lease count is 0
       await waitUntil(
         "hosted MCP server exit and lease release",
         async () =>
@@ -208,10 +208,10 @@ test(
   "AC-138: Given an unknown name or a relative command / When open_mcp_server runs or the daemon starts / Then NOT_FOUND is returned and startup is refused with a reason",
   TIMEOUT,
   async () => {
-    // Given: "fake" だけを定義した config
+    // Given: a config that defines only "fake"
     const stack = await startHostedMcpStack();
     try {
-      // When: 未定義の name を開く
+      // When: open an undefined name
       const response = await rawRpc(
         stack.daemon.socketPath,
         "open_mcp_server",
@@ -221,14 +221,14 @@ test(
       );
       stack.observe("rpc:open_mcp_server:unknown", response);
 
-      // Then: NOT_FOUND で、サーバーは起動されない
+      // Then: NOT_FOUND, and the server is not started
       expect(response.error?.message).toBe("NOT_FOUND");
       expect(readServerLog(stack.serverLog)).toBeUndefined();
     } finally {
       await stopHostedMcpStack(stack);
     }
 
-    // Given: command = "node"（相対）の config
+    // Given: a config with command = "node" (relative)
     const scratch = fs.mkdtempSync(
       path.join(os.tmpdir(), "tegata-mcp-reject-"),
     );
@@ -243,7 +243,7 @@ test(
         ]),
       });
 
-      // Then: 起動は拒否され、stderr に command の理由が出る
+      // Then: startup is rejected, and stderr states the reason for the command
       expect(
         exit.code,
         `daemon kept running; stderr: ${exit.stderr}`,
@@ -261,14 +261,14 @@ test(
   "AC-139: Given an approve_cmd that records its environment and exits 1 / When open_mcp_server {name: fake} runs / Then APPROVAL_DENIED is returned, the record carries the method and mcp:fake, and the server never starts",
   TIMEOUT,
   async () => {
-    // Given: env をファイルへ書いて exit 1 する approve_cmd
+    // Given: an approve_cmd that writes its env to a file and exits 1
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "tegata-mcp-hitl-"));
     const envFile = path.join(scratch, "approve-env.txt");
     const stack = await startHostedMcpStack({
       top: { approveCmd: `env > ${envFile}; exit 1` },
     });
     try {
-      // When: open_mcp_server を呼ぶ
+      // When: call open_mcp_server
       const response = await rawRpc(
         stack.daemon.socketPath,
         "open_mcp_server",
@@ -278,7 +278,7 @@ test(
       );
       stack.observe("rpc:open_mcp_server:denied", response);
 
-      // Then: APPROVAL_DENIED で、承認コマンドに参照だけが渡る
+      // Then: APPROVAL_DENIED, and only the reference is passed to the approval command
       expect(response.error?.message).toBe("APPROVAL_DENIED");
       const env = fs.readFileSync(envFile, "utf8");
       stack.observe("mcp-hosting-approve-env", env);
@@ -286,7 +286,7 @@ test(
       expect(env).toContain("TEGATA_TARGET_URL=mcp:fake");
       expect(env).not.toContain(stack.canaries.password);
 
-      // Then: 偽サーバーは起動されておらず（起動記録が無い）、リースも無い
+      // Then: the fake server was not started (no startup record) and there is no lease
       await sleep(1_000);
       expect(readServerLog(stack.serverLog)).toBeUndefined();
       expect(await leaseCount(stack.daemon.socketPath)).toBe(0);
@@ -301,7 +301,7 @@ test(
   "AC-140: Given an open_mcp_server reply / When a connection with a wrong stream secret is followed by two with the right one / Then the first and third are closed, the second is relayed, and the server only receives the second's request",
   TIMEOUT,
   async () => {
-    // Given: open_mcp_server の応答（session_id・port・stream_secret）
+    // Given: the open_mcp_server response (session_id, port, stream_secret)
     const stack = await startHostedMcpStack();
     let sessionId: string | undefined;
     const sockets: StreamExchange[] = [];
@@ -318,7 +318,7 @@ test(
       sessionId = session.session_id as string;
       const { port, stream_secret: secret } = session as OpenMcpServer;
 
-      // When: 1 本目は誤った secret の行と要求を送る
+      // When: the first connection sends a line with a wrong secret and a request
       let wrongSecret = randomBytes(16).toString("base64url");
       while (wrongSecret === secret)
         wrongSecret = randomBytes(16).toString("base64url");
@@ -328,7 +328,7 @@ test(
       );
       sockets.push(first);
 
-      // When: 2 本目は正しい secret の行と initialize 要求を送る
+      // When: the second connection sends a line with the correct secret and an initialize request
       const second = await streamExchange(
         port,
         `${secret}\n${initializeLine("second")}`,
@@ -336,14 +336,15 @@ test(
       );
       sockets.push(second);
 
-      // When: 2 本目を開いたまま、3 本目も正しい secret で接続する
+      // When: with the second connection still open, a third connects with the correct secret too
       const third = await streamExchange(
         port,
         `${secret}\n${initializeLine("third")}`,
       );
       sockets.push(third);
 
-      // Then: 1 本目と 3 本目は応答なしで切断され、2 本目だけが中継される
+      // Then: the first and third are disconnected without a response, and only the second is
+      // relayed
       expect(first.closed).toBe(true);
       expect(first.lines).toEqual([]);
       expect(third.closed).toBe(true);
@@ -352,7 +353,7 @@ test(
       expect(responseIds(second)).toEqual(["second"]);
       stack.observe("stream:second", second.lines);
 
-      // Then: 偽サーバーが受け取った要求は 2 本目のものだけである
+      // Then: the only request the fake server received is the second connection's
       await sleep(500);
       const ids = receivedRequests(stack.serverLog)
         .filter((request) => request.id !== undefined)

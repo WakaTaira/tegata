@@ -69,12 +69,14 @@ const METHOD_NOT_FOUND: i32 = -32601;
 const CLASSIFICATION_ERROR: i32 = -32000;
 const EXECUTOR_TIMEOUT: Duration = Duration::from_secs(90);
 const EXECUTOR_OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
-/// `api_proxy_stop` の応答待ちの上限。executor の revocation 上限 5 秒
-/// （packages/tegata-executor/src/oauth.ts の `REVOCATION_TIMEOUT_MS`）に余裕を足した値である。
-/// 変更時は両方を揃える。
+/// Upper bound on waiting for the `api_proxy_stop` response. The executor's revocation limit of 5
+/// seconds
+/// (`REVOCATION_TIMEOUT_MS` in packages/tegata-executor/src/oauth.ts) plus a margin.
+/// Keep the two in sync when changing either.
 const API_PROXY_STOP_TIMEOUT: Duration = Duration::from_secs(8);
-/// `mcp_server_stop` の応答待ちの上限。executor は SIGTERM の後 2 秒で SIGKILL へ移るため、
-/// その待機と後始末に余裕を足した値とする。
+/// Upper bound on waiting for the `mcp_server_stop` response. The executor moves to SIGKILL 2
+/// seconds after SIGTERM,
+/// so this is that wait plus the cleanup, with a margin.
 const MCP_SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const EXECUTOR_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 const PASSWORD_FILE_DIR: &str = ".bw-passwords";
@@ -95,8 +97,9 @@ pub(crate) fn current_rpc_id() -> Option<u64> {
     RPC_CONTEXT.try_with(|context| context.id).ok()
 }
 
-/// 診断行の `rpc_id` に載せる値を返す。RPC 内では連番、起動処理では `"startup"`、
-/// reaper などそれ以外の RPC 外の背景タスクでは `"background"` とする。
+/// Returns the value recorded as `rpc_id` in a diagnostic line. Inside an RPC it is a sequence
+/// number, in startup processing it is `"startup"`,
+/// and in other background tasks outside an RPC, such as the reaper, it is `"background"`.
 pub(crate) fn current_diagnostic_rpc_id() -> Value {
     match current_rpc_id() {
         Some(rpc_id) => json!(rpc_id),
@@ -167,7 +170,8 @@ fn default_stepwise_max_secs() -> u64 {
     stepwise::DEFAULT_MAX_SECS
 }
 
-/// `[[api_proxy]]` の 1 項目。agent は `name` で選ぶだけで、上流・注入ヘッダは設定で固定される。
+/// One `[[api_proxy]]` entry. The agent only selects by `name`; the upstream and the injected
+/// header are fixed by the configuration.
 #[derive(Clone, Debug, Deserialize)]
 struct ApiProxyConfig {
     name: String,
@@ -180,8 +184,10 @@ struct ApiProxyConfig {
     oauth: Option<ApiProxyOAuthConfig>,
 }
 
-/// `[api_proxy.oauth]` の設定。注入する値を、executor が device-code grant で得るトークンから作る。
-/// `login_cred_id` は認可画面でのブラウザログインに使う資格であり、承認の対象でもある。
+/// Settings of `[api_proxy.oauth]`. The injected value is built from the token the executor obtains
+/// through the device-code grant.
+/// `login_cred_id` is the credential used for the browser login on the authorization screen, and is
+/// also the subject of approval.
 #[derive(Clone, Debug, Deserialize)]
 struct ApiProxyOAuthConfig {
     client_id: String,
@@ -195,10 +201,11 @@ struct ApiProxyOAuthConfig {
     failure_selector: Option<String>,
 }
 
-/// `api_proxy_start` に載せる注入値の指定。
+/// Specification of the injected value carried in `api_proxy_start`.
 ///
-/// 静的な資格では `header_value` のみを、OAuth では `value_template` と `oauth` の組のみを持つ。
-/// 両者は排他であり、同時に持つことも、どちらも持たないこともない。
+/// A static credential has only `header_value`; OAuth has only the pair of `value_template` and
+/// `oauth`.
+/// The two are mutually exclusive: it never has both, and never has neither.
 struct ApiProxyStartOptions {
     value_template: Option<String>,
     header_value: Option<Zeroizing<String>>,
@@ -224,7 +231,7 @@ fn api_proxy_cred_id(proxy: &ApiProxyConfig) -> Option<&str> {
     })
 }
 
-/// 起動を拒否すべき `[[api_proxy]]` の設定誤りを検出する。
+/// Detects a misconfigured `[[api_proxy]]` whose startup must be refused.
 fn validate_api_proxies(proxies: &[ApiProxyConfig]) -> Result<(), String> {
     let mut names = HashSet::new();
     for proxy in proxies {
@@ -272,7 +279,8 @@ fn validate_api_proxies(proxies: &[ApiProxyConfig]) -> Result<(), String> {
     Ok(())
 }
 
-/// 起動を拒否すべき `[api_proxy.oauth]` の設定誤りを検出する。`name` はエラーに載せるプロキシ名である。
+/// Detects a misconfigured `[api_proxy.oauth]` whose startup must be refused. `name` is the proxy
+/// name put in the error.
 fn validate_api_proxy_oauth(name: &str, oauth: &ApiProxyOAuthConfig) -> Result<(), String> {
     if oauth.login_cred_id.split_once(':').is_none() {
         return Err(format!(
@@ -303,7 +311,8 @@ fn validate_api_proxy_oauth(name: &str, oauth: &ApiProxyOAuthConfig) -> Result<(
     Ok(())
 }
 
-/// `[[mcp_server]]` の 1 項目。agent は `name` で選ぶだけで、コマンド・引数・環境変数は設定で固定される。
+/// One `[[mcp_server]]` entry. The agent only selects by `name`; the command, arguments, and
+/// environment variables are fixed by the configuration.
 #[derive(Clone, Debug, Deserialize)]
 struct McpServerConfig {
     name: String,
@@ -315,7 +324,8 @@ struct McpServerConfig {
     env: BTreeMap<String, String>,
 }
 
-/// `[mcp_server.env]` の値で置換するプレースホルダ。`{{secret}}` は password、`{{totp}}` は現在の TOTP である。
+/// Placeholders substituted in the values of `[mcp_server.env]`. `{{secret}}` is the password and
+/// `{{totp}}` is the current TOTP.
 const MCP_SECRET_PLACEHOLDER: &str = API_PROXY_SECRET_PLACEHOLDER;
 const MCP_USERNAME_PLACEHOLDER: &str = "{{username}}";
 const MCP_TOTP_PLACEHOLDER: &str = "{{totp}}";
@@ -331,7 +341,8 @@ fn contains_mcp_placeholder(template: &str) -> bool {
         .any(|placeholder| template.contains(placeholder))
 }
 
-/// 起動を拒否すべき `[[mcp_server]]` の設定誤りを検出する。名前空間は `[[api_proxy]]` と別である。
+/// Detects a misconfigured `[[mcp_server]]` whose startup must be refused. Its namespace is
+/// separate from `[[api_proxy]]`.
 fn validate_mcp_servers(servers: &[McpServerConfig]) -> Result<(), String> {
     let mut names = HashSet::new();
     for server in servers {
@@ -387,8 +398,10 @@ fn validate_mcp_servers(servers: &[McpServerConfig]) -> Result<(), String> {
     Ok(())
 }
 
-/// command・args・env の名前と値のいずれかが NUL を含むかを判定する。
-/// executor は NUL を含む引数・環境変数で子プロセスを起動できず実行時に拒否するため、起動時に先取りする。
+/// Checks whether any of the command, the args, or the name or value of an env entry contains a
+/// NUL.
+/// The executor cannot start a child process with an argument or environment variable containing
+/// NUL and refuses it at runtime, so this is checked ahead of time at startup.
 fn mcp_server_contains_nul(server: &McpServerConfig) -> bool {
     std::iter::once(&server.command)
         .chain(&server.args)
@@ -396,10 +409,11 @@ fn mcp_server_contains_nul(server: &McpServerConfig) -> bool {
         .any(|value| value.contains('\0'))
 }
 
-/// 上流が `https://`、または loopback ホストの `http://` であるかを判定する。
+/// Checks whether the upstream is `https://`, or `http://` on a loopback host.
 ///
-/// executor（WHATWG URL）と解釈が食い違いうる文字（制御文字・空白・バックスラッシュ）や、
-/// 解釈できないポートを含む値は、判定の取り違えを避けるため一律に拒否する。
+/// Values containing characters that the executor (WHATWG URL) may interpret differently (control
+/// characters, whitespace, backslashes),
+/// or a port that cannot be interpreted, are uniformly rejected to avoid a misjudgment.
 fn api_proxy_upstream_allowed(upstream: &str) -> bool {
     if upstream
         .chars()
@@ -528,7 +542,8 @@ fn default_unlock_mode() -> UnlockMode {
 #[derive(Debug, Deserialize)]
 struct ProviderConfig {
     namespace: String,
-    /// cookie を永続化する資格の backend id。`"*"` はその provider の全資格を表す。全 provider 種別に共通する。
+    /// Backend id of the credential whose cookies are persisted. `"*"` stands for every
+    /// credential of that provider. Common to all provider kinds.
     #[serde(default)]
     persist_cookies: Vec<String>,
     #[serde(flatten)]
@@ -636,10 +651,11 @@ struct DaemonState {
     api_proxies: HashMap<String, ApiProxyConfig>,
     mcp_servers: HashMap<String, McpServerConfig>,
     cookie_store: Arc<cookie_store::CookieStore>,
-    /// ハンドオフ前の段階ログインの台帳。
+    /// Ledger of stepwise logins before the handoff.
     stepwise: stepwise::Ledger,
-    /// デーモンが停止処理に入った（`accept_connections` を抜けた）ことを示す。
-    /// 停止処理の開始後に登録された段階ログインの `pending` を、登録直後に自ら終了させるために用いる。
+    /// Indicates that the daemon has entered shutdown processing (left `accept_connections`).
+    /// Used so that a `pending` stepwise login registered after shutdown processing began ends
+    /// itself right after registration.
     shutting_down: bool,
     #[cfg(windows)]
     sealed_blob_path: PathBuf,
@@ -738,7 +754,8 @@ struct AuditRecord<'a> {
     outcome: String,
 }
 
-/// 監査行の項目。`proxy` 以降は注入プロキシ・MCP サーバーの行でのみ値を持ち、他の行では省略される。
+/// Audit line fields. Those from `proxy` onward have values only in the lines of injection proxies
+/// and MCP servers, and are omitted in other lines.
 #[derive(Clone, Default, Serialize)]
 struct AuditFields {
     cred_id: Option<String>,
@@ -769,31 +786,37 @@ struct AuditFields {
     mcp_action: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     exit_code: Option<i64>,
-    /// 永続化対象の資格の login 行で、保管済み cookie を復元したか（`"restored"` / `"none"`）。
+    /// In the login line of a persisted credential, whether the stored cookies were restored
+    /// (`"restored"` / `"none"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     cookies: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     steps_skipped: Option<bool>,
-    /// 永続化対象の資格のブラウザが終了した行で、cookie を保管できたか。
+    /// In the line where the browser of a persisted credential ended, whether the cookies could
+    /// be stored.
     #[serde(skip_serializing_if = "Option::is_none")]
     cookies_saved: Option<bool>,
-    /// `admin_cookies_forget` の行で、削除したファイル数と全削除であるか。
+    /// In the `admin_cookies_forget` line, the number of files deleted and whether everything
+    /// was deleted.
     #[serde(skip_serializing_if = "Option::is_none")]
     removed: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     all: Option<bool>,
-    /// 段階ログインの行（`login_begin`・`login_step`・終了の行）で、その段階ログインの ID。
+    /// In the lines of a stepwise login (`login_begin`, `login_step`, and the termination
+    /// line), the ID of that stepwise login.
     #[serde(skip_serializing_if = "Option::is_none")]
     login_id: Option<String>,
-    /// `login_step` の行で、action の種別名。selector や値は載せない。
+    /// In the `login_step` line, the kind name of the action. The selector and the values are
+    /// not recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     action: Option<String>,
-    /// 段階ログインに関する行であること。
+    /// That the line concerns a stepwise login.
     #[serde(skip_serializing_if = "Option::is_none")]
     stepwise: Option<bool>,
 }
 
-/// login 行・セッション終了行に載せる cookie 永続化の監査項目。永続化対象の資格でのみ値を持つ。
+/// Cookie persistence audit fields recorded in the login line and the session termination line.
+/// They have values only for a persisted credential.
 #[derive(Clone, Copy, Default)]
 struct CookieAudit {
     cookies: Option<&'static str>,
@@ -842,9 +865,10 @@ struct HandledRequest {
     audit_shared: Option<bool>,
     audit_approval: Option<(String, bool)>,
     audit_approval_grant: Option<grants::ApprovalGrant>,
-    /// ハンドラが確定した監査項目。`Some` のとき、params から導いた項目の代わりに記録する。
+    /// Audit fields determined by the handler. When `Some`, they are recorded in place of the
+    /// fields derived from params.
     audit_fields: Option<AuditFields>,
-    /// cookie 永続化の監査項目。上記の監査項目に重ねて記録する。
+    /// Cookie persistence audit fields. Recorded on top of the audit fields above.
     audit_cookies: Option<CookieAudit>,
 }
 
@@ -951,8 +975,8 @@ enum UnixCookiesCommand {
     },
 }
 
-/// `cookies forget` の CLI 引数から `admin_cookies_forget` の params を組み立てる。
-/// cred_id と `--all` のどちらか一方だけが与えられることは clap が保証する。
+/// Builds the params of `admin_cookies_forget` from the CLI arguments of `cookies forget`.
+/// clap guarantees that exactly one of cred_id and `--all` is given.
 fn cookies_forget_params(cred_id: Option<String>, all: bool) -> Value {
     match cred_id {
         Some(cred_id) => json!({ "cred_id": cred_id }),
@@ -1298,8 +1322,10 @@ async fn serve_transport(
     // The daemon is exiting — on a stop request, a termination signal, or a
     // transport failure. Reap every live executor before returning so
     // interrupted sessions do not leave orphaned browser processes behind.
-    // フラグは、この掃討より前に登録された段階ログインの `pending` を確実に拾うため、掃討の直前に立てる。
-    // 掃討より後に登録された `pending` は、登録直後の自己終了判定（`stepwise::register_pending`）が拾う。
+    // The flag is set immediately before the sweep so that it reliably picks up the `pending`
+    // of a stepwise login registered before the sweep.
+    // A `pending` registered after the sweep is picked up by the self-termination check right
+    // after registration (`stepwise::register_pending`).
     state.lock().await.shutting_down = true;
     terminate_browsers(&state, drain_browsers(&state, None).await).await;
     stepwise::terminate(&state, None, stepwise::EndReason::Shutdown).await;
@@ -1357,7 +1383,8 @@ async fn validate_executor_socket(path: &str) -> Result<u32, io::Error> {
     Ok(uid)
 }
 
-/// executor が hello を拒否したときの説明文を返す。executor が理由を添えていれば、それをそのまま含める。
+/// Returns the explanation used when the executor refuses hello. If the executor attached a reason,
+/// it is included as is.
 fn executor_refusal(response: &ExecutorHelloResponse) -> String {
     match response.reason.as_deref() {
         Some(reason) => format!("executor reported ok=false: {reason}"),
@@ -1365,10 +1392,12 @@ fn executor_refusal(response: &ExecutorHelloResponse) -> String {
     }
 }
 
-/// spawn モードの executor を、リース時と同じ起動方法で 1 回起動し、起動前提を確かめる。
+/// Starts the spawn-mode executor once in the same way as at lease time, and checks the startup
+/// prerequisites.
 ///
-/// 完全版 Chromium の欠如などの前提不備は、リースのたびではなく起動時に止めるため、listen の前に行う。
-/// 応答の成否にかかわらず、executor は `shutdown` で終了させる。
+/// A missing prerequisite such as the full Chromium is stopped at startup rather than at every
+/// lease, so this runs before listen.
+/// Regardless of whether the response succeeds, the executor is terminated with `shutdown`.
 async fn validate_spawned_executor(config: &Config) -> Result<(), io::Error> {
     let entry = resolve_executor_entry(config);
     let node_path = resolve_node_path(config);
@@ -1393,7 +1422,8 @@ async fn validate_spawned_executor(config: &Config) -> Result<(), io::Error> {
     Ok(())
 }
 
-/// 起動済みの executor へ `hello` を 1 行送り、応答を解釈する。応答が無いまま終了した場合は失敗とする。
+/// Sends one `hello` line to a started executor and interprets the response. If it exits without
+/// responding, that is a failure.
 async fn request_executor_hello(
     executor: &mut ExecutorHandle,
 ) -> Result<ExecutorHelloResponse, String> {
@@ -1865,7 +1895,8 @@ fn spawn_session_reaper(state: SharedState) {
                 });
             }
             for (session_id, lease, executor, key, shutdown, persist_cookies) in expired {
-                // 最後のリースの満了ではブラウザが閉じるため、タブを閉じる前に cookie を書き出す。
+                // Expiry of the last lease closes the browser, so the cookies are
+                // written out before closing the tab.
                 let cookies_saved = if shutdown && persist_cookies {
                     Some(export_browser_cookies(&state, &key, &executor).await)
                 } else {
@@ -1995,7 +2026,8 @@ async fn serve_connection<S>(
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned);
                     fields.shared = handled.audit_shared;
-                    // 段階ログインを始めた行には、以後の login_step 行と対応づけるため login_id を載せる。
+                    // The line that started a stepwise login carries the
+                    // login_id to associate it with the later login_step lines.
                     if request.method == "login_begin" {
                         fields.login_id = result
                             .get("login_id")
@@ -2060,7 +2092,8 @@ async fn write_response<W: AsyncWrite + Unpin>(
     let registry = daemon.registry.lock().await;
     let leaked = scan_bytes(&response_bytes, registry.as_slice());
     drop(registry);
-    // secret を含むページに対して段階ログインを続けさせないため、差し替えた pending 応答の段階ログインは終了する。
+    // To avoid letting a stepwise login continue on a page containing a secret, the stepwise
+    // login of a replaced pending response is terminated.
     let leaked_login_id = (!leaked.is_empty())
         .then(|| stepwise::pending_login_id(&method, response.result.as_ref()))
         .flatten();
@@ -2186,8 +2219,10 @@ async fn append_audit(
     file.write_all(&bytes)
         .await
         .map_err(AppendAuditError::Write)?;
-    // tokio の File は write を裏のブロッキングタスクへ渡した時点で完了を返す。
-    // flush で書き込みの完了を待たないと、監査行がファイルに現れる前に応答が届きうる。
+    // The tokio File returns completion once the write has been handed to a background blocking
+    // task.
+    // Without waiting for the write to complete with flush, a response can arrive before the
+    // audit line appears in the file.
     file.flush().await.map_err(AppendAuditError::Write)
 }
 
@@ -2244,7 +2279,8 @@ async fn handle_request(
         "authorize_device" => authorize_device(request, state, peer).await,
         "open_api_proxy" => open_service::<ApiProxyConfig>(request, state, peer).await,
         "open_mcp_server" => open_service::<McpServerConfig>(request, state, peer).await,
-        // logout は disconnect の非推奨の別名であり、次のマイナーリリースで廃止する。
+        // logout is a deprecated alias of disconnect and will be removed in the next minor
+        // release.
         "disconnect" | "logout" => disconnect(request, state, peer).await,
         "get_totp" => get_totp(request, state).await,
         "lock_vault" => lock_vault(request, state).await,
@@ -2358,8 +2394,9 @@ struct AdminCookiesForgetParams {
     all: bool,
 }
 
-/// 保管済み cookie を削除する。`cred_id` 指定ではその資格の全 principal 分、`all` では全件を削除する。
-/// 実行中のセッションは終了させないため、そのセッションの終了時に再び保存される。
+/// Deletes the stored cookies. With `cred_id` it deletes them for all principals of that
+/// credential, and with `all` it deletes everything.
+/// A running session is not terminated, so its cookies are saved again when that session ends.
 async fn admin_cookies_forget(request: &RpcRequest, state: SharedState) -> HandledRequest {
     let params = match parse_params::<AdminCookiesForgetParams>(&request.params) {
         Ok(params) => params,
@@ -2444,7 +2481,8 @@ async fn admin_approval_decide(request: &RpcRequest, state: SharedState) -> Hand
         Ok(()) => success(request.id.clone(), json!({ "ok": true })),
         Err(approvals::NotFound) => classified(request.id.clone(), ErrorCode::NotFound),
     };
-    // どの保留にどう答えたかを監査で追えるよう、決定の内容を監査項目に載せる。
+    // The content of the decision is recorded in the audit fields so that which pending request
+    // was answered, and how, can be traced in the audit.
     handled.with_audit_approval(params.id, params.allow)
 }
 
@@ -2520,7 +2558,8 @@ async fn status(request: &RpcRequest, state: SharedState) -> HandledRequest {
         .values()
         .map(|browser| browser.leases.len())
         .sum::<usize>();
-    // `browsers` はブラウザのみを数え、注入プロキシと MCP サーバーは含めない。`leases` はすべてのリースを数える。
+    // `browsers` counts only browsers, excluding injection proxies and MCP servers. `leases`
+    // counts all leases.
     let browsers = daemon
         .browsers
         .values()
@@ -2651,7 +2690,8 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
     .with_audit_approval_grant(grant)
 }
 
-/// 承認ゲートを通過した `login` について、既存ブラウザへの相乗りまたは新規起動を行う。
+/// For a `login` that passed the approval gate, piggybacks on an existing browser or starts a new
+/// one.
 async fn start_login(
     request: &RpcRequest,
     state: SharedState,
@@ -2685,7 +2725,7 @@ async fn start_login(
             daemon.cookie_store.clone(),
         )
     };
-    // 承認ゲートとアンロック確認を通過した後にのみ、保管済み cookie を読み出す。
+    // Read the stored cookies only after passing the approval gate and the unlock check.
     let persist_cookies = cookie_store.persists(&params.cred_id);
     let restored_cookies = persist_cookies
         .then(|| cookie_store.load(&key, cookie_store::unix_now()))
@@ -2745,7 +2785,7 @@ async fn start_login(
         .with_audit_cookies(cookie_audit)
 }
 
-/// ログインを終えた executor を、リースを 1 件持つブラウザとして登録するための値。
+/// Values for registering an executor that finished login as a browser holding one lease.
 struct BrowserRegistration {
     key: sessions::BrowserKey,
     principal: String,
@@ -2754,14 +2794,15 @@ struct BrowserRegistration {
     endpoint: String,
     target_id: String,
     executor: ExecutorHandle,
-    /// executor へ次に送る要求の id。それまでに用いた id と重ならない値とする。
+    /// Id of the next request to send to the executor. It must not overlap any id used so far.
     next_id: u64,
     browser_started_at: Instant,
 }
 
-/// ログインを終えた executor をブラウザとして台帳へ登録し、応答を読む reaper を起動する。
-/// 戻り値は `login` の成功応答（`session_id`・`target_id`・`channel`）である。
-/// 登録できない場合は executor を停止して `INTERNAL` を返す。
+/// Registers an executor that finished login in the ledger as a browser, and starts a reaper that
+/// reads its responses.
+/// The return value is the success response of `login` (`session_id`, `target_id`, `channel`).
+/// If it cannot be registered, the executor is stopped and `INTERNAL` is returned.
 async fn register_login_browser(
     state: &SharedState,
     registration: BrowserRegistration,
@@ -2845,7 +2886,7 @@ async fn register_login_browser(
     }))
 }
 
-/// 起動制御を鍵ごとに取り出す。無ければ作成する。
+/// Takes out the startup control for each key, creating it if absent.
 async fn start_control(
     state: &SharedState,
     key: sessions::StartKey,
@@ -2859,9 +2900,12 @@ async fn start_control(
         .clone()
 }
 
-/// 承認ゲートが構成されている場合、資格の存在と施錠状態を確かめたうえで承認を求める。
-/// 施錠中の資格は承認を求める前に拒否する。付与の扱いは `approve_with_grant` に従う。
-/// 存在を確認できなかった資格は、付与を参照・記録せずに承認のみを求める。
+/// When the approval gate is configured, checks the existence and lock state of the credential and
+/// then asks for approval.
+/// A locked credential is rejected before approval is requested. The handling of grants follows
+/// `approve_with_grant`.
+/// For a credential whose existence could not be confirmed, approval alone is requested, without
+/// consulting or recording a grant.
 async fn gate_on_approval(
     state: &SharedState,
     cred_id: &str,
@@ -2886,8 +2930,10 @@ async fn gate_on_approval(
     approve_with_grant(state, cred_id, target_url, method, peer).await
 }
 
-/// (principal, cred_id) に有効な付与があれば承認を求めずに通し、無ければ承認を求める。
-/// 承認が成立した場合のみ付与を記録する。付与の有効期間が 0 の構成では `None` を返す。
+/// If a valid grant exists for (principal, cred_id), passes without asking for approval; otherwise
+/// asks for approval.
+/// The grant is recorded only when approval is given. Returns `None` in a configuration where the
+/// grant validity period is 0.
 async fn approve_with_grant(
     state: &SharedState,
     cred_id: &str,
@@ -2907,8 +2953,9 @@ async fn approve_with_grant(
         daemon.approval_grants.generation()
     };
     request_approval(state, cred_id, target_url, method, peer).await?;
-    // 承認待ちの間に lock_vault が付与を破棄した場合、この承認は当該要求にのみ効かせ、
-    // 付与としては記録しない。
+    // If lock_vault discarded the grant while waiting for approval, this approval applies only
+    // to the current request
+    // and is not recorded as a grant.
     let issued = state.lock().await.approval_grants.issue(
         principal,
         cred_id.to_owned(),
@@ -2918,7 +2965,8 @@ async fn approve_with_grant(
     Ok(issued.then_some(grants::ApprovalGrant::Issued))
 }
 
-/// 資格を解決し、存在しなければ `INVALID_CREDENTIAL`、施錠中なら `VAULT_LOCKED` とする。
+/// Resolves the credential, yielding `INVALID_CREDENTIAL` if it does not exist and `VAULT_LOCKED`
+/// if it is locked.
 async fn resolve_unlocked_credential(
     state: &SharedState,
     cred_id: &str,
@@ -2932,8 +2980,10 @@ async fn resolve_unlocked_credential(
     Ok(credential)
 }
 
-/// namespace の資格プロバイダが施錠中かを判定する。プロバイダが見つからなければ施錠中とはしない。
-/// 資格 1 件を解決しない分、`resolve_unlocked_credential` より安価に呼べる。
+/// Checks whether the credential provider of the namespace is locked. If the provider is not found,
+/// it is not treated as locked.
+/// It can be called more cheaply than `resolve_unlocked_credential` because it does not resolve a
+/// credential.
 async fn namespace_locked(state: &SharedState, namespace: &str) -> bool {
     let provider = {
         let daemon = state.lock().await;
@@ -2996,7 +3046,7 @@ async fn authorize_device(
             return classified(request.id.clone(), error).with_audit_approval_grant(grant);
         }
     };
-    // 承認ゲートとアンロック確認を通過した後にのみ、保管済み cookie を読み出す。
+    // Read the stored cookies only after passing the approval gate and the unlock check.
     let login_cookies = LoginCookies::load(&state, key).await;
     let restored_cookies = login_cookies.as_ref().and_then(LoginCookies::wire_cookies);
     let (executor_entry, executor_socket, node_path, browsers_path) = {
@@ -3024,9 +3074,11 @@ async fn authorize_device(
     .with_audit_approval_grant(grant)
 }
 
-/// 設定済みのサービスを専用の executor 接続で起動し、排他リースとして登録する。
+/// Starts a configured service on a dedicated executor connection and registers it as an exclusive
+/// lease.
 ///
-/// 監査項目は agent が params に添えた値ではなく、名前で引いた設定の値から確定する。
+/// The audit fields are determined from the values of the configuration looked up by name, not from
+/// values the agent attached to params.
 async fn open_service<S: HostedService>(
     request: &RpcRequest,
     state: SharedState,
@@ -3076,9 +3128,10 @@ async fn open_service<S: HostedService>(
     .with_audit_approval_grant(grant)
 }
 
-/// 承認ゲートを通過したサービスを起動制御を経て起動し、リースを登録して
-/// `(session_id, port, secret, cookie 永続化の監査項目)` を返す。
-/// `cred_id` と `namespace` は承認対象から分割済みの値である。
+/// Starts a service that passed the approval gate through the startup control, registers the lease,
+/// and
+/// returns `(session_id, port, secret, cookie persistence audit fields)`.
+/// `cred_id` and `namespace` are values already split from the approval subject.
 async fn start_service_session<S: HostedService>(
     state: &SharedState,
     peer: &PeerIdentity,
@@ -3096,7 +3149,7 @@ async fn start_service_session<S: HostedService>(
         return Err(ErrorCode::RateLimited);
     }
     let credential = resolve_unlocked_credential(state, &cred_id).await?;
-    // 承認ゲートとアンロック確認を通過した後にのみ、保管済み cookie を読み出す。
+    // Read the stored cookies only after passing the approval gate and the unlock check.
     let login_cookies = if service.logs_in_browser() {
         let key = sessions::BrowserKey::new(peer.principal(), namespace.clone(), cred_id.clone());
         LoginCookies::load(state, key).await
@@ -3148,46 +3201,52 @@ async fn start_service_session<S: HostedService>(
     Ok((session_id, port, secret, cookie_audit))
 }
 
-/// 起動したサービスの executor と、その成功応答から取り出した値。
+/// The executor of a started service, and the values extracted from its success response.
 struct ServiceStarted {
     port: u16,
     secret: String,
     executor: ExecutorHandle,
-    /// ブラウザログインを伴う起動での cookie 永続化の値。それ以外の起動では既定値とする。
+    /// Cookie persistence values for a startup that involves a browser login. The default for
+    /// other startups.
     returned_cookies: ReturnedCookies,
 }
 
-/// executor 接続 1 本を占有するサービスの設定。`open_service` と `start_service_session` のうち、
-/// サービスの種類によって異なる部分（設定の引き方・承認対象・起動要求・応答の形）を与える。
+/// Settings of a service that occupies one executor connection. Provides the parts of
+/// `open_service` and `start_service_session`
+/// that differ by service kind (how the configuration is looked up, the approval subject, the
+/// startup request, and the shape of the response).
 trait HostedService: Clone {
     const KIND: ServiceKind;
-    /// RPC のパラメータ。agent は設定上の名前でのみ選ぶ。
+    /// RPC parameters. The agent selects only by the name in the configuration.
     type Params: for<'de> Deserialize<'de>;
-    /// 資格を解決した後に executor へ渡す起動値。解決済みの秘密を含む。
+    /// Startup value passed to the executor after the credential is resolved. Contains the
+    /// resolved secret.
     type Launch;
 
     fn requested_name(params: &Self::Params) -> String;
     fn lookup(daemon: &DaemonState, name: &str) -> Option<Self>;
     fn name(&self) -> &str;
-    /// 承認と解決の対象とする資格。設定から定まらない場合は `None` とする。
+    /// Credential subject to approval and resolution. `None` when it is not determined by the
+    /// configuration.
     fn cred_id(&self) -> Option<&str>;
-    /// 承認と監査に載せる対象。
+    /// Subject recorded in approval and audit.
     fn target_url(&self) -> String;
-    /// 起動の際に資格でブラウザログインを行うか。真であれば、そのログインに保管済み cookie を用いる。
+    /// Whether the startup performs a browser login with the credential. If true, the stored
+    /// cookies are used for that login.
     fn logs_in_browser(&self) -> bool;
-    /// `cookies` は、ブラウザログインの前に復元する保管済み cookie である。
+    /// `cookies` are the stored cookies restored before the browser login.
     fn build_launch(
         &self,
         credential: &ResolvedCredential,
         cookies: Option<Vec<Value>>,
     ) -> Result<Self::Launch, ErrorCode>;
-    /// executor 接続を 1 本開いてサービスを起動する。
+    /// Opens one executor connection and starts the service.
     async fn start_executor(
         &self,
         settings: &ServiceLaunchSettings,
         launch: Self::Launch,
     ) -> Result<ServiceStarted, ErrorCode>;
-    /// 起動に成功した場合の RPC の結果。
+    /// RPC result when startup succeeds.
     fn open_result(session_id: &str, port: u16, secret: &str) -> Value;
 }
 
@@ -3307,7 +3366,8 @@ impl HostedService for McpServerConfig {
     }
 }
 
-/// executor 接続 1 本を占有するサービスの種類。リースの解放要求とイベント行の扱いを決める。
+/// Kind of service that occupies one executor connection. Determines how the lease release request
+/// and the event lines are handled.
 #[derive(Clone, Copy)]
 enum ServiceKind {
     ApiProxy,
@@ -3322,7 +3382,7 @@ impl ServiceKind {
         }
     }
 
-    /// サービスを開く RPC 名。承認ゲートへ渡す。
+    /// RPC name that opens the service. Passed to the approval gate.
     fn open_method(self) -> &'static str {
         match self {
             Self::ApiProxy => "open_api_proxy",
@@ -3337,7 +3397,8 @@ impl ServiceKind {
         }
     }
 
-    /// 設定上の名前を、種類に応じた監査項目（`proxy` または `mcp_server`）に載せた値を返す。
+    /// Returns the name in the configuration, put in the audit field that matches the kind
+    /// (`proxy` or `mcp_server`).
     fn named_audit_fields(self, name: String) -> AuditFields {
         let name = Some(name);
         let (proxy, mcp_server) = match self {
@@ -3351,7 +3412,7 @@ impl ServiceKind {
         }
     }
 
-    /// 停止要求の op と応答待ちの上限。
+    /// The op of the stop request and the upper bound on waiting for its response.
     fn stop_request(self) -> (&'static str, Duration) {
         match self {
             Self::ApiProxy => ("api_proxy_stop", API_PROXY_STOP_TIMEOUT),
@@ -3360,7 +3421,7 @@ impl ServiceKind {
     }
 }
 
-/// 起動済みのサービスをリースとして登録するための値。`name` は設定上の名前である。
+/// Values for registering a started service as a lease. `name` is the name in the configuration.
 struct ServiceLease {
     kind: ServiceKind,
     name: String,
@@ -3371,8 +3432,9 @@ struct ServiceLease {
     deadline: Instant,
 }
 
-/// 起動済みのサービスの executor 接続を排他リース 1 件として登録し、イベント行の読み取りを始める。
-/// 登録できなかった場合は executor を停止する。発行した session_id を返す。
+/// Registers the executor connection of a started service as one exclusive lease and starts reading
+/// event lines.
+/// If it cannot be registered, the executor is stopped. Returns the issued session_id.
 async fn register_service_lease(
     state: &SharedState,
     peer: &PeerIdentity,
@@ -3402,8 +3464,9 @@ async fn register_service_lease(
     });
     let session_id = Uuid::new_v4().to_string();
     let now = Instant::now();
-    // サービスは共有しないため shared_browsers には登録しない。endpoint は CDP の
-    // 相乗りにのみ使われる値であり、path secret などを残さないよう空とする。
+    // A service is not shared, so it is not registered in shared_browsers. The endpoint is a
+    // value used only for
+    // CDP piggybacking, so it is left empty so that no path secret or the like remains.
     let browser = sessions::Browser {
         key: sessions::BrowserKey::new(principal.clone(), namespace.clone(), cred_id.clone()),
         executor: connection.clone(),
@@ -3452,7 +3515,7 @@ async fn register_service_lease(
     Ok(session_id)
 }
 
-/// サービスの起動に用いる executor の起動経路とリースの寿命の設定。
+/// Settings of the executor startup route used to start a service, and of the lease lifetime.
 struct ServiceLaunchSettings {
     executor_entry: PathBuf,
     executor_socket: Option<PathBuf>,
@@ -3474,18 +3537,23 @@ async fn service_launch_settings(state: &SharedState) -> ServiceLaunchSettings {
     }
 }
 
-/// `mcp_server_start` に載せる環境変数と漏洩検査の対象文字列。いずれも解決済みの秘密を含むため
-/// `Zeroizing` で保持し、`Debug` は導出しない。
+/// Environment variables and the leak scan target strings carried in `mcp_server_start`. Both
+/// contain resolved secrets, so
+/// they are held in `Zeroizing` and `Debug` is not derived.
 struct McpServerLaunch {
     env: BTreeMap<String, Zeroizing<String>>,
     scan: Vec<Zeroizing<String>>,
 }
 
-/// `[mcp_server.env]` のプレースホルダを資格の値で置換し、漏洩検査の対象文字列を作る。
+/// Replaces the placeholders in `[mcp_server.env]` with the credential's values and builds the leak
+/// scan target strings.
 ///
-/// 検査の対象は password と、`{{secret}}` または `{{totp}}` を含んでいた値の置換後の値である
-/// （空文字を除き、重複を除去する）。`{{username}}` のみを含む値は対象としない。
-/// `{{totp}}` を使う設定で資格が TOTP の seed を持たない場合は `INTERNAL` とする。
+/// The scan targets are the password and the substituted values of the entries that contained
+/// `{{secret}}` or `{{totp}}`
+/// (excluding empty strings and removing duplicates). Values containing only `{{username}}` are not
+/// targets.
+/// If the configuration uses `{{totp}}` and the credential has no TOTP seed, the result is
+/// `INTERNAL`.
 fn build_mcp_server_launch(
     templates: &BTreeMap<String, String>,
     credential: &ResolvedCredential,
@@ -3532,25 +3600,28 @@ fn build_mcp_server_launch(
     Ok(McpServerLaunch { env, scan })
 }
 
-/// 空文字と既出の値を除いて、漏洩検査の対象文字列へ加える。
+/// Adds to the leak scan target strings, excluding empty strings and values already present.
 fn push_scan_value(scan: &mut Vec<Zeroizing<String>>, value: &str) {
     if !value.is_empty() && !scan.iter().any(|existing| existing.as_str() == value) {
         scan.push(Zeroizing::new(value.to_owned()));
     }
 }
 
-/// プレースホルダ 1 種と置換する値。`scanned` は、これを含んだ値を漏洩検査の対象とするかである。
+/// One kind of placeholder and the value that replaces it. `scanned` indicates whether a value
+/// containing it is a leak scan target.
 struct McpPlaceholderValue<'a> {
     placeholder: &'static str,
     value: &'a str,
     scanned: bool,
 }
 
-/// テンプレートを先頭から 1 回だけ走査してプレースホルダを置換し、`scanned` のプレースホルダを
-/// 1 つでも置換したかを添えて返す。
+/// Scans the template once from the start and substitutes the placeholders, returning
+/// whether at least one `scanned` placeholder was substituted.
 ///
-/// 置換後の値を再走査しないため、資格の値に含まれるプレースホルダ形の文字列は展開されない。
-/// 置換中の再確保で秘密の断片が解放済み領域に残らないよう、上限の長さを先に確保する。
+/// The substituted values are not scanned again, so placeholder-shaped strings contained in the
+/// credential's values are not expanded.
+/// The capacity for the upper bound is reserved first so that no fragment of the secret remains in
+/// freed memory through reallocation during substitution.
 fn render_mcp_env_value(
     template: &str,
     values: &[McpPlaceholderValue<'_>],
@@ -3582,9 +3653,10 @@ fn render_mcp_env_value(
     (rendered, scanned)
 }
 
-/// OAuth の注入プロキシについて `api_proxy_start` に載せる値を組み立てる。
-/// ログイン URL は資格の URI を優先し、無いか空であれば device authorization endpoint の origin とする。
-/// `cookies` は、ブラウザログインの前に復元する保管済み cookie である。
+/// Builds the values carried in `api_proxy_start` for an OAuth injection proxy.
+/// The login URL prefers the credential's URI, and falls back to the origin of the device
+/// authorization endpoint if it is absent or empty.
+/// `cookies` are the stored cookies restored before the browser login.
 fn build_oauth_start(
     value_template: &str,
     oauth: &ApiProxyOAuthConfig,
@@ -3669,8 +3741,8 @@ async fn credential_refs(
     Ok(Some((refs, locked)))
 }
 
-/// URL を scheme・authority・それ以降（path・query・fragment）に分ける。
-/// authority は `://` の後、最初の `/`・`?`・`#` の手前までである。
+/// Splits a URL into scheme, authority, and the rest (path, query, fragment).
+/// The authority runs from after `://` up to just before the first `/`, `?`, or `#`.
 fn split_authority(value: &str) -> Option<(&str, &str, &str)> {
     let (scheme, remainder) = value.split_once("://")?;
     let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
@@ -3696,7 +3768,8 @@ fn http_origin(value: &str) -> Option<String> {
 fn audit_target_url(value: &str) -> Option<String> {
     let origin = http_origin(value)?;
     let (scheme, authority) = origin.split_once("://")?;
-    // userinfo（`user:pw@`）は認証情報を含みうるため、監査と承認フックへ渡す前に除く。
+    // The userinfo (`user:pw@`) may contain authentication information, so it is removed before
+    // being passed to the audit and the approval hook.
     let host = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
@@ -3729,10 +3802,11 @@ fn valid_authorize_steps(steps: Option<&[tegata_core::wire::LoginStep]>) -> bool
     })
 }
 
-/// 承認ゲートが確かめた資格の状態。
+/// State of the credential confirmed by the approval gate.
 struct CredentialState {
     locked: bool,
-    /// 列挙結果に資格が含まれ、存在を確認できたか。
+    /// Whether the credential was included in the enumeration result and its existence could be
+    /// confirmed.
     confirmed: bool,
 }
 
@@ -3752,7 +3826,8 @@ async fn credential_state(
             confirmed: true,
         }));
     }
-    // 施錠中は列挙が空になりうるため通すが、存在は確認できていない。
+    // While locked the enumeration can be empty, so it is let through, but the existence has
+    // not been confirmed.
     if locked && refs.is_empty() {
         return Ok(Some(CredentialState {
             locked: false,
@@ -3767,8 +3842,10 @@ async fn approve_authorize_device(
     params: &AuthorizeDeviceParams,
     peer: &PeerIdentity,
 ) -> Result<Option<grants::ApprovalGrant>, ErrorCode> {
-    // verification_uri_complete の query に載る user_code を承認フックや保留一覧へ
-    // 広げないため、監査と同じく query・fragment・userinfo を除いた URL を渡す。
+    // To avoid spreading the user_code carried in the query of verification_uri_complete to the
+    // approval hook and the pending list,
+    // the URL is passed with the query, fragment, and userinfo removed, the same as in the
+    // audit.
     let target_url = audit_target_url(&params.verification_url).ok_or(ErrorCode::Internal)?;
     approve_with_grant(
         state,
@@ -3799,7 +3876,8 @@ async fn approve_command(
     let Some(approve_cmd) = approve_cmd else {
         return Ok(());
     };
-    // 照合番号は要求ごとの束縛であり secret ではない。照合は hook 側の責務とする。
+    // The verification number is a per-request binding and not a secret. Verification is the
+    // responsibility of the hook side.
     let approval_code = grants::approval_code().map_err(|_| ErrorCode::Internal)?;
     let peer_uid = match peer {
         PeerIdentity::Uid(uid) => uid.to_string(),
@@ -3835,8 +3913,9 @@ async fn approve_command(
     }
 }
 
-/// 承認ゲートが構成されているかを返す。Unix は `approve_cmd`、Windows は
-/// `approve_operator` の保留キューを用いる。
+/// Returns whether the approval gate is configured. Unix uses `approve_cmd`, and Windows uses the
+/// pending queue of
+/// `approve_operator`.
 fn approval_required(daemon: &DaemonState) -> bool {
     #[cfg(unix)]
     {
@@ -3848,8 +3927,8 @@ fn approval_required(daemon: &DaemonState) -> bool {
     }
 }
 
-/// 構成された承認手段に承認を求める。Unix は `approve_cmd` を起動し、Windows は
-/// 保留キューに登録して操作者の決定を待つ。
+/// Asks the configured approval means for approval. Unix starts `approve_cmd`, and Windows
+/// registers in the pending queue and waits for the operator's decision.
 async fn request_approval(
     state: &SharedState,
     cred_id: &str,
@@ -3867,7 +3946,8 @@ async fn request_approval(
     }
 }
 
-/// 保留キューに登録し、昇格した操作者の管理 RPC による決定を待つ。
+/// Registers in the pending queue and waits for the decision made through the management RPC of an
+/// elevated operator.
 #[cfg(windows)]
 async fn approve_by_operator(
     state: &SharedState,
@@ -3899,7 +3979,8 @@ async fn approve_by_operator(
         })
 }
 
-/// 呼び出し元のリースを終え、最後のリースであればブラウザを閉じる。サイト側のセッションには触れない。
+/// Ends the caller's lease and closes the browser if it was the last lease. The session on the site
+/// side is not touched.
 async fn disconnect(
     request: &RpcRequest,
     state: SharedState,
@@ -3947,7 +4028,8 @@ async fn disconnect(
     };
     let mut cookie_audit = None;
     if let Some((lease, executor, empty, cookie_key)) = removed {
-        // 最後のリースの終了ではブラウザが閉じるため、タブを閉じる前に cookie を書き出す。
+        // The end of the last lease closes the browser, so the cookies are written out
+        // before closing the tab.
         if empty && let Some(key) = cookie_key {
             let saved = export_browser_cookies(&state, &key, &executor).await;
             cookie_audit = Some(CookieAudit::session_end(Some(saved)));
@@ -4080,18 +4162,23 @@ async fn terminate_browser(
     release_leases: bool,
 ) {
     let namespace = browser.key.namespace.clone();
-    // ブラウザ全体が閉じる前に、永続化対象であれば cookie を書き出す。
+    // If the browser is subject to persistence, its cookies are written out before the whole
+    // browser closes.
     let cookies_saved = if browser.persist_cookies {
         Some(export_browser_cookies(state, &browser.key, &browser.executor).await)
     } else {
         None
     };
     let leases = browser.leases.into_iter().collect::<Vec<_>>();
-    // executor が応答しない場合に全リース分の待機を積み上げないよう、最初の失敗で個別解放を打ち切る。
-    // executor の停止でブラウザ全体が閉じるため、残りのタブは停止処理で回収される。
-    // 注入プロキシと MCP サーバーのリースは release_leases が偽でも停止要求で解放する。executor は
-    // この要求の中で OAuth トークンの失効や MCP サーバーの終了・一時ディレクトリの削除を行うため、
-    // 停止処理の短い待機で打ち切らせない。
+    // To avoid accumulating the wait for every lease when the executor does not respond,
+    // individual releases are abandoned at the first failure.
+    // Stopping the executor closes the whole browser, so the remaining tabs are reclaimed by
+    // the stop processing.
+    // The leases of injection proxies and MCP servers are released by a stop request even when
+    // release_leases is false. Within
+    // this request the executor revokes the OAuth token, terminates the MCP server, and deletes
+    // the temporary directory,
+    // so it must not be cut off by the short wait of the stop processing.
     for (_, lease) in &leases {
         if !release_leases && !lease.target.is_service() {
             continue;
@@ -4169,7 +4256,8 @@ async fn terminate_peer_leases(state: SharedState, peer_id: &str) {
         if shutdown {
             shutdown_executor(executor).await;
         }
-        // 失効した peer の cookie は以後使われないため書き出さず、保管しなかったことを記録する。
+        // The cookies of a revoked peer will not be used afterward, so they are not written
+        // out, and the fact that they were not stored is recorded.
         let cookies_saved = (shutdown && persist_cookies).then_some(false);
         let daemon = state.lock().await;
         if let Err(error) = append_audit(
@@ -4412,9 +4500,10 @@ fn forward_executor_stderr(child: &mut Child) {
     });
 }
 
-/// executor へ id 1 の初回要求を 1 行書き込み、応答を 1 行読む。
+/// Writes the initial request with id 1 to the executor as one line and reads one response line.
 ///
-/// 要求は秘密を含みうるため、値は直列化の直後に破棄し、直列化したバイト列は書き込み後に消去する。
+/// The request may contain secrets, so the value is discarded immediately after serialization, and
+/// the serialized bytes are erased after the write.
 async fn exchange_first_request<T: Serialize>(
     executor: &mut ExecutorHandle,
     request: T,
@@ -4436,8 +4525,10 @@ async fn exchange_first_request<T: Serialize>(
     Ok(response_line)
 }
 
-/// executor 接続を 1 本開いて初回要求を送り、応答行を `parse_response` で解釈する。
-/// 接続を保持し続ける要求（login・api_proxy_start）に用い、失敗時は executor を停止する。
+/// Opens one executor connection, sends the initial request, and interprets the response line with
+/// `parse_response`.
+/// Used for requests that keep the connection open (login and api_proxy_start), and stops the
+/// executor on failure.
 async fn open_executor_with<T, R, E>(
     entry: &Path,
     executor_socket: Option<&Path>,
@@ -4477,7 +4568,8 @@ fn current_totp(credential: &ResolvedCredential) -> Option<String> {
     })
 }
 
-/// executor への `login` 要求。`cookies` は復元する保管済み cookie であり、復元しない場合は null とする。
+/// `login` request to the executor. `cookies` are the stored cookies to restore, and null when
+/// nothing is restored.
 #[derive(Serialize)]
 struct ExecutorLoginWithCookies<'a> {
     #[serde(flatten)]
@@ -4485,17 +4577,17 @@ struct ExecutorLoginWithCookies<'a> {
     cookies: Option<&'a [cookie_store::Cookie]>,
 }
 
-/// executor の `login` 成功応答から取り出した値。
+/// Values extracted from the successful `login` response of the executor.
 struct ParsedLoginResponse {
     endpoint: String,
     target_id: String,
-    /// そのときの context の全 cookie。古い executor では欠ける。
+    /// All cookies of the context at that time. Absent from older executors.
     cookies: Option<Value>,
-    /// 復元した cookie によりステップを省略したか。欠けている場合は偽とみなす。
+    /// Whether steps were skipped thanks to the restored cookies. Treated as false when absent.
     steps_skipped: bool,
 }
 
-/// 起動した login ブラウザの executor と、その成功応答。
+/// Executor of a started login browser, and its success response.
 struct ExecutorLoginStarted {
     endpoint: String,
     target_id: String,
@@ -4547,8 +4639,10 @@ async fn start_executor(
     })
 }
 
-/// `login` への応答から CDP の endpoint と target_id、および cookie 永続化の値を取り出す。
-/// `cookies` と `steps_skipped` は古い executor では欠けるため、欠けていても成功として扱う。
+/// Extracts the CDP endpoint, the target_id, and the cookie persistence values from the response to
+/// `login`.
+/// `cookies` and `steps_skipped` are absent from older executors, so their absence is still treated
+/// as success.
 fn parse_login_response(line: &str) -> Result<ParsedLoginResponse, ExecutorFailure> {
     let response: ExecutorResponse = serde_json::from_str(line).map_err(|_| ErrorCode::Internal)?;
     if response.id != Some(1) {
@@ -4580,7 +4674,8 @@ fn parse_login_response(line: &str) -> Result<ParsedLoginResponse, ExecutorFailu
     }
 }
 
-/// executor への `authorize_device` 要求を組み立てる。`cookies` はログイン段の前に復元する保管済み cookie である。
+/// Builds the `authorize_device` request to the executor. `cookies` are the stored cookies restored
+/// before the login steps.
 fn authorize_device_request(
     params: &AuthorizeDeviceParams,
     login_url: String,
@@ -4605,8 +4700,9 @@ fn authorize_device_request(
     }
 }
 
-/// executor 接続を 1 本開いて `build_request` の `authorize_device` 要求を送り、応答後に接続を停止する。
-/// 成功時は応答に載る cookie 永続化の値を返す。
+/// Opens one executor connection, sends the `authorize_device` request of `build_request`, and
+/// stops the connection after the response.
+/// On success it returns the cookie persistence values carried in the response.
 async fn authorize_device_with_executor(
     entry: &Path,
     executor_socket: Option<&Path>,
@@ -4647,8 +4743,10 @@ async fn shutdown_authorize_executor(executor: &mut ExecutorHandle) {
     shutdown_executor_handle(executor, 2).await;
 }
 
-/// `ExecutorHandle` へ `shutdown` を送り、応答を待ったうえで停止する。応答が無ければ強制終了する。
-/// `authorize_device` の使い捨て接続と、段階ログインの `stop_pending` とで共有する手順である。
+/// Sends `shutdown` to an `ExecutorHandle`, waits for the response, and then stops it. If there is
+/// no response, it is forcibly terminated.
+/// This procedure is shared by the throwaway connection of `authorize_device` and the
+/// `stop_pending` of a stepwise login.
 async fn shutdown_executor_handle(executor: &mut ExecutorHandle, id: u64) {
     let Ok(mut request) = serde_json::to_vec(&json!({ "op": "shutdown", "id": id })) else {
         return;
@@ -4663,7 +4761,8 @@ async fn shutdown_executor_handle(executor: &mut ExecutorHandle, id: u64) {
     }
 }
 
-/// executor 接続を 1 本開き、`api_proxy_start` を送ってリスナーのポートと path secret を受け取る。
+/// Opens one executor connection, sends `api_proxy_start`, and receives the listener port and the
+/// path secret.
 async fn start_api_proxy_executor(
     settings: &ServiceLaunchSettings,
     proxy: &ApiProxyConfig,
@@ -4701,7 +4800,8 @@ async fn start_api_proxy_executor(
     })
 }
 
-/// executor 接続を 1 本開き、`mcp_server_start` を送って中継のリスナーのポートと stream secret を受け取る。
+/// Opens one executor connection, sends `mcp_server_start`, and receives the relay listener port
+/// and the stream secret.
 async fn start_mcp_server_executor(
     settings: &ServiceLaunchSettings,
     server: &McpServerConfig,
@@ -4728,8 +4828,8 @@ async fn start_mcp_server_executor(
     Ok((port, stream_secret, executor))
 }
 
-/// `mcp_server_start` への応答から中継のリスナーのポートと stream secret を取り出す。
-/// executor の失敗は分類せず一律に `INTERNAL` とする。
+/// Extracts the relay listener port and the stream secret from the response to `mcp_server_start`.
+/// Executor failures are not classified and uniformly yield `INTERNAL`.
 fn parse_mcp_server_start_response(line: &str) -> Result<(u16, String), ErrorCode> {
     let response: ExecutorMcpServerStartResponse =
         serde_json::from_str(line).map_err(|_| ErrorCode::Internal)?;
@@ -4747,8 +4847,9 @@ fn parse_mcp_server_start_response(line: &str) -> Result<(u16, String), ErrorCod
     Ok((port, stream_secret))
 }
 
-/// `api_proxy_start` への応答からリスナーのポートと path secret を取り出す。
-/// OAuth の場合は、ブラウザログインの cookie 永続化の値も取り出す（静的トークンでは既定値とする）。
+/// Extracts the listener port and the path secret from the response to `api_proxy_start`.
+/// For OAuth it also extracts the cookie persistence values of the browser login (the default for a
+/// static token).
 fn parse_api_proxy_start_response(
     line: &str,
     oauth_enabled: bool,
@@ -4785,11 +4886,12 @@ fn parse_api_proxy_start_response(
     Ok((port, secret, returned_cookies))
 }
 
-/// executor が返す秘密値が、空でない base64url の文字列であるかを判定する。
+/// Checks whether a secret value returned by the executor is a non-empty base64url string.
 ///
-/// 注入プロキシの path secret は base_url の 1 セグメントとして、MCP サーバーの stream secret は
-/// 中継への接続でランナーが最初に送る 1 行として、いずれも加工せずにそのまま用いる。区切り文字や改行が
-/// 混入して解釈が変わることを避けるため、base64url の文字だけを受け入れる。
+/// The path secret of an injection proxy is used as is, as one segment of base_url, and the stream
+/// secret of an MCP server is used as is,
+/// as the first line the runner sends when connecting to the relay. To avoid a delimiter or newline
+/// slipping in and changing the interpretation, only base64url characters are accepted.
 fn valid_base64url_secret(secret: &str) -> bool {
     !secret.is_empty()
         && secret
@@ -4945,7 +5047,8 @@ async fn executor_release(
     })
 }
 
-/// サービスの種類に応じた停止要求を送り、応答が `ok: true` であるかを確かめる。
+/// Sends the stop request that matches the kind of service and checks that the response is `ok:
+/// true`.
 async fn executor_service_stop(
     connection: &Arc<ExecutorConnection>,
     kind: ServiceKind,
@@ -4962,7 +5065,8 @@ async fn executor_service_stop(
         .ok_or(ErrorCode::Internal)
 }
 
-/// リースが占有する executor 上の資源を、その種類に応じた要求で解放する。
+/// Releases the resources on the executor that a lease occupies, with the request that matches its
+/// kind.
 async fn release_lease(
     connection: &Arc<ExecutorConnection>,
     target: &sessions::LeaseTarget,
@@ -4980,7 +5084,8 @@ async fn release_lease(
     }
 }
 
-/// executor から受け取った cookie を保管する。保管できたかを返し、失敗は値を含めずに stderr へ記録する。
+/// Stores the cookies received from the executor. Returns whether they could be stored, and records
+/// a failure to stderr without including the values.
 fn save_cookies(
     store: &cookie_store::CookieStore,
     key: &sessions::BrowserKey,
@@ -4995,17 +5100,17 @@ fn save_cookies(
     }
 }
 
-/// executor の成功応答に載る cookie 永続化の値。
+/// Cookie persistence values carried in the success response of the executor.
 #[derive(Default)]
 struct ReturnedCookies {
-    /// 成功時点の context の全 cookie。
+    /// All cookies of the context at the time of success.
     cookies: Option<Value>,
-    /// 復元した cookie によりログイン段を省略したか。
+    /// Whether the login steps were skipped thanks to the restored cookies.
     steps_skipped: bool,
 }
 
-/// 成功応答の行から `cookies` と `steps_skipped` を取り出す。
-/// 古い executor では欠けるため、欠けていれば cookie なし・省略なしとして扱う。
+/// Extracts `cookies` and `steps_skipped` from the success response line.
+/// They are absent from older executors, so their absence is treated as no cookies and no skipping.
 fn parse_returned_cookies(line: &str) -> ReturnedCookies {
     let mut response = serde_json::from_str::<Value>(line).unwrap_or(Value::Null);
     ReturnedCookies {
@@ -5020,8 +5125,9 @@ fn parse_returned_cookies(line: &str) -> ReturnedCookies {
     }
 }
 
-/// 使い捨てのブラウザでログインする経路（`authorize_device`・OAuth の注入プロキシ）について、
-/// 永続化対象の資格の保管先と、ログインの前に読み出した保管済み cookie。
+/// For the routes that log in with a throwaway browser (`authorize_device` and the OAuth injection
+/// proxy),
+/// the storage location of a persisted credential and the stored cookies read before the login.
 struct LoginCookies {
     store: Arc<cookie_store::CookieStore>,
     key: sessions::BrowserKey,
@@ -5029,8 +5135,9 @@ struct LoginCookies {
 }
 
 impl LoginCookies {
-    /// 資格が永続化対象であれば保管済み cookie を読み出し、対象外であれば `None` を返す。
-    /// 承認ゲートとアンロック確認を通過した後にのみ呼ぶ。
+    /// Reads the stored cookies if the credential is persisted, and returns `None` if it is
+    /// not.
+    /// Call only after passing the approval gate and the unlock check.
     async fn load(state: &SharedState, key: sessions::BrowserKey) -> Option<Self> {
         let store = state.lock().await.cookie_store.clone();
         if !store.persists(&key.cred_id) {
@@ -5044,7 +5151,8 @@ impl LoginCookies {
         })
     }
 
-    /// executor への要求に載せる形の復元 cookie。復元するものが無ければ `None` を返す。
+    /// Restored cookies in the shape carried in the request to the executor. Returns `None` if
+    /// there is nothing to restore.
     fn wire_cookies(&self) -> Option<Vec<Value>> {
         self.restored.as_ref().map(|cookies| {
             cookies
@@ -5054,7 +5162,8 @@ impl LoginCookies {
         })
     }
 
-    /// 成功応答の cookie を保管し、監査項目を返す。ログインが成功した場合にのみ呼ぶ。
+    /// Stores the cookies of the success response and returns the audit fields. Call only when
+    /// the login succeeded.
     fn finish(self, returned: ReturnedCookies) -> CookieAudit {
         if let Some(cookies) = returned.cookies.as_ref() {
             save_cookies(&self.store, &self.key, cookies);
@@ -5063,11 +5172,12 @@ impl LoginCookies {
     }
 }
 
-/// executor に `export_cookies` を送り、応答の cookie 配列を返す。
-/// `executor_request` は書き込み・応答受信などの各段階をそれぞれ独立に
-/// `EXECUTOR_SHUTDOWN_TIMEOUT` で待つため、呼び出し全体を単一の
-/// `timeout(EXECUTOR_SHUTDOWN_TIMEOUT, ..)` で包み、全体としても
-/// `EXECUTOR_SHUTDOWN_TIMEOUT` を超えないように打ち切る。失敗・異常応答では `None` を返す。
+/// Sends `export_cookies` to the executor and returns the cookie array of the response.
+/// `executor_request` waits for each stage, such as writing and receiving the response,
+/// independently
+/// with `EXECUTOR_SHUTDOWN_TIMEOUT`, so the whole call is wrapped in a single
+/// `timeout(EXECUTOR_SHUTDOWN_TIMEOUT, ..)` to cut it off so that the total also does not exceed
+/// `EXECUTOR_SHUTDOWN_TIMEOUT`. Returns `None` on failure or an abnormal response.
 async fn executor_export_cookies(connection: &Arc<ExecutorConnection>) -> Option<Value> {
     let mut response = timeout(
         EXECUTOR_SHUTDOWN_TIMEOUT,
@@ -5089,8 +5199,9 @@ async fn executor_export_cookies(connection: &Arc<ExecutorConnection>) -> Option
         .filter(Value::is_array)
 }
 
-/// 永続化対象のブラウザについて、終了前に cookie を書き出して保管する。保管できたかを返す。
-/// 保管できなかった場合も既存のファイルには触れない。
+/// For a browser subject to persistence, writes out and stores the cookies before it ends. Returns
+/// whether they could be stored.
+/// Even when they could not be stored, the existing file is not touched.
 async fn export_browser_cookies(
     state: &SharedState,
     key: &sessions::BrowserKey,
@@ -5201,8 +5312,9 @@ async fn stop_child(mut executor: ExecutorHandle) {
     }
 }
 
-/// サービス（注入プロキシ・MCP サーバー）の executor が書くイベント行を、監査とリースの終了へつなぐための文脈。
-/// `browser_id` はリースを収めた `DaemonState::browsers` の鍵である。
+/// Context for connecting the event lines written by the executor of a service (injection proxy or
+/// MCP server) to the audit and the lease termination.
+/// `browser_id` is the key of `DaemonState::browsers` that holds the lease.
 struct ServiceEventContext {
     kind: ServiceKind,
     browser_id: String,
@@ -5214,7 +5326,8 @@ struct ServiceEventContext {
 }
 
 impl ServiceEventContext {
-    /// セッションに共通する監査項目（資格・セッション・namespace・サービス名）を埋めた値を返す。
+    /// Returns the audit fields common to the session (credential, session, namespace, and
+    /// service name) filled in.
     fn audit_fields(&self) -> AuditFields {
         AuditFields {
             cred_id: Some(self.cred_id.clone()),
@@ -5225,8 +5338,9 @@ impl ServiceEventContext {
     }
 }
 
-/// `id` を持たず `event` を持つ行を executor のイベントとして取り出す。
-/// イベント行を応答チャネルへ流すと、id 照合中の要求が取り違えを検出して executor を停止させるため、ここで分離する。
+/// Extracts a line that has `event` and no `id` as an executor event.
+/// Sending an event line into the response channel would make a request being matched by id detect
+/// a mismatch and stop the executor, so it is separated here.
 fn executor_event(line: &str) -> Option<Value> {
     let value = serde_json::from_str::<Value>(line).ok()?;
     (value.get("id").is_none() && value.get("event").is_some()).then_some(value)
@@ -5239,10 +5353,13 @@ async fn handle_service_event(state: &SharedState, context: &ServiceEventContext
     }
 }
 
-/// MCP サーバーのイベント行を監査し、サーバーが終了した場合（`exit`・`leak`）はそのリースを終える。
+/// Audits an event line of an MCP server, and ends its lease if the server terminated (`exit`,
+/// `leak`).
 ///
-/// リースの終了は executor への停止要求を伴い、その応答はこのイベントを読んだ reaper が受け渡す。
-/// 同じタスクで待つと応答を読む者がいなくなるため、終了処理は別タスクで行う。
+/// Ending the lease involves a stop request to the executor, and the reaper that read this event
+/// hands over its response.
+/// Waiting in the same task would leave nobody to read the response, so the termination is done in
+/// a separate task.
 async fn handle_mcp_server_event(state: &SharedState, context: &ServiceEventContext, event: Value) {
     let parsed = serde_json::from_value::<ExecutorMcpServerEvent>(event).ok();
     let Some((event, (end_reason, outcome, exit_code))) =
@@ -5266,8 +5383,8 @@ async fn handle_mcp_server_event(state: &SharedState, context: &ServiceEventCont
     }
 }
 
-/// MCP サーバーのイベント行を `(リースの終了理由, 監査の outcome, exit_code)` に対応づける。
-/// `exit_code` は `exit` でのみ監査へ載せる。認識できない行は `None` とする。
+/// Maps an event line of an MCP server to `(lease termination reason, audit outcome, exit_code)`.
+/// `exit_code` is recorded in the audit only for `exit`. An unrecognized line yields `None`.
 fn classify_mcp_server_event(
     event: &ExecutorMcpServerEvent,
 ) -> Option<(Option<&'static str>, &'static str, Option<i64>)> {
@@ -5282,8 +5399,9 @@ fn classify_mcp_server_event(
     }
 }
 
-/// サービスのリースを、disconnect と同じく停止要求と executor の停止で終え、`audit_method` で監査する。
-/// 既に disconnect などで終えられている場合は何もしない。
+/// Ends the lease of a service with a stop request and an executor stop, the same as disconnect,
+/// and audits it with `audit_method`.
+/// Does nothing if it has already been ended, for example by disconnect.
 async fn end_service_lease(state: &SharedState, browser_id: &str, audit_method: &'static str) {
     let browser = take_browser_locked(&mut *state.lock().await, browser_id);
     if let Some(browser) = browser {
@@ -5333,7 +5451,7 @@ async fn audit_api_proxy_event(state: &SharedState, context: &ServiceEventContex
     }
 }
 
-/// サービスの監査行を追記し、失敗は stderr へ報告する。
+/// Appends the audit line of a service and reports a failure to stderr.
 async fn append_service_audit(
     state: &SharedState,
     context: &ServiceEventContext,
@@ -5355,16 +5473,19 @@ async fn append_service_audit(
     }
 }
 
-/// 監査へ記録するプロキシ要求の path の上限バイト数。
+/// Upper bound in bytes on the proxy request path recorded in the audit.
 const AUDIT_PROXY_PATH_MAX_BYTES: usize = 512;
-/// path secret の文字数。executor は 16 バイトの乱数を base64url（パディングなし）で符号化する。
+/// Number of characters of the path secret. The executor encodes 16 random bytes in base64url
+/// (without padding).
 const API_PROXY_SECRET_LEN: usize = 22;
 
-/// プロキシ要求の path を監査用に整える。
+/// Normalizes the proxy request path for the audit.
 ///
-/// base_url にさらに base_url を連結した要求では 2 つ目の path secret が先頭 segment に現れるため、
-/// secret と同じ形（22 文字の base64url）の先頭 segment は `[redacted]` に置き換える。
-/// そのうえで UTF-8 の文字境界を保って上限バイト数に切り詰める。
+/// In a request that concatenates a base_url onto a base_url, the second path secret appears as the
+/// first segment,
+/// so a first segment of the same shape as the secret (22 base64url characters) is replaced with
+/// `[redacted]`.
+/// It is then truncated to the upper bound in bytes while keeping UTF-8 character boundaries.
 fn audit_proxy_path(path: &str) -> String {
     let mut sanitized = match path.strip_prefix('/') {
         Some(rest) => {
@@ -5387,7 +5508,8 @@ fn audit_proxy_path(path: &str) -> String {
     sanitized
 }
 
-/// 上流の応答 status を監査の outcome に対応づける。502 は executor が上流へ到達できなかった場合に返す値である。
+/// Maps the upstream response status to the audit outcome. 502 is the value returned when the
+/// executor could not reach the upstream.
 fn api_proxy_outcome(status: u16) -> &'static str {
     match status {
         status if status < 400 => "ok",
@@ -5453,7 +5575,8 @@ fn spawn_executor_reaper(
         let Some(browser) = browser else {
             return;
         };
-        // executor が切断された後は cookie を書き出せないため、保管しなかったことを記録する。
+        // After the executor is disconnected the cookies cannot be written out, so the fact
+        // that they were not stored is recorded.
         let cookies_saved = browser.persist_cookies.then_some(false);
         for (session_id, _) in browser.leases {
             audit_system_session(
@@ -5510,8 +5633,8 @@ fn optional_namespace(params: &Value) -> Result<Option<String>, ErrorCode> {
     }
 }
 
-/// 監査へ転記してよい params のキーを method ごとに限定する。
-/// method が解釈しないキーまで転記すると、呼び出し側が監査記録を偽装できるためである。
+/// Restricts, per method, the params keys that may be copied into the audit.
+/// Copying keys that the method does not interpret would let the caller forge the audit record.
 fn audit_param_keys(method: &str) -> &'static [&'static str] {
     match method {
         "login" | "login_begin" => &["cred_id", "target_url"],
@@ -5661,7 +5784,8 @@ mod tests {
             "/[redacted]"
         );
         assert_eq!(super::audit_proxy_path("/api/whoami"), "/api/whoami");
-        // 22 文字でも base64url 以外の文字を含む segment は secret の形ではない。
+        // A segment containing characters other than base64url is not in the shape of a
+        // secret even if it has 22 characters.
         assert_eq!(
             super::audit_proxy_path("/Ax7fQ2mN9pL3kR8sT1vW0.y/x"),
             "/Ax7fQ2mN9pL3kR8sT1vW0.y/x"
@@ -5672,7 +5796,8 @@ mod tests {
     fn audit_proxy_path_truncates_on_a_utf8_boundary() {
         let ascii = format!("/{}", "a".repeat(600));
         assert_eq!(super::audit_proxy_path(&ascii).len(), 512);
-        // 3 バイト文字の途中で上限に達する場合は、その文字の手前で切る。
+        // When the upper bound is reached in the middle of a 3-byte character, the cut is
+        // made before that character.
         let multibyte = format!("/{}", "あ".repeat(200));
         let truncated = super::audit_proxy_path(&multibyte);
         assert_eq!(truncated.len(), 511);
@@ -5744,7 +5869,7 @@ mod mcp_server_launch_tests {
     fn placeholders_are_replaced_in_one_pass() {
         let values = values("pa{{username}}ss", "user");
         let (rendered, scanned) = render_mcp_env_value("{{secret}}:{{username}}", &values);
-        // 置換後の値に含まれるプレースホルダ形の文字列は展開しない。
+        // Placeholder-shaped strings contained in the substituted values are not expanded.
         assert_eq!(rendered.as_str(), "pa{{username}}ss:user");
         assert!(scanned);
     }
@@ -5771,7 +5896,8 @@ mod mcp_server_config_tests {
     use super::{McpServerConfig, validate_mcp_servers};
     use std::collections::BTreeMap;
 
-    /// 実行環境で絶対パスとして扱われるコマンド。Windows では `/bin/…` が絶対パスにならない。
+    /// A command treated as an absolute path in the execution environment. On Windows, `/bin/…`
+    /// is not an absolute path.
     #[cfg(windows)]
     const ABSOLUTE_COMMAND: &str = r"C:\bin\server.exe";
     #[cfg(not(windows))]

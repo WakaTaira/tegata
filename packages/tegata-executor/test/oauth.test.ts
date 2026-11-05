@@ -53,7 +53,10 @@ type PostCall = {
   at: number;
 };
 
-/** 応答列を順に返す POST のスタブ。呼び出しの時刻と引数を記録する。 */
+/**
+ * A POST stub that returns a sequence of responses in order. Records the time and arguments of each
+ * call.
+ */
 function stubPost(
   responses: Array<FormResponse | Error>,
   now: () => number = Date.now,
@@ -69,7 +72,7 @@ function stubPost(
   return { post, calls };
 }
 
-/** 仮想時計。sleep は時計を進めるだけで実時間を消費しない。 */
+/** A virtual clock. sleep only advances the clock and does not consume real time. */
 function virtualClock(start = 1_000_000) {
   let current = start;
   return {
@@ -805,7 +808,8 @@ describe("OAuth proxy session", () => {
   test("closes without a revoked event when the revocation request cannot connect", async () => {
     const proxy = fakeProxy();
     const events: OAuthTokenAction[] = [];
-    // ENDPOINTS の revocation_url は 127.0.0.1 の 1 番ポートであり、既定の postForm は接続を拒否される。
+    // The revocation_url in ENDPOINTS is port 1 on 127.0.0.1, so the default postForm has its
+    // connection refused.
     const session = new OAuthProxySession({
       endpoints: ENDPOINTS,
       proxy,

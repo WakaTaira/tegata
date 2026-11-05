@@ -23,19 +23,18 @@ beforeAll(async () => {
 });
 
 test("AC-67: an existing token_hash file becomes the legacy peer", async () => {
-  // Given: `token issue` 相当の旧 token_hash ファイル（既知トークンの sha256）
-  // を state に置いた foreground daemon 構成
+  // Given: a foreground daemon setup with an old token_hash file equivalent to `token issue`
+  // (the sha256 of a known token) placed in state
   const token = randomBytes(32).toString("base64url");
   const daemon = await startForegroundPhase4Daemon({
     allowedSids: [mySid],
     legacyToken: token,
   });
   try {
-    // When: デーモンが起動を終えている（ready 行まで待った）
+    // When: the daemon has finished starting (waited until the ready line)
     const peersPath = path.join(daemon.stateDirWsl, "peers.json");
 
-    // Then: peers.json に peer_id = "legacy" があり、旧ファイルは .imported に
-    // リネームされている
+    // Then: peers.json has peer_id = "legacy", and the old file is renamed to .imported
     expect(fs.existsSync(peersPath), "peers.json was not created").toBe(true);
     const peers = JSON.parse(fs.readFileSync(peersPath, "utf8")) as Array<{
       peer_id: string;
@@ -52,7 +51,7 @@ test("AC-67: an existing token_hash file becomes the legacy peer", async () => {
       false,
     );
 
-    // And: 旧トークンで preamble が通り、status が JSON-RPC の result を返す
+    // And: the preamble passes with the old token, and status returns a JSON-RPC result
     const lines = await winLoopbackExchange(daemon.tcpPort, [
       JSON.stringify({ v: 1, auth: token }),
       JSON.stringify({ jsonrpc: "2.0", id: 1, method: "status", params: {} }),
@@ -61,7 +60,7 @@ test("AC-67: an existing token_hash file becomes the legacy peer", async () => {
     const rpc = parsed.find((l) => l.jsonrpc === "2.0");
     expect(rpc?.result, JSON.stringify(parsed)).toBeDefined();
 
-    // And: 監査の status 行は principal "peer:legacy" と peer_id "legacy" を持つ
+    // And: the audit status line has principal "peer:legacy" and peer_id "legacy"
     const audit = readForegroundAudit(daemon.stateDirWsl);
     const record = audit.find(
       (r) => r.method === "status" && r.peer_id === "legacy",
@@ -69,7 +68,7 @@ test("AC-67: an existing token_hash file becomes the legacy peer", async () => {
     expect(record, JSON.stringify(audit)).toBeDefined();
     expect(record?.principal).toBe("peer:legacy");
 
-    // And: 同じデーモンへ pipe から status を呼ぶと principal は SID
+    // And: calling status over the pipe against the same daemon gives a principal that is the SID
     const viaPipe = await pipeRpc(daemon.pipeName, "status", {});
     expect(viaPipe.result).toBeDefined();
     const pipeRecord = readForegroundAudit(daemon.stateDirWsl).find(

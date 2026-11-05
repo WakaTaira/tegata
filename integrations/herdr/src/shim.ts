@@ -270,7 +270,7 @@ class UpstreamConnection {
       try {
         this.socket?.close();
       } catch {
-        // 上流 socket が既に破棄されている場合は処理を継続します。
+        // Processing continues if the upstream socket has already been destroyed.
       }
       this.handleClose();
     }, SOCKET_CLOSE_GRACE_MS);
@@ -477,7 +477,7 @@ class ShimRuntime {
         }
       }
     } catch {
-      // 上流の HTTP endpoint が利用できない場合は shim の固定値を返します。
+      // If the upstream HTTP endpoint is unavailable, the shim's fixed value is returned.
     }
     return { Browser: "tegata-shim", "Protocol-Version": "1.3" };
   }

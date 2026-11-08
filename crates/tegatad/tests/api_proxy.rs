@@ -739,6 +739,26 @@ fn failed_starts_back_off() {
 }
 
 #[test]
+fn opens_over_the_limit_are_refused_before_approve_cmd_runs() {
+    let calls_directory =
+        std::env::temp_dir().join(format!("tegatad-api-proxy-calls-{}", Uuid::new_v4()));
+    std::fs::create_dir(&calls_directory).expect("create calls directory");
+    let calls_path = calls_directory.join("calls");
+    let mut options = Options::new(PROXY_EXECUTOR);
+    options.approve_cmd = Some(format!("echo run >> {}; exit 0", calls_path.display()));
+    let daemon = Daemon::start(options);
+    for _ in 0..3 {
+        open(&daemon);
+    }
+
+    let limited = rpc(daemon.socket(), "open_api_proxy", json!({ "name": "fx" }));
+    error_message(&limited, "RATE_LIMITED");
+    let calls = std::fs::read_to_string(&calls_path).expect("read approve calls");
+    let _ = std::fs::remove_dir_all(&calls_directory);
+    assert_eq!(calls.lines().count(), 3);
+}
+
+#[test]
 fn approve_cmd_receives_the_upstream_and_can_deny() {
     let env_directory =
         std::env::temp_dir().join(format!("tegatad-api-proxy-env-{}", Uuid::new_v4()));

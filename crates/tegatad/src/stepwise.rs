@@ -25,8 +25,8 @@ use crate::{
     AuditFields, AuditPeer, BrowserRegistration, CookieAudit, EXECUTOR_OPERATION_TIMEOUT,
     EXECUTOR_TIMEOUT, ErrorCode, ExecutorFailure, ExecutorHandle, HandledRequest, SharedState,
     append_audit, classified, classified_with_step, cookie_store, current_totp, gate_on_approval,
-    join_browser, namespace_locked, open_executor_with, parse_error_code, parse_params,
-    register_login_browser, resolve_unlocked_credential, save_cookies, selector_step,
+    join_browser, limited_before_approval, namespace_locked, open_executor_with, parse_error_code,
+    parse_params, register_login_browser, resolve_unlocked_credential, save_cookies, selector_step,
     service_launch_settings, shutdown_executor_handle, start_control, stop_child, success,
 };
 
@@ -687,6 +687,10 @@ pub(crate) async fn login_begin(
         namespace.to_owned(),
         params.cred_id.clone(),
     );
+    let joinable = (!params.exclusive).then_some(&key);
+    if limited_before_approval(&state, StartKey::Browser(key.clone()), joinable).await {
+        return classified(request.id.clone(), ErrorCode::RateLimited);
+    }
     let grant = match gate_on_approval(
         &state,
         &params.cred_id,

@@ -486,6 +486,14 @@ this control exists to avoid. Gating on a credential that actually exists keeps 
 prompt rare and meaningful, and preserves the quiet `INVALID_CREDENTIAL` refusal
 for everything else.
 
+The startup limit is checked on both sides of the gate for the same reason. A
+`login`, `login_begin`, `open_api_proxy`, or `open_mcp_server` that is already over
+its limit, and has no shared browser to join, returns `RATE_LIMITED` without
+asking anyone: an approval it could not use would only train the operator to
+approve. A request that can join a shared browser still asks, because joining
+starts nothing. The check after approval stays, since the limit can be reached
+while an approval is pending.
+
 **The hook is told references, never values.** It receives exactly four
 environment variables:
 

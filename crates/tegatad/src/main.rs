@@ -2671,6 +2671,10 @@ async fn login(request: &RpcRequest, state: SharedState, peer: &PeerIdentity) ->
     let namespace = namespace.to_owned();
     let principal = peer.principal();
     let key = sessions::BrowserKey::new(principal.clone(), namespace, params.cred_id.clone());
+    let joinable = (!request_params.exclusive).then_some(&key);
+    if limited_before_approval(&state, sessions::StartKey::Browser(key.clone()), joinable).await {
+        return classified(request.id.clone(), ErrorCode::RateLimited);
+    }
     let grant =
         match gate_on_approval(&state, &params.cred_id, &params.target_url, "login", peer).await {
             Ok(grant) => grant,
@@ -2898,6 +2902,42 @@ async fn start_control(
         .clone()
 }
 
+/// When the approval gate is configured, tells whether a start request is already over the startup
+/// limit with nothing to join, so that it can be refused before a human is asked to approve it.
+/// `joinable` is the browser key a non-exclusive `login` / `login_begin` may join; services pass
+/// `None`. The check after approval stays in place, because the limit can be reached while the
+/// approval is pending. The startup control is only tried, not waited for: while another start of
+/// the same key holds it, the request goes on to approval and the later check decides.
+pub(crate) async fn limited_before_approval(
+    state: &SharedState,
+    start_key: sessions::StartKey,
+    joinable: Option<&sessions::BrowserKey>,
+) -> bool {
+    {
+        let daemon = state.lock().await;
+        if !approval_required(&daemon) {
+            return false;
+        }
+        if joinable.is_some_and(|key| has_joinable_browser(&daemon, key, Instant::now())) {
+            return false;
+        }
+    }
+    let gate = start_control(state, start_key).await;
+    let Ok(mut control) = gate.try_lock() else {
+        return false;
+    };
+    control.is_limited(Instant::now())
+}
+
+/// Whether a shared browser for `key` is registered and still before its lifetime deadline.
+fn has_joinable_browser(daemon: &DaemonState, key: &sessions::BrowserKey, now: Instant) -> bool {
+    daemon
+        .shared_browsers
+        .get(key)
+        .and_then(|browser_id| daemon.browsers.get(browser_id))
+        .is_some_and(|browser| browser.deadline > now)
+}
+
 /// When the approval gate is configured, checks the existence and lock state of the credential and
 /// then asks for approval.
 /// A locked credential is rejected before approval is requested. The handling of grants follows
@@ -3106,6 +3146,10 @@ async fn open_service<S: HostedService>(
             .with_audit_fields(fields);
     };
     let namespace = namespace.to_owned();
+    let start_key = S::KIND.start_key(peer.principal(), service.name().to_owned());
+    if limited_before_approval(&state, start_key, None).await {
+        return classified(request.id.clone(), ErrorCode::RateLimited).with_audit_fields(fields);
+    }
     let grant =
         match gate_on_approval(&state, &cred_id, &target_url, S::KIND.open_method(), peer).await {
             Ok(grant) => grant,
